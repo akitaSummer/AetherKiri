@@ -608,6 +608,37 @@ bool TVPLayerImageAlphaHit(tTJSNI_BaseLayer *layer, tjs_int local_x,
     }
 }
 
+tTJSNI_BaseLayer *TVPRouteTransparentQuickMenuToUnderlying(
+    tTVPLayerManager *manager, tTJSNI_BaseLayer *hit, tjs_int x, tjs_int y) {
+    if(!manager || !hit || hit->GetName().AsStdString() != "QuickMenu" ||
+       !hit->GetNodeVisible() || !hit->GetNodeEnabled()) {
+        return hit;
+    }
+
+    tjs_int local_x = 0;
+    tjs_int local_y = 0;
+    if(!TVPLayerRectContainsPrimaryPoint(hit, x, y, local_x, local_y) ||
+       TVPLayerImageAlphaHit(hit, local_x, local_y)) {
+        return hit;
+    }
+
+    // YuzuSoft's quick menu is a full-primary-layer motion canvas even
+    // though only the command strip at the lower right is drawn. Its script
+    // deliberately uses a zero hit threshold, which makes the transparent
+    // remainder of that canvas win the native layer hit test. On Windows the
+    // motion hit-test filters those pixels before normal KAG input dispatch;
+    // keep the visible command pixels interactive while allowing the empty
+    // canvas to reach the story/message layers below it.
+    tTJSNI_BaseLayer *under = manager->GetMostFrontChildAt(x, y, hit);
+    if(TVPInputTraceEnabled()) {
+        spdlog::info(
+            "LayerManager pass transparent quick menu through primary=({}, {}) menu={} under={}",
+            x, y, hit->GetName().AsStdString(),
+            under ? under->GetName().AsStdString() : std::string("<none>"));
+    }
+    return under;
+}
+
 tTJSNI_BaseLayer *TVPFindCgPreviewLayerAt(tTVPLayerManager *manager, tjs_int x,
                                           tjs_int y) {
     if(!manager || !TVPScriptIsCgPreviewLoop())
@@ -1107,6 +1138,7 @@ tTJSNI_BaseLayer *tTVPLayerManager::GetClickableLayerAt(tjs_int x, tjs_int y) {
     // normal front-to-back hit result for press, hover, click, and drag.  The
     // preview fallback is intentionally applied only to right-click release
     // in PrimaryMouseUp, where it is needed to close a full-screen preview.
+    layer = TVPRouteTransparentQuickMenuToUnderlying(this, layer, x, y);
     layer = TVPFindMotionButtonOwnerForDisplayProxy(layer, x, y);
     layer = TVPRoutePassiveKagPresentationProxyToPage(layer, x, y);
     layer = TVPRouteAffinePresentationToMessageLayer(this, layer, x, y);
