@@ -1,9 +1,14 @@
 #include <cstdint>
 #include <uchardet.h>
 #include <zlib.h>
+#include <array>
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include <limits>
+#include <vector>
+
+#include <boost/locale/encoding.hpp>
 
 #include "TextStream.h"
 
@@ -15,8 +20,11 @@
 #include "tjsError.h"
 #include "CharacterSet.h"
 #include "BinaryStream.h"
+#include "StorageIntf.h"
 
-static std::string G_DefaultReadEncoding = "UTF-8";
+// Legacy KiriKiri scripts without a BOM are traditionally encoded as CP932.
+// UTF-8 remains auto-detected before this fallback is used.
+static std::string G_DefaultReadEncoding = "cp932";
 
 static std::string toUpperAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -66,6 +74,19 @@ static bool isKnownNonUtf8GameEncoding(const std::string &encoding) {
            encoding == "GB18030" || encoding == "Big5";
 }
 
+static bool isStrictlyDecodable(const unsigned char *raw, size_t size,
+                                const std::string &encoding) {
+    try {
+        boost::locale::conv::to_utf<wchar_t>(
+            reinterpret_cast<const char *>(raw),
+            reinterpret_cast<const char *>(raw + size), encoding,
+            boost::locale::conv::stop);
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
 static bool hasNonAsciiBytes(const unsigned char *raw, size_t size) {
     for(size_t i = 0; i < size; i++) {
         if(raw[i] >= 0x80)
@@ -100,12 +121,181 @@ static bool isValidUTF8(const unsigned char *raw, size_t size) {
     return true;
 }
 
+static bool shouldPreferCP932ForStandMetadata(const ttstr &name) {
+    ttstr shortName = TVPExtractStorageName(name).AsLowerCase();
+    if(TVPExtractStorageExt(shortName) == TJS_W(".stand"))
+        return true;
+    if(shortName == TJS_W("facezoom.csv"))
+        return true;
+
+    constexpr tjs_int InfoSuffixLen = 9; // "_info.txt"
+    if(shortName.GetLen() < InfoSuffixLen)
+        return false;
+
+    ttstr suffix(shortName.c_str() + shortName.GetLen() - InfoSuffixLen,
+                 InfoSuffixLen);
+    return suffix == TJS_W("_info.txt");
+}
+
+static std::optional<size_t> findEmbeddedBmpTextOffset(
+    const std::vector<std::uint8_t> &raw) {
+    // Some older KiriKiri save systems append saveStruct output to a BMP
+    // thumbnail and then read the combined file as a text stream.  The BMP
+    // file-size field marks the end of the image; only honor it when the tail
+    // starts with a real KiriKiri text signature so ordinary bitmaps and
+    // arbitrary trailing metadata keep their normal behavior.
+    if(raw.size() < 14 || raw[0] != 'B' || raw[1] != 'M')
+        return std::nullopt;
+
+    const size_t imageSize = static_cast<size_t>(raw[2]) |
+        (static_cast<size_t>(raw[3]) << 8) |
+        (static_cast<size_t>(raw[4]) << 16) |
+        (static_cast<size_t>(raw[5]) << 24);
+    if(imageSize < 14 || imageSize >= raw.size())
+        return std::nullopt;
+
+    const size_t remaining = raw.size() - imageSize;
+    const auto *tail = raw.data() + imageSize;
+    const bool utf16Bom = remaining >= 2 &&
+        ((tail[0] == 0xff && tail[1] == 0xfe) ||
+         (tail[0] == 0xfe && tail[1] == 0xff));
+    const bool utf8Bom = remaining >= 3 && tail[0] == 0xef &&
+        tail[1] == 0xbb && tail[2] == 0xbf;
+    const bool kirikiriCipher = remaining >= 3 && tail[0] == 0xfe &&
+        tail[1] == 0xfe && tail[2] <= 2;
+    if(!utf16Bom && !utf8Bom && !kirikiriCipher)
+        return std::nullopt;
+    return imageSize;
+}
+
+std::optional<tjs_uint64> TVPFindEmbeddedBmpPayloadOffset(
+    tTJSBinaryStream *stream) {
+    if(stream == nullptr) {
+        return std::nullopt;
+    }
+
+    tjs_uint64 originalPosition = 0;
+    try {
+        originalPosition = stream->GetPosition();
+        const tjs_uint64 totalSize = stream->GetSize();
+        if(totalSize < 17u) {
+            stream->SetPosition(originalPosition);
+            return std::nullopt;
+        }
+
+        std::array<std::uint8_t, 14> header{};
+        stream->SetPosition(0);
+        if(stream->Read(header.data(), static_cast<tjs_uint>(header.size())) !=
+           header.size() || header[0] != 'B' || header[1] != 'M') {
+            stream->SetPosition(originalPosition);
+            return std::nullopt;
+        }
+
+        const tjs_uint64 imageSize = static_cast<tjs_uint64>(header[2]) |
+            (static_cast<tjs_uint64>(header[3]) << 8u) |
+            (static_cast<tjs_uint64>(header[4]) << 16u) |
+            (static_cast<tjs_uint64>(header[5]) << 24u);
+        if(imageSize < 14u || imageSize >= totalSize ||
+           totalSize - imageSize < 3u) {
+            stream->SetPosition(originalPosition);
+            return std::nullopt;
+        }
+
+        std::array<std::uint8_t, 3> payloadHeader{};
+        stream->SetPosition(imageSize);
+        if(stream->Read(payloadHeader.data(),
+                        static_cast<tjs_uint>(payloadHeader.size())) !=
+           payloadHeader.size()) {
+            stream->SetPosition(originalPosition);
+            return std::nullopt;
+        }
+        const bool utf16Bom =
+            (payloadHeader[0] == 0xff && payloadHeader[1] == 0xfe) ||
+            (payloadHeader[0] == 0xfe && payloadHeader[1] == 0xff);
+        const bool utf8Bom = payloadHeader[0] == 0xef &&
+            payloadHeader[1] == 0xbb && payloadHeader[2] == 0xbf;
+        const bool kirikiriCipher = payloadHeader[0] == 0xfe &&
+            payloadHeader[1] == 0xfe && payloadHeader[2] <= 2u;
+        stream->SetPosition(originalPosition);
+        if(!utf16Bom && !utf8Bom && !kirikiriCipher) {
+            return std::nullopt;
+        }
+        return imageSize;
+    } catch(...) {
+        try {
+            stream->SetPosition(originalPosition);
+        } catch(...) {
+        }
+        return std::nullopt;
+    }
+}
+
+static bool selectLegacyBmpTextPayload(const ttstr &requested,
+                                       std::vector<std::uint8_t> &raw) {
+    ttstr legacy;
+    try {
+        legacy = TVPFindLegacySaveThumbnail(requested);
+    } catch(...) {
+        return false;
+    }
+    if(legacy.IsEmpty())
+        return false;
+
+    try {
+        std::unique_ptr<tTJSBinaryStream> stream(
+            TVPCreateStream(legacy, TJS_BS_READ));
+        const auto streamSize = stream->GetSize();
+        if(streamSize == 0 ||
+           streamSize > static_cast<tjs_uint64>(
+                            std::numeric_limits<size_t>::max())) {
+            return false;
+        }
+
+        std::vector<std::uint8_t> candidate(
+            static_cast<size_t>(streamSize));
+        stream->ReadBuffer(candidate.data(), candidate.size());
+        const auto embeddedOffset = findEmbeddedBmpTextOffset(candidate);
+        if(!embeddedOffset)
+            return false;
+
+        candidate.erase(candidate.begin(),
+                        candidate.begin() + *embeddedOffset);
+        raw = std::move(candidate);
+        spdlog::debug(
+            "Text stream selected legacy compound BMP payload: requested={} source={} offset={} bytes={}",
+            requested.AsStdString(), legacy.AsStdString(), *embeddedOffset,
+            raw.size());
+        return true;
+    } catch(...) {
+        // The requested stream still exists and remains the authoritative
+        // fallback if the legacy sidecar disappears between lookup and open.
+        return false;
+    }
+}
+
+static std::uint64_t readLe64(const std::uint8_t *bytes) {
+    std::uint64_t value = 0;
+    for(int i = 0; i < 8; i++)
+        value |= static_cast<std::uint64_t>(bytes[i]) << (i * 8);
+    return value;
+}
+
 std::string checkTextEncoding(const void *buf, size_t size,
                               std::uint8_t &bomSize) {
     auto raw = static_cast<const unsigned char *>(buf);
     std::string encoding;
     // --- 检查 BOM ---
-    if(size >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
+    if(size >= 4 && raw[0] == 0xFF && raw[1] == 0xFE && raw[2] == 0x00 &&
+       raw[3] == 0x00) {
+        // UTF-32LE BOM (must be checked before its UTF-16LE prefix)
+        bomSize = 4;
+        encoding = "UTF-32LE";
+    } else if(size >= 4 && raw[0] == 0x00 && raw[1] == 0x00 &&
+              raw[2] == 0xFE && raw[3] == 0xFF) {
+        // UTF-32BE BOM
+        bomSize = 4;
+        encoding = "UTF-32BE";
+    } else if(size >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
         // UTF-16LE BOM
         bomSize = 2;
         encoding = "UTF-16LE";
@@ -117,16 +307,6 @@ std::string checkTextEncoding(const void *buf, size_t size,
         // UTF-8 BOM
         bomSize = 3;
         encoding = "UTF-8";
-    } else if(size >= 4 && raw[0] == 0xFF && raw[1] == 0xFE && raw[2] == 0x00 &&
-              raw[3] == 0x00) {
-        // UTF-32LE BOM
-        bomSize = 4;
-        encoding = "UTF-32LE";
-    } else if(size >= 4 && raw[0] == 0x00 && raw[1] == 0x00 && raw[2] == 0xFE &&
-              raw[3] == 0xFF) {
-        // UTF-32BE BOM
-        bomSize = 4;
-        encoding = "UTF-32BE";
     } else {
         // ---------- 普通文本：用 uchardet 检测编码 ----------
         uchardet_t ud = uchardet_new();
@@ -142,8 +322,22 @@ std::string checkTextEncoding(const void *buf, size_t size,
             } else if(encoding == "UTF-8") {
                 if(!isValidUTF8(raw, size))
                     encoding.clear();
-            } else if(!encoding.empty() && !isKnownNonUtf8GameEncoding(encoding)) {
+            } else if(!encoding.empty() &&
+                      !isKnownNonUtf8GameEncoding(encoding)) {
                 encoding.clear();
+            } else if(!encoding.empty() &&
+                      !isStrictlyDecodable(raw, size, encoding)) {
+                // Statistical detectors can mistake GBK text containing many
+                // Japanese glyphs for EUC-JP.  Never accept a legacy encoding
+                // that cannot decode the complete byte stream: the default
+                // conversion policy silently drops invalid bytes and can turn
+                // quotes inside scripts into executable punctuation.
+                if((encoding == "EUC-JP" || encoding == "ISO-2022-JP") &&
+                   isStrictlyDecodable(raw, size, "GBK")) {
+                    encoding = "GBK";
+                } else {
+                    encoding.clear();
+                }
             }
         }
     }
@@ -169,6 +363,18 @@ public:
         auto size = static_cast<size_t>(_stream->GetSize() - ofs);
         std::vector<std::uint8_t> raw(size);
         _stream->ReadBuffer(raw.data(), size);
+
+        if(ofs == 0) {
+            if(const auto embeddedOffset = findEmbeddedBmpTextOffset(raw)) {
+                raw.erase(raw.begin(), raw.begin() + *embeddedOffset);
+                size = raw.size();
+                spdlog::debug(
+                    "Text stream selected embedded BMP payload: {} offset={} bytes={}",
+                    name.AsStdString(), *embeddedOffset, size);
+            } else if(selectLegacyBmpTextPayload(name, raw)) {
+                size = raw.size();
+            }
+        }
 
         // ---------- 检查是否加密/压缩 ----------
         if(size >= 3 && raw[0] == 0xFE && raw[1] == 0xFE) {
@@ -204,13 +410,17 @@ public:
                     TVPThrowExceptionMessage(TVPUnsupportedCipherMode, name);
 
                 // 读压缩大小和解压大小
-                std::uint8_t *ptr = raw.data() + 5;
-                std::uint64_t compressed =
-                    *reinterpret_cast<std::uint64_t *>(ptr);
+                const std::uint8_t *ptr = raw.data() + 5;
+                const std::uint64_t compressed = readLe64(ptr);
                 ptr += 8;
-                std::uint64_t uncompressed =
-                    *reinterpret_cast<std::uint64_t *>(ptr);
+                const std::uint64_t uncompressed = readLe64(ptr);
                 ptr += 8;
+
+                if(compressed > size - 21 ||
+                   compressed > std::numeric_limits<unsigned long>::max() ||
+                   uncompressed > std::numeric_limits<unsigned long>::max()) {
+                    TVPThrowExceptionMessage(TVPUnsupportedCipherMode, name);
+                }
 
                 std::vector<std::uint8_t> compBuf(compressed);
                 memcpy(compBuf.data(), ptr, compressed);
@@ -233,19 +443,38 @@ public:
         std::uint8_t bomSize = 0;
         std::string encoding = checkTextEncoding(raw.data(), size, bomSize);
         raw.erase(raw.begin(), raw.begin() + bomSize);
+        size = raw.size();
+
+        // Storages.setTextEncoding()/Scripts.textEncoding is an explicit game
+        // instruction.  Legacy CJK byte streams are often valid in more than
+        // one encoding, so a statistical guess (for example CP932 for GBK
+        // bytes) must not override that instruction.  Keep UTF-8 as the
+        // auto-detecting default for games that do not select an encoding.
+        if(bomSize == 0 && G_DefaultReadEncoding != "UTF-8") {
+            encoding = G_DefaultReadEncoding;
+        } else if(bomSize == 0 && shouldPreferCP932ForStandMetadata(name) &&
+                  hasNonAsciiBytes(raw.data(), size) &&
+                  !isValidUTF8(raw.data(), size)) {
+            encoding = "cp932";
+        }
+
+        if(encoding.empty() && G_DefaultReadEncoding == "UTF-8" &&
+           hasNonAsciiBytes(raw.data(), size) && !isValidUTF8(raw.data(), size)) {
+            encoding = "cp932";
+        }
 
         if(encoding.empty())
             encoding = G_DefaultReadEncoding; // 默认回退
 
         if(encoding == "ASCII") {
-            _buffer.assign(raw.data(), raw.data() + size);
+            _buffer.assign(raw.data(), raw.data() + raw.size());
             return;
         }
 
         if(encoding == "UTF-8") {
             _buffer = boost::locale::conv::utf_to_utf<char16_t>(
                 reinterpret_cast<const char *>(raw.data()),
-                reinterpret_cast<const char *>(raw.data() + size));
+                reinterpret_cast<const char *>(raw.data() + raw.size()));
             return;
         }
 
@@ -272,7 +501,7 @@ public:
            encoding == "UTF-32BE") {
             _buffer = boost::locale::conv::utf_to_utf<char16_t>(
                 reinterpret_cast<const char32_t *>(raw.data()),
-                reinterpret_cast<const char32_t *>(raw.data() + size));
+                reinterpret_cast<const char32_t *>(raw.data() + raw.size()));
             return;
         }
 

@@ -1,395 +1,328 @@
 #!/usr/bin/env bash
-#
-# build_android.sh — One-step build script for krkr2 Android (Flutter)
-#
-# Usage:
-#   ./build_android.sh [debug|release] [--abi=arm64-v8a,x86_64]
-#
-# Output: Flutter Android APK with bundled native engine
-#
-# This script will:
-#   1. Pre-install vcpkg dependencies for the target Android ABIs
-#   2. Build the Flutter Android APK (which triggers CMake native build via Gradle)
-#   3. Verify and report the output APK
-#
-
 set -euo pipefail
 
-# ============================================================
-# Configuration
-# ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BUILD_TYPE="${1:-debug}"
-BUILD_TYPE_LOWER="$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
-SKIP_ANDROID_VCPKG_INSTALL="${SKIP_ANDROID_VCPKG_INSTALL:-0}"
-
-# Parse optional --abi argument
-TARGET_ABIS="arm64-v8a"
+BUILD_TYPE="debug"
+ABIS="arm64-v8a"
 for arg in "$@"; do
-    case $arg in
-        --abi=*)
-            TARGET_ABIS="${arg#*=}"
-            ;;
+    case "$arg" in
+        debug|release|Debug|Release) BUILD_TYPE="$arg" ;;
+        --abi=*) ABIS="${arg#*=}" ;;
+        *) echo "[WARN] Unknown Android build argument ignored: $arg" ;;
     esac
 done
 
-if [[ "$BUILD_TYPE_LOWER" != "debug" && "$BUILD_TYPE_LOWER" != "release" ]]; then
-    echo "Error: Invalid build type '$BUILD_TYPE'. Use 'debug' or 'release'."
-    exit 1
-fi
-
+BUILD_TYPE_LOWER="$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
 BUILD_TYPE_CAP="$(echo "${BUILD_TYPE_LOWER:0:1}" | tr '[:lower:]' '[:upper:]')${BUILD_TYPE_LOWER:1}"
 
-if [[ -d "$PROJECT_ROOT/.devtools/flutter" ]]; then
-    FLUTTER_SDK="$PROJECT_ROOT/.devtools/flutter"
-    FLUTTER_BIN="$FLUTTER_SDK/bin/flutter"
-elif command -v flutter >/dev/null 2>&1; then
-    FLUTTER_BIN="$(command -v flutter)"
-    if command -v realpath >/dev/null 2>&1; then
-        RESOLVED_BIN="$(realpath "$FLUTTER_BIN")"
-    elif command -v python3 >/dev/null 2>&1; then
-        RESOLVED_BIN="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$FLUTTER_BIN")"
-    else
-        RESOLVED_BIN="$FLUTTER_BIN"
-    fi
-    FLUTTER_SDK="$(dirname "$(dirname "$RESOLVED_BIN")")"
-else
-    echo "Error: Flutter SDK not found in .devtools and not in PATH."
+if [[ "$BUILD_TYPE_LOWER" != "debug" && "$BUILD_TYPE_LOWER" != "release" ]]; then
+    echo "Error: Invalid build type '$BUILD_TYPE'. Use 'debug' or 'release'." >&2
     exit 1
 fi
 
-FLUTTER_APP_DIR="$PROJECT_ROOT/apps/flutter_app"
-
-recreate_local_vcpkg() {
-    echo "[INFO] Recreating local vcpkg in .devtools/vcpkg..."
-    rm -rf "$PROJECT_ROOT/.devtools/vcpkg"
-    mkdir -p "$PROJECT_ROOT/.devtools"
-    git clone https://github.com/microsoft/vcpkg.git "$PROJECT_ROOT/.devtools/vcpkg"
-    (cd "$PROJECT_ROOT/.devtools/vcpkg" && ./bootstrap-vcpkg.sh -disableMetrics)
-}
-
-if [[ -d "$PROJECT_ROOT/.devtools/vcpkg" ]]; then
-    VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
-elif [[ -n "${VCPKG_ROOT:-}" && -f "$VCPKG_ROOT/.vcpkg-root" ]]; then
-    :
-elif [[ "$SKIP_ANDROID_VCPKG_INSTALL" == "1" ]]; then
-    echo "[ERROR] Prebuilt vcpkg root not found."
-    echo "[INFO] Expected path: $PROJECT_ROOT/.devtools/vcpkg"
-    exit 1
-else
-    echo "[INFO] vcpkg not found. Automatically setting up vcpkg in .devtools/vcpkg..."
-    recreate_local_vcpkg
-    VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
-fi
-
-VCPKG_BIN="$VCPKG_ROOT/vcpkg"
-
-if [[ "$SKIP_ANDROID_VCPKG_INSTALL" == "1" ]]; then
-    if [[ ! -f "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" ]]; then
-        echo "[ERROR] Prebuilt vcpkg toolchain file missing."
-        echo "[INFO] Expected path: $VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-        exit 1
-    fi
-elif [[ ! -x "$VCPKG_BIN" ]]; then
-    if [[ -x "$VCPKG_ROOT/bootstrap-vcpkg.sh" ]]; then
-        echo "[WARN] vcpkg binary missing, bootstrapping existing tree..."
-        (cd "$VCPKG_ROOT" && ./bootstrap-vcpkg.sh -disableMetrics)
-    else
-        echo "[WARN] vcpkg tree is incomplete, recreating..."
-        recreate_local_vcpkg
-    fi
-fi
-
-VCPKG_BIN="$VCPKG_ROOT/vcpkg"
-
-# Android SDK/NDK paths (auto-detect common locations)
-if [[ -z "${ANDROID_HOME:-}" ]]; then
-    if [[ -d "$HOME/Library/Android/sdk" ]]; then
-        ANDROID_HOME="$HOME/Library/Android/sdk"
-    elif [[ -d "$HOME/Android/Sdk" ]]; then
-        ANDROID_HOME="$HOME/Android/Sdk"
-    else
-        ANDROID_HOME=""
-    fi
-fi
-
-# Find NDK (prefer ANDROID_NDK_HOME, then auto-detect latest in SDK)
-if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
-    if [[ -n "$ANDROID_HOME" && -d "$ANDROID_HOME/ndk" ]]; then
-        # Pick the latest NDK version
-        ANDROID_NDK_HOME="$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)"
-    fi
-fi
-
+ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+GODOT_BIN="${GODOT_BIN:-/Applications/Godot.app/Contents/MacOS/Godot}"
+GODOT_TEMPLATE_DIR="${GODOT_TEMPLATE_DIR:-$HOME/Library/Application Support/Godot/export_templates/4.7.stable}"
+GODOT_APP_DIR="$PROJECT_ROOT/apps/godot_app"
 PARALLEL_JOBS="${JOBS:-8}"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+ensure_vcpkg() {
+    if [[ -f "$PROJECT_ROOT/.devtools/vcpkg/.vcpkg-root" ]]; then
+        export VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
+    elif [[ -n "${VCPKG_ROOT:-}" && -f "$VCPKG_ROOT/.vcpkg-root" ]]; then
+        export VCPKG_ROOT
+    else
+        echo "[INFO] vcpkg not found. Automatically setting up vcpkg in .devtools/vcpkg..."
+        mkdir -p "$PROJECT_ROOT/.devtools"
+        rm -rf "$PROJECT_ROOT/.devtools/vcpkg"
+        git clone https://github.com/microsoft/vcpkg.git "$PROJECT_ROOT/.devtools/vcpkg"
+        (cd "$PROJECT_ROOT/.devtools/vcpkg" && ./bootstrap-vcpkg.sh -disableMetrics)
+        export VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
+    fi
 
-# ============================================================
-# Helper functions
-# ============================================================
-log_step() {
-    echo ""
-    echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}  $1${NC}"
-    echo -e "${CYAN}========================================${NC}"
+    if [[ ! -x "$VCPKG_ROOT/vcpkg" ]]; then
+        if [[ -x "$VCPKG_ROOT/bootstrap-vcpkg.sh" ]]; then
+            echo "[INFO] vcpkg binary missing. Bootstrapping existing vcpkg tree..."
+            (cd "$VCPKG_ROOT" && ./bootstrap-vcpkg.sh -disableMetrics)
+        else
+            echo "[INFO] vcpkg tree is incomplete. Recreating .devtools/vcpkg..."
+            mkdir -p "$PROJECT_ROOT/.devtools"
+            rm -rf "$PROJECT_ROOT/.devtools/vcpkg"
+            git clone https://github.com/microsoft/vcpkg.git "$PROJECT_ROOT/.devtools/vcpkg"
+            (cd "$PROJECT_ROOT/.devtools/vcpkg" && ./bootstrap-vcpkg.sh -disableMetrics)
+            export VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
+        fi
+    fi
 }
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+ensure_vcpkg
+
+find_android_ndk() {
+    local candidate
+    # A caller-selected NDK must win over SDK auto-discovery. This lets the
+    # native extension use the same libc++ ABI as Godot's export template.
+    for candidate in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK:-}" "${NDK_HOME:-}"; do
+        [[ -z "$candidate" ]] && continue
+        candidate="${candidate%.}"
+        if [[ -f "$candidate/build/cmake/android.toolchain.cmake" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if [[ -n "${ANDROID_NDK_VERSION:-}" ]]; then
+        candidate="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+        if [[ -f "$candidate/build/cmake/android.toolchain.cmake" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    if [[ -d "$ANDROID_HOME/ndk" ]]; then
+        # Godot 4.7 Android export templates are built with NDK r28. Prefer
+        # an installed r28 release so the bundled libc++_shared.so matches
+        # native extension ABI expectations.
+        candidate="$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d -name '28.*' \
+            -exec test -f '{}/build/cmake/android.toolchain.cmake' ';' -print \
+            | sort -V | tail -1)"
+        if [[ -n "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d \
+            -exec test -f '{}/build/cmake/android.toolchain.cmake' ';' -print \
+            | sort -V | tail -1
+        return 0
+    fi
+
+    return 1
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+ANDROID_NDK_HOME_RESOLVED="$(find_android_ndk || true)"
+if [[ -z "$ANDROID_NDK_HOME_RESOLVED" ]]; then
+    echo "Error: Android NDK not found. Install one with Android Studio or sdkmanager." >&2
+    exit 1
+fi
+export ANDROID_HOME
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_NDK_HOME_RESOLVED"
+export ANDROID_NDK="$ANDROID_NDK_HOME_RESOLVED"
+
+# The Android export uses a custom Gradle build template (minSdk 26 lives in
+# export_presets.cfg). The template is generated content and gitignored;
+# materialize it from the installed Godot export templates when missing.
+# Layout mirrors Godot's official installer (ExportTemplateManager::
+# install_android_template): <android>/.build_version marks the template
+# version, <android>/build/.gdignore keeps Godot from scanning it.
+if [[ ! -f "$GODOT_APP_DIR/android/.build_version" || ! -f "$GODOT_APP_DIR/android/build/build.gradle" ]]; then
+    if [[ ! -f "$GODOT_TEMPLATE_DIR/android_source.zip" ]]; then
+        echo "Error: Android build template missing and " >&2
+        echo "       $GODOT_TEMPLATE_DIR/android_source.zip not found." >&2
+        echo "       Install Godot export templates or set GODOT_TEMPLATE_DIR." >&2
+        exit 1
+    fi
+    echo "Installing Godot Android build template into apps/godot_app/android/build"
+    rm -rf "$GODOT_APP_DIR/android"
+    mkdir -p "$GODOT_APP_DIR/android/build"
+    unzip -qo "$GODOT_TEMPLATE_DIR/android_source.zip" -d "$GODOT_APP_DIR/android/build"
+    printf '%s\n' "${GODOT_TEMPLATE_DIR##*/}" > "$GODOT_APP_DIR/android/.build_version"
+    : > "$GODOT_APP_DIR/android/build/.gdignore"
+fi
+
+command -v cmake >/dev/null
+NINJA_BIN="${CMAKE_MAKE_PROGRAM:-$(command -v ninja || command -v ninja-build || true)}"
+if [[ -z "$NINJA_BIN" ]]; then
+    echo "Error: Ninja build tool not found. Install ninja and ensure it is available in PATH." >&2
+    exit 1
+fi
+export CMAKE_MAKE_PROGRAM="$NINJA_BIN"
+
+if [[ ! -d "$ANDROID_HOME" ]]; then
+    echo "Error: Android SDK not found at $ANDROID_HOME." >&2
+    exit 1
+fi
+
+is_elf_file() {
+    local path="$1"
+    [[ -f "$path" ]] || return 1
+    [[ "$(dd if="$path" bs=4 count=1 2>/dev/null | LC_ALL=C od -An -tx1 | tr -d ' \n')" == "7f454c46" ]]
 }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+copy_android_so() {
+    local src="$1"
+    local dst="$2"
 
-check_command() {
-    if ! command -v "$1" &>/dev/null; then
-        log_error "'$1' is not installed or not in PATH."
+    rm -f "$dst"
+    if command -v rsync >/dev/null; then
+        rsync -a "$src" "$dst"
+    else
+        dd if="$src" of="$dst" bs=1048576 status=none
+        chmod 755 "$dst"
+    fi
+    if is_elf_file "$dst"; then
+        return 0
+    fi
+
+    sync
+    sleep 1
+    rm -f "$dst"
+    if command -v rsync >/dev/null; then
+        rsync -a "$src" "$dst"
+    else
+        dd if="$src" of="$dst" bs=1048576 status=none
+        chmod 755 "$dst"
+    fi
+    if ! is_elf_file "$dst"; then
+        echo "Error: staged Android library is not a valid ELF file: $dst" >&2
         exit 1
     fi
 }
 
-# Map Android ABI to vcpkg triplet
-abi_to_triplet() {
-    case "$1" in
-        arm64-v8a)    echo "arm64-android" ;;
-        armeabi-v7a)  echo "arm-android" ;;
-        x86_64)       echo "x64-android" ;;
-        x86)          echo "x86-android" ;;
+ensure_android_godot_cpp_package_config() {
+    local triplet_root="$1"
+    local config_dir="$triplet_root/share/unofficial-godot-cpp"
+    local config_file="$config_dir/unofficial-godot-cpp-config.cmake"
+    local include_dir="$triplet_root/include/godot_cpp"
+    local lib_file
+
+    if [[ -f "$config_file" ]]; then
+        return
+    fi
+
+    lib_file="$(find "$triplet_root/lib" -maxdepth 1 -name 'libgodot-cpp*.a' -print -quit)"
+    if [[ -z "$lib_file" || ! -d "$include_dir" ]]; then
+        echo "Error: restored Android vcpkg bundle is missing godot-cpp package files." >&2
+        echo "       Expected include directory: $include_dir" >&2
+        echo "       Expected static library matching: $triplet_root/lib/libgodot-cpp*.a" >&2
+        exit 1
+    fi
+
+    mkdir -p "$config_dir"
+    cat > "$config_file" <<EOF
+get_filename_component(_godot_cpp_prefix "\${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+if(NOT TARGET unofficial::godot::cpp)
+    add_library(unofficial::godot::cpp STATIC IMPORTED)
+    set_target_properties(unofficial::godot::cpp PROPERTIES
+        IMPORTED_LOCATION "\${_godot_cpp_prefix}/lib/$(basename "$lib_file")"
+        INTERFACE_INCLUDE_DIRECTORIES "\${_godot_cpp_prefix}/include"
+    )
+endif()
+unset(_godot_cpp_prefix)
+EOF
+    echo "[INFO] Recreated missing godot-cpp CMake package config: $config_file"
+}
+
+build_abi() {
+    local abi="$1"
+    local cmake_config_preset
+    local cmake_build_preset
+    local cmake_build_dir
+    local godot_bin_dir
+    local vcpkg_triplet_dir
+    local libomp_path
+    local android_strip_path
+    local cmake_config_args=(
+        -D "CMAKE_MAKE_PROGRAM=$CMAKE_MAKE_PROGRAM"
+        -D "AETHERKIRI_ENABLE_INTERNAL=${AETHERKIRI_ENABLE_INTERNAL:-ON}"
+    )
+
+    case "$abi" in
+        arm64-v8a)
+            cmake_config_preset="Android arm64 ${BUILD_TYPE_CAP} Config"
+            cmake_build_preset="Android arm64 ${BUILD_TYPE_CAP} Build"
+            ;;
         *)
-            log_error "Unknown ABI: $1"
+            echo "Error: Android ABI '$abi' is not wired for the Godot migration yet. Use arm64-v8a." >&2
             exit 1
             ;;
     esac
+
+    cmake_build_dir="$PROJECT_ROOT/out/android/$abi/$BUILD_TYPE_LOWER"
+    godot_bin_dir="$GODOT_APP_DIR/bin/android/$abi/$BUILD_TYPE_LOWER"
+    vcpkg_triplet_dir="$cmake_build_dir/vcpkg_installed/arm64-android"
+
+    echo "==> Building Android native libraries ($abi, $BUILD_TYPE_LOWER)"
+    if [[ "${SKIP_ANDROID_VCPKG_INSTALL:-}" == "1" ]]; then
+        if [[ ! -d "$VCPKG_ROOT/installed/arm64-android" ]]; then
+            echo "Error: SKIP_ANDROID_VCPKG_INSTALL=1 but prebuilt vcpkg triplet is missing: $VCPKG_ROOT/installed/arm64-android" >&2
+            exit 1
+        fi
+        mkdir -p "$cmake_build_dir"
+        rm -rf "$cmake_build_dir/vcpkg_installed"
+        ln -s "$VCPKG_ROOT/installed" "$cmake_build_dir/vcpkg_installed"
+        ensure_android_godot_cpp_package_config "$cmake_build_dir/vcpkg_installed/arm64-android"
+        cmake_config_args+=(
+            -D "VCPKG_MANIFEST_INSTALL=OFF"
+            -D "VCPKG_INSTALLED_DIR=$cmake_build_dir/vcpkg_installed"
+        )
+    fi
+
+    cmake --preset "$cmake_config_preset" --fresh "${cmake_config_args[@]}"
+    cmake --build --preset "$cmake_build_preset" -- -j"$PARALLEL_JOBS"
+
+    mkdir -p "$godot_bin_dir"
+    copy_android_so "$cmake_build_dir/bridge/engine_api/libengine_api.so" "$godot_bin_dir/libengine_api.so"
+    copy_android_so "$cmake_build_dir/bridge/godot_extension/libaether_kiri_godot.so" "$godot_bin_dir/libaether_kiri_godot.so"
+    copy_android_so "$vcpkg_triplet_dir/lib/libSDL2.so" "$godot_bin_dir/libSDL2.so"
+    libomp_path="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/lib/clang/19/lib/linux/aarch64/libomp.so"
+    if [[ ! -f "$libomp_path" ]]; then
+        libomp_path="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -path '*/lib/linux/aarch64/libomp.so' -print -quit)"
+    fi
+    if [[ -z "$libomp_path" || ! -f "$libomp_path" ]]; then
+        echo "Error: Android OpenMP runtime libomp.so not found under $ANDROID_NDK_HOME." >&2
+        exit 1
+    fi
+    copy_android_so "$libomp_path" "$godot_bin_dir/libomp.so"
+
+    if [[ "$BUILD_TYPE_LOWER" == "release" ]]; then
+        android_strip_path="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" \
+            -path '*/bin/llvm-strip' \( -type f -o -type l \) -print -quit)"
+        if [[ -z "$android_strip_path" || ! -x "$android_strip_path" ]]; then
+            echo "Error: Android llvm-strip not found under $ANDROID_NDK_HOME." >&2
+            exit 1
+        fi
+        echo "==> Removing non-runtime symbols from staged Android Release libraries"
+        AETHERKIRI_STRIP_TOOL="$android_strip_path" \
+            "$PROJECT_ROOT/tools/strip_runtime_symbols.sh" elf \
+            "$godot_bin_dir/libengine_api.so" \
+            "$godot_bin_dir/libaether_kiri_godot.so" \
+            "$godot_bin_dir/libSDL2.so" \
+            "$godot_bin_dir/libomp.so"
+    fi
 }
 
-# ============================================================
-# Pre-flight checks
-# ============================================================
-log_step "Pre-flight checks"
-
-check_command cmake
-check_command ninja
-
-if [[ ! -x "$FLUTTER_BIN" ]]; then
-    log_error "Flutter SDK not found at: $FLUTTER_SDK"
-    log_info "Expected path: $FLUTTER_BIN"
-    exit 1
-fi
-
-if [[ ! -d "$VCPKG_ROOT" ]]; then
-    log_error "vcpkg not found at: $VCPKG_ROOT"
-    exit 1
-fi
-
-if [[ -z "${ANDROID_HOME:-}" ]]; then
-    log_error "ANDROID_HOME not set and could not be auto-detected."
-    log_info "Please set ANDROID_HOME to your Android SDK directory."
-    log_info "  export ANDROID_HOME=\$HOME/Library/Android/sdk"
-    exit 1
-fi
-
-if [[ -z "${ANDROID_NDK_HOME:-}" || ! -d "${ANDROID_NDK_HOME:-}" ]]; then
-    log_error "ANDROID_NDK_HOME not set or not found."
-    log_info "Please install Android NDK via Android Studio or sdkmanager."
-    log_info "  export ANDROID_NDK_HOME=\$ANDROID_HOME/ndk/<version>"
-    exit 1
-fi
-
-log_info "Build type:     $BUILD_TYPE_CAP"
-log_info "Target ABIs:    $TARGET_ABIS"
-log_info "Project root:   $PROJECT_ROOT"
-log_info "Flutter SDK:    $FLUTTER_SDK"
-log_info "vcpkg root:     $VCPKG_ROOT"
-log_info "Android SDK:    $ANDROID_HOME"
-log_info "Android NDK:    $ANDROID_NDK_HOME"
-log_info "Parallel jobs:  $PARALLEL_JOBS"
-
-# ============================================================
-# Step 1: Install vcpkg dependencies for Android
-# ============================================================
-export VCPKG_ROOT
-export ANDROID_NDK_HOME
-export ANDROID_HOME
-
-# Parse comma-separated ABIs
-IFS=',' read -ra ABI_ARRAY <<< "$TARGET_ABIS"
-
-if [[ "$SKIP_ANDROID_VCPKG_INSTALL" == "1" ]]; then
-    log_step "Step 1/3: Using prebuilt Android vcpkg dependencies"
-    for ABI in "${ABI_ARRAY[@]}"; do
-        TRIPLET="$(abi_to_triplet "$ABI")"
-        if [[ ! -d "$VCPKG_ROOT/installed/$TRIPLET" ]]; then
-            log_error "Prebuilt vcpkg triplet missing: $TRIPLET"
-            log_info "Expected directory: $VCPKG_ROOT/installed/$TRIPLET"
-            exit 1
-        fi
-        log_info "Using prebuilt vcpkg packages for $TRIPLET ✓"
-    done
-else
-    log_step "Step 1/3: Installing vcpkg dependencies for Android"
-
-    VCPKG_LOCK_FILE="$VCPKG_ROOT/.vcpkg-root"
-
-    # Wait for vcpkg filesystem lock to be released (handles background binary cache submissions)
-    wait_for_vcpkg_lock() {
-        local max_retries=30
-        local retry_interval=2
-        local attempt=0
-
-        while (( attempt < max_retries )); do
-            # Try a vcpkg command that actually acquires the filesystem lock.
-            # 'vcpkg list' needs the lock, unlike 'vcpkg version' which does not.
-            if (cd "$PROJECT_ROOT" && "$VCPKG_BIN" list --x-install-root="$VCPKG_ROOT/installed" &>/dev/null); then
-                return 0
-            fi
-            attempt=$((attempt + 1))
-            log_info "Waiting for vcpkg lock to be released... (${attempt}/${max_retries})"
-            sleep "$retry_interval"
-        done
-
-        log_warn "vcpkg lock wait timed out after $((max_retries * retry_interval))s, proceeding anyway..."
-        return 0
-    }
-
-    OVERLAY_PORTS="$PROJECT_ROOT/vcpkg/ports"
-    OVERLAY_TRIPLETS="$PROJECT_ROOT/vcpkg/triplets"
-
-    for ABI in "${ABI_ARRAY[@]}"; do
-        TRIPLET="$(abi_to_triplet "$ABI")"
-        log_info "Installing vcpkg packages for triplet: $TRIPLET (ABI: $ABI)..."
-
-        # Wait for any previous vcpkg lock to be released
-        wait_for_vcpkg_lock
-
-        # Clean stale ANGLE build cache to ensure overlay port changes take effect
-        if [[ -d "$VCPKG_ROOT/buildtrees/angle" ]]; then
-            log_info "Cleaning ANGLE build cache for rebuild..."
-            rm -rf "$VCPKG_ROOT/buildtrees/angle"
-            rm -rf "$VCPKG_ROOT/packages/angle_${TRIPLET}"
-        fi
-
-        # Use manifest mode: vcpkg install from project root where vcpkg.json lives
-        # Only build Release libraries to save time and cache space
-        (cd "$PROJECT_ROOT" && VCPKG_BUILD_TYPE=release "$VCPKG_BIN" install \
-            --triplet "$TRIPLET" \
-            --x-install-root="$VCPKG_ROOT/installed" \
-            --x-manifest-root="$PROJECT_ROOT" \
-            --overlay-ports="$OVERLAY_PORTS" \
-            --overlay-triplets="$OVERLAY_TRIPLETS" \
-        ) || {
-            log_error "vcpkg install failed for triplet: $TRIPLET"
-            log_info "You can try running manually:"
-            log_info "  cd $PROJECT_ROOT && $VCPKG_BIN install --triplet $TRIPLET --overlay-ports=$OVERLAY_PORTS --overlay-triplets=$OVERLAY_TRIPLETS"
-            exit 1
-        }
-
-        log_info "vcpkg packages installed for $TRIPLET ✓"
-    done
-fi
-
-# ============================================================
-# Step 2: Build Flutter Android APK
-# ============================================================
-log_step "Step 2/3: Building Flutter Android APK ($BUILD_TYPE_CAP)"
-
-export PATH="$FLUTTER_SDK/bin:$PATH"
-
-log_info "Running flutter pub get..."
-(cd "$FLUTTER_APP_DIR" && "$FLUTTER_BIN" pub get)
-
-# Clean CMake cache to avoid stale configurations
-if [[ -d "$FLUTTER_APP_DIR/build/.cxx" ]]; then
-    log_info "Cleaning CMake build cache..."
-    rm -rf "$FLUTTER_APP_DIR/build/.cxx"
-fi
-
-FLUTTER_BUILD_MODE="$BUILD_TYPE_LOWER"
-
-# Map TARGET_ABIS to Flutter --target-platform values
-FLUTTER_TARGET_PLATFORMS=""
-for ABI in "${ABI_ARRAY[@]}"; do
-    case "$ABI" in
-        arm64-v8a)    PLATFORM="android-arm64" ;;
-        armeabi-v7a)  PLATFORM="android-arm" ;;
-        x86_64)       PLATFORM="android-x64" ;;
-        *)            PLATFORM="" ;;
-    esac
-    if [[ -n "$PLATFORM" ]]; then
-        if [[ -n "$FLUTTER_TARGET_PLATFORMS" ]]; then
-            FLUTTER_TARGET_PLATFORMS="$FLUTTER_TARGET_PLATFORMS,$PLATFORM"
-        else
-            FLUTTER_TARGET_PLATFORMS="$PLATFORM"
-        fi
-    fi
+IFS=',' read -r -a ABI_LIST <<< "$ABIS"
+for abi in "${ABI_LIST[@]}"; do
+    build_abi "$abi"
 done
 
-log_info "Building Flutter APK ($FLUTTER_BUILD_MODE) for platforms: $FLUTTER_TARGET_PLATFORMS..."
-(cd "$FLUTTER_APP_DIR" && "$FLUTTER_BIN" build apk --"$FLUTTER_BUILD_MODE" --target-platform "$FLUTTER_TARGET_PLATFORMS" -v)
-
-# ============================================================
-# Step 3: Verify output APK
-# ============================================================
-log_step "Step 3/3: Verifying output APK"
-
-if [[ "$FLUTTER_BUILD_MODE" == "release" ]]; then
-    APK_PATH="$FLUTTER_APP_DIR/build/app/outputs/flutter-apk/app-release.apk"
-elif [[ "$FLUTTER_BUILD_MODE" == "debug" ]]; then
-    APK_PATH="$FLUTTER_APP_DIR/build/app/outputs/flutter-apk/app-debug.apk"
+if [[ ! -x "$GODOT_BIN" ]]; then
+    echo "Warning: Godot not found at $GODOT_BIN; native libraries were staged only." >&2
+elif [[ ! -f "$GODOT_TEMPLATE_DIR/android_debug.apk" || ! -f "$GODOT_TEMPLATE_DIR/android_release.apk" ]]; then
+    echo "Warning: Godot Android export templates are missing in $GODOT_TEMPLATE_DIR; native libraries were staged only." >&2
+    echo "         Expected android_debug.apk and android_release.apk." >&2
 else
-    APK_PATH="$FLUTTER_APP_DIR/build/app/outputs/flutter-apk/app-$FLUTTER_BUILD_MODE.apk"
-fi
-
-if [[ ! -f "$APK_PATH" ]]; then
-    # Try to find any APK
-    APK_PATH="$(find "$FLUTTER_APP_DIR/build/app/outputs" -name "*.apk" -type f 2>/dev/null | head -1)"
-fi
-
-if [[ -z "${APK_PATH:-}" || ! -f "${APK_PATH:-}" ]]; then
-    log_error "APK not found! Build may have failed."
-    exit 1
-fi
-
-APK_SIZE="$(du -sh "$APK_PATH" | cut -f1)"
-log_info "APK built successfully: $APK_PATH"
-log_info "APK size: $APK_SIZE"
-
-# Verify native libraries are bundled
-if command -v unzip &>/dev/null; then
-    log_info "Checking bundled native libraries..."
-    NATIVE_LIBS="$(unzip -l "$APK_PATH" 2>/dev/null | grep '\.so$' | awk '{print $4}' || true)"
-    if [[ -n "$NATIVE_LIBS" ]]; then
-        echo "$NATIVE_LIBS" | while read -r lib; do
-            echo "  ✓ $lib"
-        done
-    else
-        log_warn "No native .so files found in APK. Something may be wrong."
+    echo "==> Exporting Godot Android APK"
+    mkdir -p "$PROJECT_ROOT/out/godot/android/$BUILD_TYPE_LOWER"
+    export_path="$PROJECT_ROOT/out/godot/android/$BUILD_TYPE_LOWER/Aether-$BUILD_TYPE_LOWER.apk"
+    export_preset="Android ${BUILD_TYPE_CAP}"
+    export_mode="--export-debug"
+    if [[ "$BUILD_TYPE_LOWER" == "release" ]]; then
+        export_mode="--export-release"
     fi
+    godot_export_command=("$GODOT_BIN")
+    macos_host_extension="$GODOT_APP_DIR/bin/macos/$BUILD_TYPE_LOWER/libaether_kiri_godot.dylib"
+    if [[ "$(uname -m)" == "arm64" && -f "$macos_host_extension" &&
+          "$(lipo -archs "$macos_host_extension" 2>/dev/null || true)" == "x86_64" ]]; then
+        # This private native host extension is currently x86_64-only. Match
+        # the editor process to the staged host extension while
+        # it imports the project; the exported Android libraries remain arm64.
+        godot_export_command=(arch -x86_64 "$GODOT_BIN")
+    fi
+    "${godot_export_command[@]}" --headless --path "$GODOT_APP_DIR" \
+        "$export_mode" "$export_preset" "$export_path"
 fi
 
-# ============================================================
-# Done
-# ============================================================
-log_step "Build complete!"
-
-log_info "APK:  $APK_PATH"
-log_info "Size: $APK_SIZE"
-echo ""
-log_info "To install on a connected device:"
-echo "  adb install \"$APK_PATH\""
-echo ""
-log_info "To install and run:"
-echo "  adb install \"$APK_PATH\" && adb shell am start -n org.github.krkr2.flutter_app/.MainActivity"
-echo ""
+echo "Android build output: $PROJECT_ROOT/out/godot/android/$BUILD_TYPE_LOWER"

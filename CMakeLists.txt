@@ -11,6 +11,8 @@ endif ()
 add_compile_definitions(
         $<$<CONFIG:Debug>:DEBUG>
         $<$<CONFIG:Debug>:_DEBUG>   # 对于 MSVC 兼容性
+        # Artemis is a supported runtime in every product configuration.
+        AETHERKIRI_ENABLE_ARTEMIS_RUNTIME
         $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
 )
 
@@ -51,17 +53,101 @@ else()
     set(CMAKE_TOOLCHAIN_FILE $ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake)
 endif()
 
-set(APP_NAME krkr2)
-
-project(${APP_NAME})
+project(krkr2)
 
 if(ANDROID)
     add_compile_options(-Wno-inconsistent-missing-override)
 endif()
 
+if(WEB OR EMSCRIPTEN)
+    add_compile_options(
+        -fPIC
+        -pthread
+        -msimd128
+        -sSUPPORT_LONGJMP=wasm
+        -sWASM_LEGACY_EXCEPTIONS=1
+        $<$<COMPILE_LANGUAGE:CXX>:-fwasm-exceptions>
+    )
+    add_link_options(
+        -pthread
+        -msimd128
+        -sSUPPORT_LONGJMP=wasm
+        -sWASM_LEGACY_EXCEPTIONS=1
+        -fwasm-exceptions
+    )
+endif()
+
 option(ENABLE_TESTS "enable tests execute build(exclude android)" ON)
 option(BUILD_TOOLS "build tools execute build(exclude android ios)" ON)
 option(BUILD_ENGINE_API "build engine_api bridge shared library" ON)
+option(BUILD_GODOT_EXTENSION "build Godot GDExtension host library" ON)
+option(AETHERKIRI_ENABLE_RFVP "build the experimental native FVP runtime (requires Rust)" OFF)
+option(BUILD_GPU_BRIDGE "build legacy external GPU bridge renderer" OFF)
+option(AETHERKIRI_ENABLE_ONSCRIPTER
+       "enable the bundled OnscripterYuri runtime" ON)
+option(AETHERKIRI_ENABLE_SIGLUS
+       "enable the bundled siglus_rs runtime (requires a Rust toolchain)" ON)
+option(AETHERKIRI_ENABLE_MINORI
+       "enable the independent Rust Minori runtime" ON)
+option(AETHERKIRI_ENABLE_CODE_OBFUSCATION
+       "obfuscate private Internal translation units in release builds" OFF)
+set(AETHERKIRI_OBFUSCATOR_PLUGIN "" CACHE FILEPATH
+    "path to a Kagura LLVM pass plugin built for the active Clang")
+set(AETHERKIRI_OBFUSCATION_BUILD_ID "local" CACHE STRING
+    "non-secret identifier mixed into deterministic obfuscation output")
+option(AETHERKIRI_ENABLE_INTERNAL
+       "enable optional private AetherInternal packages when available" ON)
+set(AETHERKIRI_MOTIONPLAYER_BACKEND_API_VERSION 4)
+set(AETHERKIRI_LIVE2D_HOST_API_VERSION 1)
+set(AETHERKIRI_FRAME_EFFECT_HOST_API_VERSION 2)
+set(AETHERKIRI_INTERNAL_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/packages/AetherInternal"
+    CACHE PATH "path to an AetherInternal package checkout")
+
+include(cmake/AetherKiriBinaryProtection.cmake)
+
+set(AETHERKIRI_INTERNAL_ENABLED OFF)
+if(AETHERKIRI_ENABLE_INTERNAL)
+    # Use a normal (non-cache) package hint so a previous configured checkout
+    # cannot keep a removed/private submodule enabled through stale cache.
+    set(AetherInternal_DIR "${AETHERKIRI_INTERNAL_DIR}/cmake")
+    unset(AetherInternal_FOUND)
+    find_package(AetherInternal CONFIG QUIET
+        NO_DEFAULT_PATH)
+    if(AetherInternal_FOUND)
+        if(NOT AETHERINTERNAL_PACKAGE_API_VERSION EQUAL 7 OR
+           NOT AETHERINTERNAL_REQUIRED_MOTIONPLAYER_API_VERSION EQUAL
+               AETHERKIRI_MOTIONPLAYER_BACKEND_API_VERSION OR
+           NOT AETHERINTERNAL_REQUIRED_LIVE2D_HOST_API_VERSION EQUAL
+               AETHERKIRI_LIVE2D_HOST_API_VERSION OR
+           NOT AETHERINTERNAL_REQUIRED_FRAME_EFFECT_HOST_API_VERSION EQUAL
+               AETHERKIRI_FRAME_EFFECT_HOST_API_VERSION OR
+           NOT COMMAND aetherinternal_extend_motionplayer OR
+           NOT COMMAND aetherinternal_extend_psbfile OR
+           NOT COMMAND aetherinternal_extend_legacy_plugins OR
+           NOT COMMAND aetherinternal_extend_live2d OR
+           NOT COMMAND aetherinternal_extend_catsystem2 OR
+           NOT COMMAND aetherinternal_extend_catsystem2_tests OR
+           NOT COMMAND aetherinternal_add_catsystem2_probe OR
+           NOT COMMAND aetherinternal_add_artemis_tests OR
+           NOT COMMAND aetherinternal_extend_artemis OR
+           NOT COMMAND aetherinternal_extend_text_translation OR
+           NOT COMMAND aetherinternal_extend_godot_extension OR
+           NOT COMMAND aetherinternal_extend_krkr2plugin OR
+           NOT COMMAND aetherinternal_extend_krkr2plugin_tests)
+            message(FATAL_ERROR
+                "AetherInternal is present but is incompatible with the "
+                "motionplayer backend contract required by this checkout")
+        endif()
+        set(AETHERKIRI_INTERNAL_ENABLED ON)
+    endif()
+endif()
+
+if(AETHERKIRI_INTERNAL_ENABLED)
+    message(STATUS "AetherInternal E-mote/Live2D package: enabled")
+else()
+    message(STATUS "AetherInternal package: unavailable; using public fallbacks")
+endif()
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -72,34 +158,19 @@ set(KRKR2PLUGIN_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cpp/plugins)
 
 if(MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/EHsc>" "/MP" "/utf-8")
-    add_link_options("/ignore:4099" "/INCREMENTAL" "/DEBUG:FASTLINK")
+    add_link_options(
+        "/ignore:4099"
+        "$<$<CONFIG:Debug>:/INCREMENTAL>"
+        "$<$<CONFIG:Debug>:/DEBUG:FASTLINK>"
+        "$<$<CONFIG:Release>:/INCREMENTAL:NO>"
+        "$<$<CONFIG:Release>:/OPT:REF>"
+        "$<$<CONFIG:Release>:/OPT:ICF>"
+    )
     # set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-if(ANDROID)
-    if(BUILD_ENGINE_API)
-        # When BUILD_ENGINE_API is ON (Flutter build), krkr2_android.cpp is compiled
-        # directly into libengine_api.so, so we don't need a separate libkrkr2.so.
-        # Just skip building the standalone krkr2 target.
-    else()
-        add_library(${PROJECT_NAME} SHARED ${CMAKE_CURRENT_SOURCE_DIR}/platforms/android/cpp/krkr2_android.cpp)
-        find_package(unofficial-breakpad CONFIG REQUIRED)
-        target_link_libraries(${PROJECT_NAME} PUBLIC unofficial::breakpad::libbreakpad_client)
-    endif()
-elseif(LINUX)
-    add_executable(${PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/platforms/linux/main.cpp)
-elseif(WINDOWS)
-    add_executable(${PROJECT_NAME}
-        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/windows/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/windows/game.rc
-    )
-elseif(IOS)
-    # iOS uses Flutter as the app shell; only build engine libraries.
-    # engine_api is built as a static library and linked into the Flutter Runner.
-elseif(MACOS)
-    # macOS uses Flutter as the app shell; only build engine libraries.
-    # The standalone krkr2 executable (cocos2dx) is no longer produced.
-endif()
+# Godot is the product app shell on the wired platforms. This native build
+# produces engine libraries and the GDExtension host, not standalone launchers.
 
 # external lib
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/cpp/external)
@@ -107,37 +178,75 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/cpp/external)
 # build library
 add_subdirectory(${KRKR2CORE_PATH})
 add_subdirectory(${KRKR2PLUGIN_PATH})
-if(BUILD_ENGINE_API)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_api)
-endif()
 
-# Link the standalone executable target (not needed on macOS where Flutter is the app shell)
-if(TARGET ${PROJECT_NAME})
-    # Keep static NCB registration objects from krkr2plugin alive.
-    set(_KRKR2PLUGIN_LINK_ITEM "$<LINK_LIBRARY:WHOLE_ARCHIVE,krkr2plugin>")
-    target_link_libraries(${PROJECT_NAME} PUBLIC
-        krkr2core
-        ${_KRKR2PLUGIN_LINK_ITEM}
-    )
-
-    ## app config
-    if(APPLE)
-        set_target_properties(${APP_NAME} PROPERTIES RESOURCE "${APP_UI_RES}")
-        if(MACOSX)
-            set_target_properties(${APP_NAME} PROPERTIES
-                    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platforms/apple/macos/Info.plist"
-            )
-        endif()
+# AetherInternal contributes sources to public targets but does not own the
+# obfuscation policy. Register only package-owned source units for protected
+# iOS Release builds.
+if(IOS AND AETHERKIRI_INTERNAL_ENABLED AND AETHERKIRI_ENABLE_CODE_OBFUSCATION)
+    file(GLOB_RECURSE AETHERKIRI_INTERNAL_EMOTE_SOURCES CONFIGURE_DEPENDS
+        "${AETHERKIRI_INTERNAL_DIR}/src/emote/*.cpp")
+    file(GLOB_RECURSE AETHERKIRI_INTERNAL_PSB_SOURCES CONFIGURE_DEPENDS
+        "${AETHERKIRI_INTERNAL_DIR}/src/psbfile/*.cpp")
+    file(GLOB_RECURSE AETHERKIRI_INTERNAL_PLUGIN_SOURCES CONFIGURE_DEPENDS
+        "${AETHERKIRI_INTERNAL_DIR}/src/plugins/*.cpp"
+        "${AETHERKIRI_INTERNAL_DIR}/src/krkr2_plugins/*.cpp"
+        "${AETHERKIRI_INTERNAL_DIR}/src/live2d/*.cpp")
+    if(TARGET motionplayer AND AETHERKIRI_INTERNAL_EMOTE_SOURCES)
+        aetherkiri_protect_internal_sources(motionplayer
+            ${AETHERKIRI_INTERNAL_EMOTE_SOURCES})
+    endif()
+    if(TARGET psbfile AND AETHERKIRI_INTERNAL_PSB_SOURCES)
+        aetherkiri_protect_internal_sources(psbfile
+            ${AETHERKIRI_INTERNAL_PSB_SOURCES})
+    endif()
+    if(TARGET krkr2plugin AND AETHERKIRI_INTERNAL_PLUGIN_SOURCES)
+        aetherkiri_protect_internal_sources(krkr2plugin
+            ${AETHERKIRI_INTERNAL_PLUGIN_SOURCES})
     endif()
 endif()
 
-if(ENABLE_TESTS AND NOT (IOS OR ANDROID))
+set(AETHERKIRI_BUILD_NATIVE_ONSCRIPTER_TESTS OFF)
+if(ENABLE_TESTS AND AETHERKIRI_ENABLE_ONSCRIPTER AND
+   NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))
+    # The provider contract links the real ONS runtime and runtime registry.
+    # Keep those targets available in the native test-only configuration used
+    # by CI even when product bridge targets are otherwise disabled.
+    set(AETHERKIRI_BUILD_NATIVE_ONSCRIPTER_TESTS ON)
+endif()
+
+if(BUILD_ENGINE_API OR AETHERKIRI_BUILD_NATIVE_ONSCRIPTER_TESTS OR AETHERKIRI_ENABLE_RFVP)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/engine_api)
+endif()
+if(AETHERKIRI_ENABLE_ONSCRIPTER AND
+   (BUILD_GODOT_EXTENSION OR AETHERKIRI_BUILD_NATIVE_ONSCRIPTER_TESTS))
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/onscripter_runtime)
+endif()
+if(AETHERKIRI_ENABLE_SIGLUS AND BUILD_GODOT_EXTENSION AND
+   NOT (WEB OR EMSCRIPTEN))
+    # Web stays excluded until the wasm host path is designed (phase 5).
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/siglus_runtime)
+endif()
+# The Rust provider has targets for Linux, Apple, Android, and Emscripten.
+# Keep it out of unsupported native targets, but do not make Linux the only
+# product platform that can register Minori.
+if(AETHERKIRI_ENABLE_MINORI AND BUILD_GODOT_EXTENSION AND
+   (LINUX OR APPLE OR ANDROID OR EMSCRIPTEN))
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/rust/minori_runtime)
+endif()
+if(AETHERKIRI_ENABLE_RFVP)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/rfvp_runtime)
+endif()
+if(BUILD_GODOT_EXTENSION)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/godot_extension)
+endif()
+
+if(ENABLE_TESTS AND NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))
     enable_testing()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
         add_subdirectory(tests)
     endif()
 endif()
 
-if(BUILD_TOOLS AND NOT (IOS OR ANDROID))
+if(BUILD_TOOLS AND NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))
     add_subdirectory(tools)
 endif()

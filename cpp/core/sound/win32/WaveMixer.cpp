@@ -2,8 +2,10 @@
 #include "tjsCommHead.h"
 
 #ifdef __APPLE__
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <OpenAL/al.h>
 #include <OpenAL/alc.h>
+#include <TargetConditionals.h>
 #else
 
 #include <AL/alc.h>
@@ -17,14 +19,17 @@
 #endif
 
 #include "DebugIntf.h"
+#include "Platform.h"
 #include "SysInitIntf.h"
 #include "TickCount.h"
 #include "WaveImpl.h"
 #include <SDL2/SDL.h>
 #include <algorithm>
+#include <atomic>
 #include <assert.h>
 #include <iomanip>
 #include <math.h>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <string.h>
 #include <unordered_set>
@@ -32,6 +37,12 @@
 class iTVPAudioRenderer;
 
 static iTVPAudioRenderer *TVPAudioRenderer;
+static ALCcontext *TVPALContext = nullptr;
+
+static void TVPEnsureALContext() {
+    if(TVPALContext && alcGetCurrentContext() != TVPALContext)
+        alcMakeContextCurrent(TVPALContext);
+}
 
 template <int ch>
 void MixAudioS16CPP(void *dst, const void *src, int samples, int16_t *volume) {
@@ -108,6 +119,7 @@ public:
     SDL_AudioCVT *_cvt = nullptr;
     std::vector<uint8_t> _cvtbuf;
     int _frame_size = 0;
+    int _input_frame_size = 0;
 
     void RecalcVolume() {
         if(_pan > 0) {
@@ -129,8 +141,10 @@ public:
     tjs_uint _sendedFrontBuffer = 0;
     tjs_uint _sendedSamples = 0, _inCachedSamples = 0;
 
-    tTVPSoundBuffer(int framesize, SDL_AudioCVT *cvt) :
-        _frame_size(framesize), _cvt(cvt) {
+    tTVPSoundBuffer(int input_frame_size, int output_frame_size,
+                    SDL_AudioCVT *cvt) :
+        _cvt(cvt), _frame_size(output_frame_size),
+        _input_frame_size(input_frame_size) {
         RecalcVolume();
         if(cvt) {
             _cvtbuf.resize(
@@ -179,10 +193,11 @@ public:
 
     void AppendBuffer(const void *_inbuf,
                       unsigned int inlen /*, int tag = 0*/) override {
+        std::lock_guard<std::mutex> lk(_buffer_mtx);
         if(_cvt) {
             std::vector<uint8_t> buffer;
             uint8_t *inbuf = (uint8_t *)_inbuf;
-            int buflen = _frame_size * 2352;
+            int buflen = _input_frame_size * 2352;
             _cvt->len = buflen;
             while(inlen > buflen) { // fill 2352 samples to fit 48k/44.1k
                 memcpy(_cvt->buf, inbuf, buflen);
@@ -200,12 +215,10 @@ public:
                 buffer.insert(buffer.end(), _cvt->buf,
                               _cvt->buf + _cvt->len_cvt);
             }
-            std::lock_guard<std::mutex> lk(_buffer_mtx);
             _inCachedSamples += buffer.size() / _frame_size;
             _buffers.emplace_back();
             _buffers.back().swap(buffer);
         } else {
-            std::lock_guard<std::mutex> lk(_buffer_mtx);
             _buffers.emplace_back((uint8_t *)_inbuf,
                                   ((uint8_t *)_inbuf) + inlen);
             _inCachedSamples += inlen / _frame_size;
@@ -227,6 +240,8 @@ public:
 
     tjs_uint GetCurrentPlaySamples() override;
 
+    tjs_uint GetPlaybackSampleRate() override;
+
     float GetLatencySeconds() override;
 
     void FillBuffer(uint8_t *out, int len);
@@ -238,6 +253,8 @@ protected:
     std::mutex _streams_mtx;
     std::unordered_set<tTVPSoundBuffer *> _streams;
     int _frame_size = 0;
+    std::atomic<std::uint64_t> _callback_count{0};
+    std::atomic<Uint64> _last_callback_ms{0};
 
 public:
     iTVPAudioRenderer() {
@@ -246,13 +263,18 @@ public:
         _spec.format = AUDIO_S16;
         _spec.channels = 2;
         _spec.callback = [](void *p, Uint8 *s, int l) {
+            auto *renderer = static_cast<iTVPAudioRenderer *>(p);
+            renderer->_callback_count.fetch_add(1, std::memory_order_relaxed);
+            renderer->_last_callback_ms.store(SDL_GetTicks64(),
+                                              std::memory_order_relaxed);
             memset(s, 0, l);
-            ((iTVPAudioRenderer *)p)->FillBuffer(s, l);
+            renderer->FillBuffer(s, l);
         };
         _spec.userdata = this;
         _spec.size = 4;
         _frame_size = 4;
     }
+    virtual ~iTVPAudioRenderer() = default;
 
     void InitMixer() {
         if(SDL_Init(SDL_INIT_AUDIO) < 0) { // for format converter
@@ -275,6 +297,14 @@ public:
     }
 
     virtual bool Init() = 0;
+
+    virtual void SuspendForHost() {}
+
+    virtual bool ResumeForHost() { return true; }
+
+    virtual bool IsSuspendedForHost() const { return false; }
+
+    virtual void PollForHost() {}
 
     virtual tTVPSoundBuffer *CreateStream(tTVPWaveFormat &fmt, int bufcount) {
         SDL_AudioSpec spec;
@@ -312,7 +342,8 @@ public:
         }
 
         tTVPSoundBuffer *s =
-            new tTVPSoundBuffer(fmt.BytesPerSample * fmt.Channels, cvt);
+            new tTVPSoundBuffer(fmt.BytesPerSample * fmt.Channels,
+                                _frame_size, cvt);
         std::lock_guard<std::mutex> lk(_streams_mtx);
         _streams.emplace(s);
         return s;
@@ -350,19 +381,31 @@ tTVPSoundBuffer::~tTVPSoundBuffer() {
 }
 
 tjs_uint tTVPSoundBuffer::GetLatencySamples() {
+    std::lock_guard<std::mutex> lk(_buffer_mtx);
     int32_t samples = TVPAudioRenderer->GetUnprocessedSamples();
-    return samples + _inCachedSamples;
+    return static_cast<tjs_uint>(std::max<int32_t>(samples, 0)) +
+        _inCachedSamples;
 }
 
 tjs_uint tTVPSoundBuffer::GetCurrentPlaySamples() {
+    std::lock_guard<std::mutex> lk(_buffer_mtx);
     int32_t samples = TVPAudioRenderer->GetUnprocessedSamples();
     if(samples > _sendedSamples)
         return 0;
     return _sendedSamples - samples; // -GetLatencySamples();
 }
 
+tjs_uint tTVPSoundBuffer::GetPlaybackSampleRate() {
+    return static_cast<tjs_uint>(
+        std::max(TVPAudioRenderer->GetSpec().freq, 0));
+}
+
 float tTVPSoundBuffer::GetLatencySeconds() {
-    return GetLatencySamples() / TVPAudioRenderer->GetSpec().freq;
+    const int sample_rate = TVPAudioRenderer->GetSpec().freq;
+    if(sample_rate <= 0)
+        return 0.0f;
+    return static_cast<float>(GetLatencySamples()) /
+        static_cast<float>(sample_rate);
 }
 
 void tTVPSoundBuffer::FillBuffer(uint8_t *out, int len) {
@@ -389,22 +432,141 @@ void tTVPSoundBuffer::FillBuffer(uint8_t *out, int len) {
 }
 
 class tTVPAudioRendererSDL : public iTVPAudioRenderer {
-    SDL_AudioDeviceID _playback_id;
+    SDL_AudioDeviceID _playback_id = 0;
+    bool _host_suspended = false;
+    Uint64 _next_resume_attempt_ms = 0;
+    bool _resume_probe_pending = false;
+    Uint64 _resume_probe_started_ms = 0;
+    std::uint64_t _resume_probe_callback_count = 0;
 
-public:
-    bool Init() override {
-        InitMixer();
-        _playback_id = SDL_OpenAudioDevice(nullptr, false, &_spec, &_spec,
-                                           SDL_AUDIO_ALLOW_ANY_CHANGE);
+    static const char *StatusName(SDL_AudioStatus status) {
+        switch(status) {
+            case SDL_AUDIO_STOPPED:
+                return "stopped";
+            case SDL_AUDIO_PLAYING:
+                return "playing";
+            case SDL_AUDIO_PAUSED:
+                return "paused";
+            default:
+                return "unknown";
+        }
+    }
+
+    void LogLifecycleState(const char *event) const {
+        const Uint64 now = SDL_GetTicks64();
+        const Uint64 last = _last_callback_ms.load(std::memory_order_relaxed);
+        const auto callbacks =
+            _callback_count.load(std::memory_order_relaxed);
+        const auto status = _playback_id
+            ? SDL_GetAudioDeviceStatus(_playback_id)
+            : SDL_AUDIO_STOPPED;
+        spdlog::info(
+            "iOS audio lifecycle {} device={} status={} suspended={} "
+            "callbacks={} last_callback_age_ms={} sdl_error=\"{}\"",
+            event, static_cast<unsigned int>(_playback_id), StatusName(status),
+            _host_suspended ? 1 : 0,
+            static_cast<unsigned long long>(callbacks),
+            last == 0 || now < last
+                ? static_cast<unsigned long long>(0)
+                : static_cast<unsigned long long>(now - last),
+            SDL_GetError());
+    }
+
+    bool OpenPlaybackDevice(int allowedChanges) {
+        SDL_AudioSpec requested = _spec;
+        SDL_AudioSpec obtained;
+        memset(&obtained, 0, sizeof(obtained));
+        _playback_id = SDL_OpenAudioDevice(nullptr, false, &requested, &obtained,
+                                           allowedChanges);
         if(_playback_id <= 0) {
-            SDL_Log("Fail to open audio @%dHz.", _spec.freq);
+            _playback_id = 0;
+            SDL_Log("Fail to open audio @%dHz: %s", requested.freq,
+                    SDL_GetError());
             return false;
         }
+        _spec = obtained;
         _frame_size = SDL_AUDIO_BITSIZE(_spec.format) / 8 * _spec.channels;
         SDL_Log("Audio Device: %s", SDL_GetCurrentAudioDriver());
         SDL_PauseAudioDevice(_playback_id, false);
         SetupMixer();
         return true;
+    }
+
+public:
+    virtual ~tTVPAudioRendererSDL() {
+        if(_playback_id)
+            SDL_CloseAudioDevice(_playback_id);
+    }
+
+    bool Init() override {
+        InitMixer();
+        return OpenPlaybackDevice(SDL_AUDIO_ALLOW_ANY_CHANGE);
+    }
+
+    void SuspendForHost() override {
+        if(_host_suspended)
+            return;
+        LogLifecycleState("suspend_begin");
+        _host_suspended = true;
+        _next_resume_attempt_ms = 0;
+        _resume_probe_pending = false;
+        if(_playback_id) {
+            SDL_PauseAudioDevice(_playback_id, true);
+        }
+        LogLifecycleState("suspend_complete");
+    }
+
+    bool ResumeForHost() override {
+        if(!_host_suspended)
+            return true;
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        const Uint64 now = SDL_GetTicks64();
+        if(_next_resume_attempt_ms != 0 && now < _next_resume_attempt_ms)
+            return false;
+
+        LogLifecycleState("resume_attempt");
+
+        // SDL's iOS backend owns an interruption observer for this device. Keep
+        // it alive across suspension so UIApplicationDidBecomeActive can
+        // restart its AudioQueue, then explicitly reactivate the shared
+        // AVAudioSession. Closing the device here removes that observer and can
+        // also deactivate Godot's audio session out from under the host.
+        if(!TVPActivateAudioSessionForHost()) {
+            _next_resume_attempt_ms = now + 250;
+            LogLifecycleState("resume_session_deferred");
+            return false;
+        }
+#endif
+        if(_playback_id)
+            SDL_PauseAudioDevice(_playback_id, false);
+        _host_suspended = false;
+        _next_resume_attempt_ms = 0;
+        _resume_probe_pending = true;
+        _resume_probe_started_ms = SDL_GetTicks64();
+        _resume_probe_callback_count =
+            _callback_count.load(std::memory_order_relaxed);
+        LogLifecycleState("resume_unpaused");
+        return true;
+    }
+
+    bool IsSuspendedForHost() const override { return _host_suspended; }
+
+    void PollForHost() override {
+        if(!_resume_probe_pending)
+            return;
+        const Uint64 now = SDL_GetTicks64();
+        const auto callbacks =
+            _callback_count.load(std::memory_order_relaxed);
+        if(callbacks > _resume_probe_callback_count) {
+            _resume_probe_pending = false;
+            LogLifecycleState("resume_callback_healthy");
+            return;
+        }
+        if(now - _resume_probe_started_ms >= 2000) {
+            _resume_probe_pending = false;
+            LogLifecycleState("resume_callback_stalled");
+        }
     }
 };
 
@@ -445,6 +607,8 @@ public:
                     break;
                 case oboe::AudioFormat::Float:
                     _spec.format = AUDIO_F32LSB;
+                    break;
+                default:
                     break;
             }
             _frame_size = SDL_AUDIO_BITSIZE(_spec.format) / 8 * _spec.channels;
@@ -499,12 +663,15 @@ class tTVPSoundBufferAL : public tTVPSoundBuffer {
 
 public:
     tTVPSoundBufferAL(tTVPWaveFormat &desired, int bufcount) :
-        tTVPSoundBuffer(desired.BytesPerSample * desired.Channels, nullptr),
+        tTVPSoundBuffer(desired.BytesPerSample * desired.Channels,
+                        desired.BytesPerSample * desired.Channels, nullptr),
         _bufferCount(bufcount) {
         _bufferIds = new ALuint[bufcount];
         _bufferIds2 = new ALuint[bufcount];
         _bufferSize = new tjs_uint[bufcount];
+        std::fill(_bufferSize, _bufferSize + _bufferCount, 0);
         _format = desired;
+        TVPEnsureALContext();
         alGenSources(1, &_alSource);
         alGenBuffers(_bufferCount, _bufferIds);
         alSourcef(_alSource, AL_GAIN, 1.0f);
@@ -536,14 +703,24 @@ public:
     }
 
     ~tTVPSoundBufferAL() override {
-        alDeleteBuffers(_bufferCount, _bufferIds);
-        alDeleteSources(1, &_alSource);
+        std::lock_guard<std::mutex> lk(_buffer_mtx);
+        TVPEnsureALContext();
+        if(_alSource) {
+            alSourceStop(_alSource);
+            UnqueueAllBuffersLocked();
+            alSourcei(_alSource, AL_BUFFER, 0);
+            alDeleteSources(1, &_alSource);
+            _alSource = 0;
+        }
+        if(_bufferIds)
+            alDeleteBuffers(_bufferCount, _bufferIds);
         delete[] _bufferIds;
         delete[] _bufferIds2;
         delete[] _bufferSize;
     }
 
     bool IsBufferValid() override {
+        TVPEnsureALContext();
         ALint processed = 0;
         alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &processed);
         if(processed > 0)
@@ -558,11 +735,14 @@ public:
         if(len <= 0)
             return;
         std::lock_guard<std::mutex> lk(_buffer_mtx);
+        TVPEnsureALContext();
 
         /* First remove any processed buffers. */
         ALint processed = 0;
         alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &processed);
         if(processed > 0) {
+            if(processed > static_cast<ALint>(_bufferCount))
+                processed = _bufferCount;
             alSourceUnqueueBuffers(_alSource, processed, _bufferIds2);
             checkerr("alSourceUnqueueBuffers");
             for(int i = 0; i < processed; ++i) {
@@ -591,16 +771,38 @@ public:
         checkerr("alSourceQueueBuffers");
         //_tags[_bufferIdx] = tag;
         _bufferSize[_bufferIdx] = len;
+        if(_playing) {
+            ALenum state;
+            alGetSourcei(_alSource, AL_SOURCE_STATE, &state);
+            checkerr("AppendBuffer state");
+            if(state != AL_PLAYING) {
+                alSourcePlay(_alSource);
+                checkerr("AppendBuffer play");
+            }
+        }
     }
 
     void Reset() override {
-        inherit::Reset();
         std::lock_guard<std::mutex> lk(_buffer_mtx);
-        alSourceRewind(_alSource);
-        alSourcei(_alSource, AL_BUFFER, 0);
+        _buffers.clear();
+        _inCachedSamples = 0;
+        _sendedFrontBuffer = 0;
+        _sendedSamples = 0;
+        TVPEnsureALContext();
+        if(_alSource) {
+            alSourceStop(_alSource);
+            UnqueueAllBuffersLocked();
+            alSourcei(_alSource, AL_BUFFER, 0);
+            alSourceRewind(_alSource);
+            checkerr("Reset rewind");
+        }
+        _playing = false;
+        _bufferIdx = -1;
+        std::fill(_bufferSize, _bufferSize + _bufferCount, 0);
     }
 
     void Pause() override {
+        TVPEnsureALContext();
         alSourcePause(_alSource);
         checkerr("Pause");
         _playing = false;
@@ -609,6 +811,7 @@ public:
     static void checkerr(const char *funcname);
 
     void Play() override {
+        TVPEnsureALContext();
         ALenum state;
         alGetSourcei(_alSource, AL_SOURCE_STATE, &state);
         checkerr("Play");
@@ -621,48 +824,55 @@ public:
     }
 
     void Stop() override {
+        TVPEnsureALContext();
         alSourceStop(_alSource);
         checkerr("Stop");
         Reset();
-        _bufferIdx = -1;
         _playing = false;
     }
 
     void SetVolume(float volume) override {
+        TVPEnsureALContext();
         alSourcef(_alSource, AL_GAIN, volume);
         checkerr("SetVolume");
     }
 
     float GetVolume() override {
+        TVPEnsureALContext();
         float volume = 0;
         alGetSourcef(_alSource, AL_GAIN, &volume);
         return volume;
     }
 
     void SetPan(float pan) override {
+        TVPEnsureALContext();
         float sourcePosAL[] = { pan, 0.0f, 0.0f };
         alSourcefv(_alSource, AL_POSITION, sourcePosAL);
     }
 
     float GetPan() override {
+        TVPEnsureALContext();
         float sourcePosAL[3];
         alGetSourcefv(_alSource, AL_POSITION, sourcePosAL);
         return sourcePosAL[0];
     }
 
     bool IsPlaying() override {
+        TVPEnsureALContext();
         ALenum state;
         alGetSourcei(_alSource, AL_SOURCE_STATE, &state);
         return state == AL_PLAYING;
     }
 
     void SetPosition(float x, float y, float z) override {
+        TVPEnsureALContext();
         float sourcePosAL[] = { x, y, z };
         alSourcefv(_alSource, AL_POSITION, sourcePosAL);
         checkerr("SetPosition");
     }
 
     int GetRemainBuffers() override {
+        TVPEnsureALContext();
         ALint processed, queued = 0;
         alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &processed);
         alGetSourcei(_alSource, AL_BUFFERS_QUEUED, &queued);
@@ -671,6 +881,7 @@ public:
 
     tjs_uint GetLatencySamples() override {
         std::lock_guard<std::mutex> lk(_buffer_mtx);
+        TVPEnsureALContext();
         ALint offset = 0, queued = 0;
         alGetSourcei(_alSource, AL_BYTE_OFFSET, &offset);
         alGetSourcei(_alSource, AL_BUFFERS_QUEUED, &queued);
@@ -694,20 +905,109 @@ public:
     }
 
     tjs_uint GetCurrentPlaySamples() override {
+        std::lock_guard<std::mutex> lk(_buffer_mtx);
+        TVPEnsureALContext();
         ALint offset = 0;
         alGetSourcei(_alSource, AL_SAMPLE_OFFSET, &offset);
         return _sendedSamples + offset;
     }
+
+    tjs_uint GetPlaybackSampleRate() override {
+        return static_cast<tjs_uint>(_format.SamplesPerSec);
+    }
+
+private:
+    void UnqueueAllBuffersLocked() {
+        ALint queued = 0;
+        alGetSourcei(_alSource, AL_BUFFERS_QUEUED, &queued);
+        while(queued-- > 0) {
+            ALuint bufid = 0;
+            alSourceUnqueueBuffers(_alSource, 1, &bufid);
+        }
+    }
 };
 
 class tTVPAudioRendererAL : public iTVPAudioRenderer {
+    using ALCDevicePauseProc = void(ALC_APIENTRY *)(ALCdevice *);
+    using ALCDeviceResumeProc = void(ALC_APIENTRY *)(ALCdevice *);
+    using ALCReopenDeviceProc = ALCboolean(ALC_APIENTRY *)(
+        ALCdevice *, const ALCchar *, const ALCint *);
+
     ALCdevice *_device = nullptr;
     ALCcontext *_context = nullptr;
+    bool _host_suspended = false;
+    Uint64 _next_resume_attempt_ms = 0;
+    bool _used_device_pause = false;
+    bool _resume_probe_pending = false;
+    Uint64 _resume_probe_started_ms = 0;
+    ALCDevicePauseProc _device_pause = nullptr;
+    ALCDeviceResumeProc _device_resume = nullptr;
+    ALCReopenDeviceProc _reopen_device = nullptr;
+
+    void LoadHostLifecycleExtensions() {
+        if(!_device)
+            return;
+        if(alcIsExtensionPresent(_device, "ALC_SOFT_pause_device") ==
+           ALC_TRUE) {
+            _device_pause = reinterpret_cast<ALCDevicePauseProc>(
+                alcGetProcAddress(_device, "alcDevicePauseSOFT"));
+            _device_resume = reinterpret_cast<ALCDeviceResumeProc>(
+                alcGetProcAddress(_device, "alcDeviceResumeSOFT"));
+        }
+        if(alcIsExtensionPresent(_device, "ALC_SOFT_reopen_device") ==
+           ALC_TRUE) {
+            _reopen_device = reinterpret_cast<ALCReopenDeviceProc>(
+                alcGetProcAddress(_device, "alcReopenDeviceSOFT"));
+        }
+        spdlog::info(
+            "iOS OpenAL host extensions pause_device={} reopen_device={}",
+            _device_pause && _device_resume ? 1 : 0,
+            _reopen_device ? 1 : 0);
+    }
+
+    void LogLifecycleState(const char *event) {
+        std::size_t stream_count = 0;
+        std::size_t logical_playing = 0;
+        std::size_t source_playing = 0;
+        {
+            std::lock_guard<std::mutex> lk(_streams_mtx);
+            stream_count = _streams.size();
+            for(tTVPSoundBuffer *stream : _streams) {
+                if(!stream->_playing)
+                    continue;
+                ++logical_playing;
+                // Querying a source implicitly restores TVPALContext as the
+                // current context. Leave it detached while host-suspended.
+                if(!_host_suspended && stream->IsPlaying())
+                    ++source_playing;
+            }
+        }
+        const ALCenum error = _device ? alcGetError(_device) : ALC_NO_ERROR;
+        spdlog::info(
+            "iOS OpenAL lifecycle {} device={} context={} context_current={} "
+            "suspended={} streams={} logical_playing={} source_playing={} "
+            "alc_error={}",
+            event, static_cast<const void *>(_device),
+            static_cast<const void *>(_context),
+            _context && alcGetCurrentContext() == _context ? 1 : 0,
+            _host_suspended ? 1 : 0, stream_count, logical_playing,
+            source_playing, static_cast<int>(error));
+    }
+
+    void RestartLogicalStreams() {
+        std::lock_guard<std::mutex> lk(_streams_mtx);
+        for(tTVPSoundBuffer *stream : _streams) {
+            if(stream->_playing && !stream->IsPlaying())
+                stream->Play();
+        }
+    }
 
 public:
     virtual ~tTVPAudioRendererAL() {
         if(_context) {
             // alDeleteSources(TVP_MAX_AUDIO_COUNT, _alSources);
+            if(_context == TVPALContext)
+                TVPALContext = nullptr;
             alcMakeContextCurrent(nullptr);
             alcDestroyContext(_context);
         }
@@ -730,23 +1030,110 @@ public:
             while(*devices) {
                 TVPAddImportantLog(log + devices);
                 alldev.emplace_back(devices);
-                devices += alldev.back().length();
+                devices += alldev.back().length() + 1;
             }
-            _device = alcOpenDevice(alldev[0].c_str());
+            _device =
+                alcOpenDevice(alldev.empty() ? nullptr : alldev[0].c_str());
         }
         if(!_device)
             return false;
 
         _context = alcCreateContext(_device, nullptr);
+        if(!_context)
+            return false;
         alcMakeContextCurrent(_context);
+        TVPALContext = _context;
+        LoadHostLifecycleExtensions();
 
         return true;
     }
 
     tTVPSoundBuffer *CreateStream(tTVPWaveFormat &fmt, int bufcount) override {
         tTVPSoundBuffer *s = new tTVPSoundBufferAL(fmt, bufcount);
+        std::lock_guard<std::mutex> lk(_streams_mtx);
         _streams.emplace(s);
         return s;
+    }
+
+    void SuspendForHost() override {
+        if(_host_suspended)
+            return;
+        LogLifecycleState("suspend_begin");
+        _host_suspended = true;
+        _next_resume_attempt_ms = 0;
+        _resume_probe_pending = false;
+        if(_context) {
+            // OpenAL Soft treats alcSuspendContext as deferred property
+            // updates, not as a hardware/DSP pause. Stop the actual output
+            // device before iOS deactivates AVAudioSession so its RemoteIO
+            // unit has a clean foreground restart path.
+            if(_device_pause && _device_resume) {
+                _device_pause(_device);
+                _used_device_pause = true;
+            } else {
+                alcSuspendContext(_context);
+                _used_device_pause = false;
+            }
+            alcMakeContextCurrent(nullptr);
+        }
+        LogLifecycleState("suspend_complete");
+    }
+
+    bool ResumeForHost() override {
+        if(!_host_suspended)
+            return true;
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        const Uint64 now = SDL_GetTicks64();
+        if(_next_resume_attempt_ms != 0 && now < _next_resume_attempt_ms)
+            return false;
+        LogLifecycleState("resume_attempt");
+        if(!TVPActivateAudioSessionForHost()) {
+            _next_resume_attempt_ms = now + 250;
+            LogLifecycleState("resume_session_deferred");
+            return false;
+        }
+#endif
+
+        // Recreate OpenAL Soft's CoreAudio RemoteIO backend after the shared
+        // session has been reactivated. ALC_SOFT_reopen_device preserves all
+        // contexts, sources, buffers, playback offsets, and object identity.
+        // Merely processing the context cannot revive a RemoteIO unit stopped
+        // by iOS suspension.
+        if(_reopen_device) {
+            const ALCboolean reopened =
+                _reopen_device(_device, nullptr, nullptr);
+            spdlog::info("iOS OpenAL device reopen result={}",
+                         reopened == ALC_TRUE ? 1 : 0);
+        }
+
+        if(_context) {
+            alcMakeContextCurrent(_context);
+            if(_used_device_pause && _device_resume)
+                _device_resume(_device);
+            else
+                alcProcessContext(_context);
+        }
+        TVPALContext = _context;
+        RestartLogicalStreams();
+        _host_suspended = false;
+        _next_resume_attempt_ms = 0;
+        _resume_probe_pending = true;
+        _resume_probe_started_ms = SDL_GetTicks64();
+        LogLifecycleState("resume_complete");
+        return true;
+    }
+
+    bool IsSuspendedForHost() const override { return _host_suspended; }
+
+    void PollForHost() override {
+        if(!_resume_probe_pending)
+            return;
+        const Uint64 now = SDL_GetTicks64();
+        if(now - _resume_probe_started_ms < 500)
+            return;
+        _resume_probe_pending = false;
+        LogLifecycleState("resume_post_unlock");
     }
 
     ALCcontext *GetContext() { return _context; }
@@ -754,11 +1141,7 @@ public:
 
 void tTVPSoundBufferAL::checkerr(const char *funcname) {
 #if _DEBUG
-    ALCcontext *ctx =
-        static_cast<tTVPAudioRendererAL *>(TVPAudioRenderer)->GetContext();
-    if(alcGetCurrentContext() != ctx) {
-        alcMakeContextCurrent(ctx);
-    }
+    TVPEnsureALContext();
     ALenum err = alGetError();
     if(AL_NO_ERROR == err)
         return;
@@ -777,9 +1160,28 @@ static iTVPAudioRenderer *CreateAudioRenderer() {
     renderer = new tTVPAudioRendererSDL;
     renderer->Init();
     return renderer;
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    renderer = new tTVPAudioRendererSDL;
+    if(renderer->Init()) {
+        spdlog::info("iOS audio renderer selected: SDL");
+        return renderer;
+    }
+    spdlog::warn("iOS SDL audio renderer unavailable; falling back to OpenAL");
+    delete renderer;
+#elif defined(__linux__)
+    renderer = new tTVPAudioRendererSDL;
+    if(renderer->Init()) {
+        spdlog::info("Linux audio renderer selected: SDL");
+        return renderer;
+    }
+    spdlog::warn("Linux SDL audio renderer unavailable; falling back to OpenAL");
+    delete renderer;
 #endif
     renderer = new tTVPAudioRendererAL;
     renderer->Init();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    spdlog::info("iOS audio renderer selected: OpenAL");
+#endif
     return renderer;
 }
 
@@ -791,7 +1193,28 @@ void TVPInitDirectSound(int freq) {
 }
 
 void TVPUninitDirectSound() {
-    // nothing to do
+    delete TVPAudioRenderer;
+    TVPAudioRenderer = nullptr;
+    TVPALContext = nullptr;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+void TVPSuspendAudioRendererForHost() {
+    if(TVPAudioRenderer)
+        TVPAudioRenderer->SuspendForHost();
+}
+
+bool TVPResumeAudioRendererForHost() {
+    return !TVPAudioRenderer || TVPAudioRenderer->ResumeForHost();
+}
+
+bool TVPIsAudioRendererSuspendedForHost() {
+    return TVPAudioRenderer && TVPAudioRenderer->IsSuspendedForHost();
+}
+
+void TVPPollAudioRendererForHost() {
+    if(TVPAudioRenderer)
+        TVPAudioRenderer->PollForHost();
 }
 
 iTVPSoundBuffer *TVPCreateSoundBuffer(tTVPWaveFormat &fmt, int bufcount) {

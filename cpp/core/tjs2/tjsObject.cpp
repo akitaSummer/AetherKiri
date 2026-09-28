@@ -11,12 +11,17 @@
 #include "tjsCommHead.h"
 
 #include "tjsObject.h"
+#include "tjsArray.h"
+#include "tjsDictionary.h"
 #include "tjsUtils.h"
 #include "tjsNative.h"
 #include "../plugin/PluginCallTracer.hpp"
 #include "tjsHashSearch.h"
 #include "tjsGlobalStringMap.h"
 #include "tjsDebug.h"
+#include "../base/ScriptMgnIntf.h"
+
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 
@@ -33,11 +38,380 @@ extern "C" void TJS_GetObjByHashBits(int64_t out[8]) {
 }
 
 namespace TJS {
+    static tjs_error TJSCompatTouchImage(tTJSVariant *result,
+                                         tjs_int numparams,
+                                         tTJSVariant **param,
+                                         iTJSDispatch2 *) {
+        if(result)
+            *result = (tjs_int)0;
+        return TJS_S_OK;
+    }
+
+    static bool TJSCompatResolveTouchImage(const tjs_char *membername,
+                                           tTJSVariant *result) {
+        if(!membername || !result ||
+           TJS_strcmp(membername, TJS_W("touchImage"))) {
+            return false;
+        }
+        iTJSDispatch2 *method = TJSCreateNativeClassMethod(TJSCompatTouchImage);
+        if(!method)
+            return false;
+        *result = tTJSVariant(method, method);
+        method->Release();
+        return true;
+    }
+
+    static bool TJSCompatIsStartupNoOpFunction(const tjs_char *membername) {
+        return membername &&
+               (!TJS_strcmp(membername, TJS_W("bootStrap")) ||
+                !TJS_strcmp(membername, TJS_W("commitSavedata")) ||
+                !TJS_strcmp(membername, TJS_W("addDllDirectory")) ||
+                !TJS_strcmp(membername, TJS_W("KAGLayerConstructor")) ||
+                !TJS_strcmp(membername, TJS_W("KAGLayerFinalizer")) ||
+                !TJS_strcmp(membername, TJS_W("loadResolutionInfo")) ||
+                !TJS_strcmp(membername, TJS_W("parseArchiveIndex")) ||
+                !TJS_strcmp(membername, TJS_W("setDefaultDllDirectories")) ||
+                !TJS_strcmp(membername, TJS_W("checkSignature")) ||
+                !TJS_strcmp(membername, TJS_W("pathHash")));
+    }
+
+    static tjs_error TJSCompatStartupNoOpFunction(tTJSVariant *result,
+                                                  tjs_int,
+                                                  tTJSVariant **,
+                                                  iTJSDispatch2 *) {
+        if(result)
+            *result = static_cast<tjs_int>(1);
+        return TJS_S_OK;
+    }
+
+    static iTJSDispatch2 *TJSCompatCreateCompoundStorageMediaObject() {
+        iTJSDispatch2 *object = TJSCreateDictionaryObject();
+        if(!object)
+            return nullptr;
+
+        const tjs_char *const methods[] = {
+            TJS_W("addArchive"), TJS_W("addStorage"),
+            TJS_W("addAutoToolsPath"), TJS_W("setCurrentDirectory"),
+            TJS_W("register"), TJS_W("unregister"),
+            TJS_W("parseArchiveIndex"),
+            TJS_W("getLocallyAccessibleName")
+        };
+        for(const tjs_char *method_name : methods) {
+            iTJSDispatch2 *method =
+                TJSCreateNativeClassMethod(TJSCompatStartupNoOpFunction);
+            if(method) {
+                tTJSVariant value(method, method);
+                object->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
+                                method_name, nullptr, &value, object);
+                method->Release();
+            }
+        }
+
+        tTJSVariant archive_key(TJS_W("AetherKiri.CompoundStorageMedia"));
+        object->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
+                        TJS_W("archiveUniqueKey"), nullptr, &archive_key,
+                        object);
+
+        return object;
+    }
+
+    static bool TJSCompatCreateCompoundStorageMediaVariant(tTJSVariant *result) {
+        if(!result)
+            return true;
+
+        iTJSDispatch2 *object = TJSCompatCreateCompoundStorageMediaObject();
+        if(!object)
+            return false;
+
+        *result = tTJSVariant(object, object);
+        object->Release();
+        return true;
+    }
+
+    static tjs_error TJSCompatCompoundStorageMediaFactory(tTJSVariant *result,
+                                                          tjs_int,
+                                                          tTJSVariant **,
+                                                          iTJSDispatch2 *) {
+        return TJSCompatCreateCompoundStorageMediaVariant(result) ? TJS_S_OK
+                                                                 : TJS_E_FAIL;
+    }
+
+    class TJSCompatCompoundStorageMediaClass : public tTJSDispatch {
+    public:
+        tjs_error FuncCall(tjs_uint32, const tjs_char *membername,
+                           tjs_uint32 *, tTJSVariant *result, tjs_int,
+                           tTJSVariant **, iTJSDispatch2 *) override {
+            if(membername)
+                return TJS_E_MEMBERNOTFOUND;
+            return TJSCompatCreateCompoundStorageMediaVariant(result) ? TJS_S_OK
+                                                                     : TJS_E_FAIL;
+        }
+
+        tjs_error CreateNew(tjs_uint32, const tjs_char *membername,
+                            tjs_uint32 *, iTJSDispatch2 **result, tjs_int,
+                            tTJSVariant **, iTJSDispatch2 *) override {
+            if(membername)
+                return TJS_E_MEMBERNOTFOUND;
+            if(!result)
+                return TJS_E_INVALIDPARAM;
+
+            tTJSVariant variant;
+            if(!TJSCompatCreateCompoundStorageMediaVariant(&variant))
+                return TJS_E_FAIL;
+
+            tTJSVariantClosure closure = variant.AsObjectClosure();
+            *result = closure.Object;
+            if(*result)
+                (*result)->AddRef();
+            closure.Release();
+            return *result ? TJS_S_OK : TJS_E_FAIL;
+        }
+    };
+
+    static bool TJSCompatResolveStartupFallback(const tjs_char *membername,
+                                                tTJSVariant *result) {
+        if(!membername || !result)
+            return false;
+
+        if(TJSCompatIsStartupNoOpFunction(membername)) {
+            iTJSDispatch2 *method =
+                TJSCreateNativeClassMethod(TJSCompatStartupNoOpFunction);
+            if(!method)
+                return false;
+            *result = tTJSVariant(method, method);
+            method->Release();
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("ShortCutInitialPadKeyMap")) ||
+           !TJS_strcmp(membername, TJS_W("ShortCutInitialGamePadKeyMap"))) {
+            iTJSDispatch2 *array = TJSCreateArrayObject();
+            if(!array)
+                return false;
+            *result = tTJSVariant(array, array);
+            array->Release();
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("CompoundStorageMedia"))) {
+            iTJSDispatch2 *klass = new TJSCompatCompoundStorageMediaClass();
+            *result = tTJSVariant(klass, klass);
+            klass->Release();
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("archiveUniqueKey"))) {
+            *result = TJS_W("AetherKiri.CompoundStorageMedia");
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("kirikiriz")) ||
+           !TJS_strcmp(membername, TJS_W("inXP3archivePacked"))) {
+            *result = static_cast<tjs_int>(1);
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("llsDllLoadDir"))) {
+            *result = static_cast<tjs_int>(0x00000100);
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("llsApplicationDir"))) {
+            *result = static_cast<tjs_int>(0x00000200);
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("llsUserDirs"))) {
+            *result = static_cast<tjs_int>(0x00000400);
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("llsSystem32"))) {
+            *result = static_cast<tjs_int>(0x00000800);
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("llsDefaultDirs"))) {
+            *result = static_cast<tjs_int>(0x00001000);
+            return true;
+        }
+
+        if(!TJS_strcmp(membername, TJS_W("kirikiriz_generic")) ||
+           !TJS_strcmp(membername, TJS_W("debugWindowEnabled")) ||
+           !TJS_strcmp(membername, TJS_W("developMode"))) {
+            *result = static_cast<tjs_int>(0);
+            return true;
+        }
+
+        return false;
+    }
+
+    static const tjs_char *TJSCompatGlobalFallbackName(const tjs_char *membername) {
+        if(!membername) return nullptr;
+        if(!TJS_strcmp(membername, TJS_W("LayerClass")))
+            return TJS_W("Layer");
+
+        static const tjs_char *const names[] = {
+            TJS_W("System"), TJS_W("Storages"), TJS_W("Scripts"),
+            TJS_W("Dictionary"), TJS_W("Debug"), TJS_W("Math"),
+            TJS_W("Plugins"), TJS_W("Window"), TJS_W("Layer"),
+            TJS_W("inSystemMenuStorages"), TJS_W("kagHookEntries"),
+            TJS_W("afterInitCallback"), TJS_W("COMMAND_SYNC"),
+            TJS_W("COMMAND_ASYNC"), TJS_W("COMMAND_WAIT"),
+            TJS_W("kirikiriz"), TJS_W("kirikiriz_generic"),
+            TJS_W("AffineSource"), TJS_W("AffineSourceBMPBase"),
+            TJS_W("AffineSourceImage"), TJS_W("AffineSourceBitmap"),
+            TJS_W("AffineSourceStand"), TJS_W("AffineSourceGLES"),
+            TJS_W("clNone"), TJS_W("ltBinder"), TJS_W("ltOpaque"),
+            TJS_W("ltAlpha"), TJS_W("ltAdditive"), TJS_W("ltSubtractive"),
+            TJS_W("omAlpha"), TJS_W("omAuto"),
+            TJS_W("debugWindowEnabled")
+        };
+        for(const tjs_char *name : names) {
+            if(!TJS_strcmp(membername, name))
+                return name;
+        }
+        return nullptr;
+    }
+
+    static bool TJSCompatResolveGlobalFallback(const tjs_char *membername,
+                                               tTJSVariant *result) {
+        if(!result) return false;
+        const tjs_char *globalName = TJSCompatGlobalFallbackName(membername);
+        if(!globalName) return false;
+
+        static thread_local bool resolving = false;
+        if(resolving)
+            return false;
+
+        resolving = true;
+        tTJS *engine = TVPGetScriptEngine();
+        if(!engine) {
+            resolving = false;
+            return false;
+        }
+        iTJSDispatch2 *global = engine->GetGlobalNoAddRef();
+        if(!global) {
+            resolving = false;
+            return false;
+        }
+
+        try {
+            const bool ok = TJS_SUCCEEDED(
+                global->PropGet(0, globalName, nullptr, result, global));
+            resolving = false;
+            return ok;
+        } catch(...) {
+            resolving = false;
+            throw;
+        }
+    }
+
+    static bool TJSCompatIsKagRuntimeDefaultName(const tjs_char *membername) {
+        return membername &&
+               (!TJS_strcmp(membername, TJS_W("autoMode")) ||
+                !TJS_strcmp(membername, TJS_W("skipMode")) ||
+                !TJS_strcmp(membername, TJS_W("autoModePageWait")) ||
+                !TJS_strcmp(membername, TJS_W("autoModeLineWait")) ||
+                !TJS_strcmp(membername, TJS_W("userChSpeed")) ||
+                !TJS_strcmp(membername, TJS_W("autoModeWaitVoice")));
+    }
+
+    static bool TJSCompatIsGlobalKagReceiver(iTJSDispatch2 *target,
+                                             iTJSDispatch2 *objthis) {
+        static thread_local bool resolving = false;
+        if(resolving)
+            return false;
+
+        resolving = true;
+        tTJS *engine = TVPGetScriptEngine();
+        if(!engine) {
+            resolving = false;
+            return false;
+        }
+        iTJSDispatch2 *global = engine->GetGlobalNoAddRef();
+        if(!global) {
+            resolving = false;
+            return false;
+        }
+
+        tTJSVariant kagVariant;
+        if(TJS_FAILED(global->PropGet(0, TJS_W("kag"), nullptr, &kagVariant,
+                                      global)) ||
+           kagVariant.Type() != tvtObject) {
+            resolving = false;
+            return false;
+        }
+
+        tTJSVariantClosure kag = kagVariant.AsObjectClosure();
+        const bool matches =
+            kag.Object == target || kag.ObjThis == target ||
+            (objthis && (kag.Object == objthis || kag.ObjThis == objthis));
+        kag.Release();
+        resolving = false;
+        return matches;
+    }
+
+    static bool TJSCompatResolveKagRuntimeFallback(const tjs_char *membername,
+                                                   tTJSVariant *result,
+                                                   iTJSDispatch2 *target,
+                                                   iTJSDispatch2 *objthis) {
+        if(!TJSCompatIsKagRuntimeDefaultName(membername) || !result ||
+           !TJSCompatIsGlobalKagReceiver(target, objthis)) {
+            return false;
+        }
+
+        *result = static_cast<tjs_int>(0);
+        return true;
+    }
+
+    static bool TJSCompatIsTextRenderObject(iTJSDispatch2 *target,
+                                            iTJSDispatch2 *objthis) {
+        iTJSDispatch2 *dispatch = objthis ? objthis : target;
+        return dispatch &&
+               dispatch->IsInstanceOf(0, nullptr, nullptr,
+                                      TJS_W("TextRender"), dispatch) ==
+                   TJS_S_TRUE;
+    }
+
+    static bool TJSCompatResolveTextRenderRenderCount(
+        const tjs_char *membername, tTJSVariant *result, iTJSDispatch2 *target,
+        iTJSDispatch2 *objthis) {
+        if(!membername || TJS_strcmp(membername, TJS_W("renderCount")) ||
+           !TJSCompatIsTextRenderObject(target, objthis))
+            return false;
+
+        if(!result)
+            return true;
+
+        iTJSDispatch2 *dispatch = objthis ? objthis : target;
+        if(dispatch) {
+            tTJSVariant elapsed(static_cast<tjs_int>(0x3fffffff));
+            tTJSVariant *args[1] = {&elapsed};
+            tTJSVariant count;
+            if(TJS_SUCCEEDED(dispatch->FuncCall(0, TJS_W("calcShowCount"),
+                                                nullptr, &count, 1, args,
+                                                dispatch)) &&
+               count.Type() != tvtVoid) {
+                *result = count;
+                return true;
+            }
+        }
+
+        *result = static_cast<tjs_int>(0);
+        return true;
+    }
+
     static bool TJSIsStartupCompatWritableName(const tjs_char *membername) {
         return membername &&
                (!TJS_strcmp(membername, TJS_W("debugWindowEnabled")) ||
                 !TJS_strcmp(membername, TJS_W("inXP3archivePacked")) ||
-                !TJS_strcmp(membername, TJS_W("convertMode")));
+                !TJS_strcmp(membername, TJS_W("convertMode")) ||
+                !TJS_strcmp(membername, TJS_W("drawDevice")) ||
+                !TJS_strcmp(membername, TJS_W("gpuDrawDevice")) ||
+                !TJS_strcmp(membername, TJS_W("nativeDrawDevice")) ||
+                !TJS_strcmp(membername, TJS_W("OGLDrawDevice")) ||
+                !TJS_strcmp(membername, TJS_W("GLESAdaptor")));
     }
 
     //---------------------------------------------------------------------------
@@ -1249,8 +1623,41 @@ namespace TJS {
 
         tTJSSymbolData *data = Find(membername, hint);
 
+        // A failed affine source callback is especially important because it
+        // prevents the source image from ever reaching the layer compositor.
+        // Keep this probe opt-in and side-effect free: compare the normal
+        // hinted lookup with a direct lookup without changing the caller's
+        // hint.  If the latter succeeds, the issue is a stale/incorrect
+        // dispatch hint; if both fail, the class instance was not populated.
+        if(!data && membername &&
+           !TJS_strcmp(membername, TJS_W("calcImageMatrix"))) {
+            const char *trace = std::getenv("AETHERKIRI_CALC_TRACE");
+            if(trace && *trace && *trace != '0') {
+                tTJSVariant class_name;
+                std::string cls;
+                if(TJS_SUCCEEDED(ClassInstanceInfo(TJS_CII_GET, 0,
+                                                   &class_name)))
+                    cls = ttstr(class_name).AsStdString();
+                const tTJSSymbolData *uncached = Find(membername, nullptr);
+                spdlog::info(
+                    "AffineCalcLookup this={} objthis={} class={} hint={} hinted={} uncached={} count={} hashSize={} hashMask={}",
+                    static_cast<const void *>(this),
+                    static_cast<const void *>(objthis), cls,
+                    hint ? *hint : 0, static_cast<const void *>(data),
+                    static_cast<const void *>(uncached), Count, HashSize,
+                    HashMask);
+            }
+        }
+
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(membername && !TJS_strcmp(membername, TJS_W("touchImage"))) {
+                return TJSCompatTouchImage(result, numparams, param, objthis);
+            }
+            if(TJSCompatIsStartupNoOpFunction(membername)) {
+                return TJSCompatStartupNoOpFunction(result, numparams, param,
+                                                   objthis);
+            }
+            if(CallMissing) {
                 // call 'missing' method
                 tTJSVariant value_func;
                 if(CallGetMissing(membername, value_func))
@@ -1258,12 +1665,64 @@ namespace TJS {
                                               numparams, param, objthis);
             }
 
+            // Affine scene layers are script subclasses whose onPaint method
+            // is looked up with a bytecode-cached hash hint.  When diagnosing
+            // a missing affine callback, retry with an uncached lookup so we
+            // can distinguish a stale hint from a genuinely incomplete
+            // instance; this is intentionally opt-in and has no runtime
+            // behavior change.
+            if(const char *trace = std::getenv("AETHERKIRI_AFFINE_TRACE");
+               trace && *trace && !TJS_strcmp(membername, TJS_W("onPaint"))) {
+                tTJSVariant probe;
+                const tjs_error probe_er =
+                    PropGet(TJS_IGNOREPROP, membername, nullptr, &probe,
+                            objthis);
+                tTJSSymbolData *uncached_data = Find(membername, nullptr);
+                tTJSVariant obj_probe;
+                const tjs_error obj_probe_er = objthis
+                    ? objthis->PropGet(TJS_IGNOREPROP, membername, nullptr,
+                                       &obj_probe, objthis)
+                    : TJS_E_INVALIDOBJECT;
+                tTJSVariant class_name;
+                std::string cls;
+                if(TJS_SUCCEEDED(ClassInstanceInfo(TJS_CII_GET, 0,
+                                                   &class_name)))
+                    cls = ttstr(class_name).AsStdString();
+                const tjs_error this_is_function =
+                    IsInstanceOf(0, nullptr, nullptr, TJS_W("Function"),
+                                 this);
+                const tjs_error this_is_class =
+                    IsInstanceOf(0, nullptr, nullptr, TJS_W("Class"), this);
+                const tjs_error obj_is_env = objthis
+                    ? objthis->IsInstanceOf(0, nullptr, nullptr,
+                                            TJS_W("EnvGraphicLayer"), objthis)
+                    : TJS_E_INVALIDOBJECT;
+                const std::string this_type =
+                    TJSGetObjectTypeInfo(this).AsStdString();
+                const std::string obj_type = objthis
+                    ? TJSGetObjectTypeInfo(objthis).AsStdString()
+                    : std::string();
+                spdlog::info(
+                    "AffineMissing onPaint this={} objthis={} class={} hint={} uncached_data={} uncached_er={} uncached_type={} probe_obj={} obj_er={} obj_type={} obj_probe_obj={} thisFn={} thisClass={} objEnv={} thisType={} objType={}",
+                    static_cast<const void *>(this),
+                    static_cast<const void *>(objthis), cls,
+                    hint ? *hint : 0,
+                    static_cast<const void *>(uncached_data), probe_er,
+                    static_cast<int>(probe.Type()),
+                    static_cast<const void *>(probe.AsObjectNoAddRef()),
+                    obj_probe_er, static_cast<int>(obj_probe.Type()),
+                    static_cast<const void *>(obj_probe.AsObjectNoAddRef()),
+                    this_is_function, this_is_class, obj_is_env, this_type,
+                    obj_type);
+            }
+
             PluginCallTracer::Instance().LogMissingMember(membername, "FuncCall", objthis);
             return TJS_E_MEMBERNOTFOUND; // member not found
         }
 
-        return TJSDefaultFuncCall(flag, GetValue(data), result, numparams,
-                                  param, objthis);
+        tjs_error hr = TJSDefaultFuncCall(flag, GetValue(data), result,
+                                          numparams, param, objthis);
+        return hr;
     }
 
     //---------------------------------------------------------------------------
@@ -1329,11 +1788,28 @@ namespace TJS {
 
         tTJSSymbolData *data = Find(membername, hint);
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(CallMissing) {
                 // call 'missing' method
                 tTJSVariant value;
                 if(CallGetMissing(membername, value))
                     return TJSDefaultPropGet(flag, value, result, objthis);
+            }
+            if(TJSCompatResolveTouchImage(membername, result)) {
+                return TJS_S_OK;
+            }
+            if(TJSCompatResolveStartupFallback(membername, result)) {
+                return TJS_S_OK;
+            }
+            if(TJSCompatResolveKagRuntimeFallback(membername, result, this,
+                                                 objthis)) {
+                return TJS_S_OK;
+            }
+            if(TJSCompatResolveGlobalFallback(membername, result)) {
+                return TJS_S_OK;
+            }
+            if(TJSCompatResolveTextRenderRenderCount(membername, result, this,
+                                                     objthis)) {
+                return TJS_S_OK;
             }
         }
 
@@ -1402,7 +1878,7 @@ namespace TJS {
         }
 
         tTJSSymbolData *data;
-        if(CallMissing && TJS::TVPIsMockEnabled()) {
+        if(CallMissing) {
             data = Find(membername, hint);
             if(!data) {
                 // call 'missing' method
@@ -1417,6 +1893,17 @@ namespace TJS {
                               // is specified
         else
             data = Find(membername, hint);
+
+        if(!data) {
+            if(TJSIsStartupCompatWritableName(membername)) {
+                data = Add(membername, hint);
+            }
+        }
+
+        if(!data && membername && !TJS_strcmp(membername, TJS_W("renderCount")) &&
+           TJSCompatIsTextRenderObject(this, objthis)) {
+            data = Add(membername, hint);
+        }
 
         if(!data) {
             PluginCallTracer::Instance().LogMissingMember(membername, "PropSet", objthis);
@@ -1500,7 +1987,7 @@ namespace TJS {
         }
 
         tTJSSymbolData *data;
-        if(CallMissing && TJS::TVPIsMockEnabled()) {
+        if(CallMissing) {
             data = Find((const tjs_char *)(*membername), membername->GetHint());
             if(!data) {
                 // call 'missing' method
@@ -1629,7 +2116,7 @@ namespace TJS {
         tTJSSymbolData *data = Find(membername, hint);
 
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(CallMissing) {
                 // call 'missing' method
                 tTJSVariant value;
                 if(CallGetMissing(membername, value))
@@ -1674,7 +2161,7 @@ namespace TJS {
         tTJSSymbolData *data = Find(membername, hint);
 
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(CallMissing) {
                 // call 'missing' method
                 tTJSVariant value;
                 if(CallGetMissing(membername, value))
@@ -1723,7 +2210,19 @@ namespace TJS {
         tTJSSymbolData *data = Find(membername, hint);
 
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(membername &&
+               !TJS_strcmp(membername, TJS_W("CompoundStorageMedia"))) {
+                iTJSDispatch2 *object =
+                    TJSCompatCreateCompoundStorageMediaObject();
+                if(!object)
+                    return TJS_E_FAIL;
+                if(result)
+                    *result = object;
+                else
+                    object->Release();
+                return TJS_S_OK;
+            }
+            if(CallMissing) {
                 // call 'missing' method
                 tTJSVariant value;
                 if(CallGetMissing(membername, value))
@@ -1826,7 +2325,7 @@ namespace TJS {
         tTJSSymbolData *data = Find(membername, hint);
 
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(CallMissing) {
                 // call 'missing' method
                 tTJSVariant value;
                 if(CallGetMissing(membername, value))
@@ -1922,7 +2421,7 @@ namespace TJS {
         tTJSSymbolData *data = Find(membername, hint);
 
         if(!data) {
-            if(CallMissing && TJS::TVPIsMockEnabled()) {
+            if(CallMissing) {
                 // call default operation
                 return inherited::Operation(flag, membername, hint, result,
                                             param, objthis);

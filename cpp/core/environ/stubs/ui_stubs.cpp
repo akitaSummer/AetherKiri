@@ -4,18 +4,32 @@
  *        functions that were previously provided by MainScene.cpp,
  *        AppDelegate.cpp, and the environ/ui/ directory.
  *
- * With the migration to Flutter-based UI, all of these are replaced by
+ * With the migration to host-managed UI, all of these are replaced by
  * minimal stubs that either log a warning or return a sensible default.
  *
  * Functions stubbed here are called from the engine core and must link,
- * but their functionality will be provided by the Flutter host layer.
+ * but their functionality will be provided by the host layer.
  */
 
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <mutex>
+#include <sstream>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__EMSCRIPTEN__)
+#include <sys/stat.h>
+#endif
 
 #include "tjsCommHead.h"
 #include "tjsConfig.h"
@@ -26,10 +40,17 @@
 #include "TVPWindow.h"
 #include "Application.h"
 #include "RenderManager.h"
+#include "GodotRenderManager.h"
+#include "StorageImpl.h"
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
 #include "krkr_egl_context.h"
+#include <GLES3/gl3.h>
+#endif
 #include "SysInitImpl.h"
 
-#include <GLES3/gl3.h>
+#if defined(__EMSCRIPTEN__)
+extern "C" void TVPEngineApiNotifyWebStartupReady() __attribute__((weak));
+#endif
 
 // ---------------------------------------------------------------------------
 // Live2D post-draw hook — called after scene blit in UpdateDrawBuffer
@@ -37,17 +58,872 @@
 static void (*g_postDrawHook)() = nullptr;
 void TVPSetPostDrawHook(void (*hook)()) { g_postDrawHook = hook; }
 
+namespace {
+std::mutex g_host_frame_mutex;
+std::vector<uint8_t> g_host_frame_rgba;
+uint32_t g_host_frame_width = 0;
+uint32_t g_host_frame_height = 0;
+uint32_t g_host_frame_stride = 0;
+uint64_t g_host_frame_serial = 0;
+uint64_t g_host_gpu_texture = 0;
+uint32_t g_host_gpu_width = 0;
+uint32_t g_host_gpu_height = 0;
+uint64_t g_host_gpu_serial = 0;
+uint32_t g_host_surface_width = 1920;
+uint32_t g_host_surface_height = 1080;
+bool g_host_prefer_gpu_frame = true;
+std::atomic_bool g_host_publish_raw_source_frame{false};
+tTJSNI_Window *g_host_window_owner = nullptr;
+std::vector<tTJSNI_Window *> g_host_window_owners;
+
+struct HostTextInputState {
+    tTJSNI_Window *owner = nullptr;
+    tTVPImeMode ime_mode = imDisable;
+    bool ime_active = false;
+    bool attention_point_valid = false;
+    tjs_int attention_x = 0;
+    tjs_int attention_y = 0;
+    bool text_available = false;
+    std::string text_utf8;
+    int32_t selection_start = 0;
+    int32_t selection_end = 0;
+};
+
+std::mutex g_host_text_input_mutex;
+HostTextInputState g_host_text_input_state;
+
+bool IsHostTextInputModeActive(tTVPImeMode mode) {
+    return mode != imDisable && mode != imClose;
+}
+
+bool IsHighSurrogate(tjs_char value) {
+    return value >= static_cast<tjs_char>(0xd800) &&
+           value <= static_cast<tjs_char>(0xdbff);
+}
+
+bool IsLowSurrogate(tjs_char value) {
+    return value >= static_cast<tjs_char>(0xdc00) &&
+           value <= static_cast<tjs_char>(0xdfff);
+}
+
+void AppendUtf8Scalar(std::string &out, uint32_t scalar) {
+    if(scalar <= 0x7f) {
+        out.push_back(static_cast<char>(scalar));
+    } else if(scalar <= 0x7ff) {
+        out.push_back(static_cast<char>(0xc0 | (scalar >> 6)));
+        out.push_back(static_cast<char>(0x80 | (scalar & 0x3f)));
+    } else if(scalar <= 0xffff) {
+        out.push_back(static_cast<char>(0xe0 | (scalar >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (scalar & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (scalar >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((scalar >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((scalar >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (scalar & 0x3f)));
+    }
+}
+
+std::string HostTextUtf16ToUtf8(const tjs_char *text, size_t length) {
+    std::string result;
+    result.reserve(length);
+    for(size_t index = 0; index < length; ++index) {
+        uint32_t scalar = static_cast<uint32_t>(text[index]);
+        if(IsHighSurrogate(text[index])) {
+            if(index + 1 < length && IsLowSurrogate(text[index + 1])) {
+                scalar = 0x10000u +
+                         ((static_cast<uint32_t>(text[index]) - 0xd800u)
+                          << 10u) +
+                         (static_cast<uint32_t>(text[index + 1]) - 0xdc00u);
+                ++index;
+            } else {
+                scalar = 0xfffdu;
+            }
+        } else if(IsLowSurrogate(text[index])) {
+            scalar = 0xfffdu;
+        }
+        AppendUtf8Scalar(result, scalar);
+    }
+    return result;
+}
+
+int32_t HostUtf16OffsetToScalar(const tjs_char *text, size_t length,
+                                tTVInteger offset) {
+    size_t boundary = static_cast<size_t>(
+        std::clamp<tTVInteger>(offset, 0, static_cast<tTVInteger>(length)));
+    if(boundary > 0 && boundary < length &&
+       IsHighSurrogate(text[boundary - 1]) && IsLowSurrogate(text[boundary])) {
+        --boundary;
+    }
+
+    int32_t scalar_offset = 0;
+    for(size_t index = 0; index < boundary; ++scalar_offset) {
+        if(IsHighSurrogate(text[index]) && index + 1 < boundary &&
+           IsLowSurrogate(text[index + 1])) {
+            index += 2;
+        } else {
+            ++index;
+        }
+    }
+    return scalar_offset;
+}
+
+bool TryReadHostTextInputContent(iTJSDispatch2 *attention_owner,
+                                 std::string *out_text_utf8,
+                                 int32_t *out_selection_start,
+                                 int32_t *out_selection_end) {
+    if(attention_owner == nullptr || out_text_utf8 == nullptr ||
+       out_selection_start == nullptr || out_selection_end == nullptr) {
+        return false;
+    }
+
+    try {
+        tTJSVariant text_value;
+        if(TJS_FAILED(attention_owner->PropGet(
+               TJS_IGNOREPROP, TJS_W("Edit_text"), nullptr, &text_value,
+               attention_owner)) ||
+           text_value.Type() != tvtString) {
+            return false;
+        }
+
+        const ttstr text(text_value.GetString());
+        const size_t utf16_length = static_cast<size_t>(text.GetLen());
+        tTVInteger caret = static_cast<tTVInteger>(utf16_length);
+        tTVInteger anchor = caret;
+        tTJSVariant caret_value;
+        if(TJS_SUCCEEDED(attention_owner->PropGet(
+               TJS_IGNOREPROP, TJS_W("Edit_selStart"), nullptr, &caret_value,
+               attention_owner)) &&
+           (caret_value.Type() == tvtInteger || caret_value.Type() == tvtReal)) {
+            caret = caret_value.AsInteger();
+        }
+        tTJSVariant anchor_value;
+        if(TJS_SUCCEEDED(attention_owner->PropGet(
+               TJS_IGNOREPROP, TJS_W("Edit_selAnchor"), nullptr,
+               &anchor_value, attention_owner)) &&
+           (anchor_value.Type() == tvtInteger ||
+            anchor_value.Type() == tvtReal)) {
+            anchor = anchor_value.AsInteger();
+        } else {
+            anchor = caret;
+        }
+
+        *out_text_utf8 = HostTextUtf16ToUtf8(text.c_str(), utf16_length);
+        const int32_t caret_scalar =
+            HostUtf16OffsetToScalar(text.c_str(), utf16_length, caret);
+        const int32_t anchor_scalar =
+            HostUtf16OffsetToScalar(text.c_str(), utf16_length, anchor);
+        *out_selection_start = std::min(caret_scalar, anchor_scalar);
+        *out_selection_end = std::max(caret_scalar, anchor_scalar);
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
+void AdoptHostTextInputOwnerLocked(tTJSNI_Window *owner) {
+    if(g_host_text_input_state.owner == owner)
+        return;
+    g_host_text_input_state = {};
+    g_host_text_input_state.owner = owner;
+}
+
+void SetHostTextInputMode(tTJSNI_Window *owner, tTVPImeMode mode) {
+    if(owner == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(g_host_text_input_mutex);
+    AdoptHostTextInputOwnerLocked(owner);
+    const bool ime_active = IsHostTextInputModeActive(mode);
+    if(g_host_text_input_state.owner == owner &&
+       g_host_text_input_state.ime_mode == mode &&
+       g_host_text_input_state.ime_active == ime_active) {
+        return;
+    }
+    g_host_text_input_state.owner = owner;
+    g_host_text_input_state.ime_mode = mode;
+    g_host_text_input_state.ime_active = ime_active;
+}
+
+void SetHostTextInputAttentionPoint(tTJSNI_Window *owner, bool valid,
+                                    tjs_int x = 0, tjs_int y = 0,
+                                    iTJSDispatch2 *attention_owner = nullptr) {
+    if(owner == nullptr)
+        return;
+    std::string text_utf8;
+    int32_t selection_start = 0;
+    int32_t selection_end = 0;
+    const bool text_available = valid && TryReadHostTextInputContent(
+        attention_owner, &text_utf8, &selection_start, &selection_end);
+
+    std::lock_guard<std::mutex> lock(g_host_text_input_mutex);
+    AdoptHostTextInputOwnerLocked(owner);
+    g_host_text_input_state.owner = owner;
+    g_host_text_input_state.attention_point_valid = valid;
+    g_host_text_input_state.attention_x = valid ? x : 0;
+    g_host_text_input_state.attention_y = valid ? y : 0;
+    g_host_text_input_state.text_available = text_available;
+    g_host_text_input_state.text_utf8 =
+        text_available ? std::move(text_utf8) : std::string();
+    g_host_text_input_state.selection_start =
+        text_available ? selection_start : 0;
+    g_host_text_input_state.selection_end = text_available ? selection_end : 0;
+}
+
+void ClearHostTextInputState(tTJSNI_Window *owner) {
+    std::lock_guard<std::mutex> lock(g_host_text_input_mutex);
+    if(g_host_text_input_state.owner != owner)
+        return;
+    g_host_text_input_state = {};
+}
+
+void RegisterHostWindow(tTJSNI_Window *owner) {
+    if(owner == nullptr)
+        return;
+    g_host_window_owners.push_back(owner);
+    g_host_window_owner = owner;
+}
+
+void UnregisterHostWindow(tTJSNI_Window *owner) {
+    if(owner == nullptr)
+        return;
+    g_host_window_owners.erase(
+        std::remove(g_host_window_owners.begin(), g_host_window_owners.end(),
+                    owner),
+        g_host_window_owners.end());
+    g_host_window_owner = g_host_window_owners.empty()
+                              ? nullptr
+                              : g_host_window_owners.back();
+}
+
+std::mutex g_host_video_overlay_mutex;
+std::vector<uint8_t> g_host_video_overlay_rgba;
+uint32_t g_host_video_overlay_width = 0;
+uint32_t g_host_video_overlay_height = 0;
+int32_t g_host_video_overlay_left = 0;
+int32_t g_host_video_overlay_top = 0;
+int32_t g_host_video_overlay_right = 0;
+int32_t g_host_video_overlay_bottom = 0;
+bool g_host_video_overlay_active = false;
+
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
+GLint HostTextureFilter() {
+    const char *value = std::getenv("AETHERKIRI_HOST_TEXTURE_FILTER");
+    if (value != nullptr && (std::strcmp(value, "nearest") == 0 ||
+                             std::strcmp(value, "NEAREST") == 0)) {
+        return GL_NEAREST;
+    }
+    return GL_LINEAR;
+}
+
+void ApplyHostTextureFilter(GLenum target) {
+    const GLint filter = HostTextureFilter();
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter);
+}
+#endif
+
+bool HostRenderTraceEnabled() {
+    return std::getenv("AETHERKIRI_RENDER_TRACE") != nullptr;
+}
+
+bool ShouldLogHostRenderTrace() {
+    static auto last_log = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last_log.time_since_epoch().count() != 0 &&
+        now - last_log < std::chrono::seconds(1)) {
+        return false;
+    }
+    last_log = now;
+    return true;
+}
+
+struct HostFrameStats {
+    size_t sampled = 0;
+    size_t alpha = 0;
+    size_t visible = 0;
+    size_t color = 0;
+    size_t any = 0;
+    int maxAlpha = 0;
+    int maxColor = 0;
+};
+
+HostFrameStats SampleHostFrameRegion(const uint8_t *rgba, uint32_t width,
+                                     uint32_t height, uint32_t stride,
+                                     uint32_t left, uint32_t top,
+                                     uint32_t right, uint32_t bottom) {
+    HostFrameStats stats;
+    if (rgba == nullptr || width == 0 || height == 0 || stride < width * 4u) {
+        return stats;
+    }
+    left = std::min(left, width);
+    right = std::min(right, width);
+    top = std::min(top, height);
+    bottom = std::min(bottom, height);
+    if (left >= right || top >= bottom) {
+        return stats;
+    }
+
+    const size_t region_width = static_cast<size_t>(right - left);
+    const size_t region_height = static_cast<size_t>(bottom - top);
+    const size_t pixels = region_width * region_height;
+    const size_t step = std::max<size_t>(1u, pixels / 4096u);
+    for (size_t index = 0; index < pixels; index += step) {
+        const size_t local_y = index / region_width;
+        const size_t local_x = index - local_y * region_width;
+        const uint32_t x = left + static_cast<uint32_t>(local_x);
+        const uint32_t y = top + static_cast<uint32_t>(local_y);
+        const uint8_t *px = rgba + static_cast<size_t>(y) * stride +
+                            static_cast<size_t>(x) * 4u;
+        const int r = px[0];
+        const int g = px[1];
+        const int b = px[2];
+        const int a = px[3];
+        const int max_rgb = std::max(r, std::max(g, b));
+        ++stats.sampled;
+        if (a != 0) ++stats.alpha;
+        if (max_rgb != 0) ++stats.color;
+        if ((r | g | b | a) != 0) ++stats.any;
+        if (a != 0 && max_rgb != 0) ++stats.visible;
+        stats.maxAlpha = std::max(stats.maxAlpha, a);
+        stats.maxColor = std::max(stats.maxColor, max_rgb);
+    }
+    return stats;
+}
+
+std::string FormatHostFrameStats(const HostFrameStats &stats) {
+    std::ostringstream out;
+    out << "sampled=" << stats.sampled
+        << " alpha=" << stats.alpha
+        << " visible=" << stats.visible
+        << " color=" << stats.color
+        << " any=" << stats.any
+        << " maxA=" << stats.maxAlpha
+        << " maxC=" << stats.maxColor;
+    return out.str();
+}
+
+bool HostMotionDebugEnabled() {
+    static bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_MOTION_DEBUG");
+        return value != nullptr && *value != '\0' && std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+struct HostVideoOverlaySnapshot {
+    std::vector<uint8_t> rgba;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t right = 0;
+    int32_t bottom = 0;
+    bool active = false;
+};
+
+bool GetHostVideoOverlaySnapshot(HostVideoOverlaySnapshot &snapshot) {
+    std::lock_guard<std::mutex> lock(g_host_video_overlay_mutex);
+    if(!g_host_video_overlay_active || g_host_video_overlay_rgba.empty() ||
+       g_host_video_overlay_width == 0 || g_host_video_overlay_height == 0) {
+        return false;
+    }
+    snapshot.rgba = g_host_video_overlay_rgba;
+    snapshot.width = g_host_video_overlay_width;
+    snapshot.height = g_host_video_overlay_height;
+    snapshot.left = g_host_video_overlay_left;
+    snapshot.top = g_host_video_overlay_top;
+    snapshot.right = g_host_video_overlay_right;
+    snapshot.bottom = g_host_video_overlay_bottom;
+    snapshot.active = true;
+    return true;
+}
+
+bool HasHostVideoOverlayFrame() {
+    std::lock_guard<std::mutex> lock(g_host_video_overlay_mutex);
+    return g_host_video_overlay_active && !g_host_video_overlay_rgba.empty() &&
+        g_host_video_overlay_width != 0 && g_host_video_overlay_height != 0;
+}
+
+void CompositeHostVideoOverlay(std::vector<uint8_t> &frame, uint32_t width,
+                               uint32_t height, uint32_t stride) {
+    HostVideoOverlaySnapshot overlay;
+    if(!GetHostVideoOverlaySnapshot(overlay))
+        return;
+    if(frame.empty() || width == 0 || height == 0 || stride < width * 4u)
+        return;
+
+    int32_t left = overlay.left;
+    int32_t top = overlay.top;
+    int32_t right = overlay.right;
+    int32_t bottom = overlay.bottom;
+    if(right <= left || bottom <= top) {
+        left = 0;
+        top = 0;
+        right = static_cast<int32_t>(width);
+        bottom = static_cast<int32_t>(height);
+    }
+
+    const int32_t clipped_left = std::max<int32_t>(0, left);
+    const int32_t clipped_top = std::max<int32_t>(0, top);
+    const int32_t clipped_right =
+        std::min<int32_t>(static_cast<int32_t>(width), right);
+    const int32_t clipped_bottom =
+        std::min<int32_t>(static_cast<int32_t>(height), bottom);
+    if(clipped_left >= clipped_right || clipped_top >= clipped_bottom)
+        return;
+
+    const uint32_t dest_width = static_cast<uint32_t>(right - left);
+    const uint32_t dest_height = static_cast<uint32_t>(bottom - top);
+    if(dest_width == 0 || dest_height == 0)
+        return;
+
+    // Full-screen videos are decoded as opaque RGBA. Avoid per-pixel blend math
+    // on the common OP/movie path and only scale vertically when needed.
+    if(clipped_left == 0 && clipped_top == 0 &&
+       clipped_right == static_cast<int32_t>(width) &&
+       clipped_bottom == static_cast<int32_t>(height) &&
+       overlay.width == width) {
+        const size_t row_bytes = static_cast<size_t>(width) * 4u;
+        for(uint32_t y = 0; y < height; ++y) {
+            const uint32_t sy = std::min<uint32_t>(
+                overlay.height - 1,
+                static_cast<uint32_t>(
+                    (static_cast<uint64_t>(y) * overlay.height) /
+                    dest_height));
+            const uint8_t *src_row = overlay.rgba.data() +
+                static_cast<size_t>(sy) * overlay.width * 4u;
+            uint8_t *dst_row = frame.data() + static_cast<size_t>(y) * stride;
+            std::memcpy(dst_row, src_row, row_bytes);
+        }
+        return;
+    }
+
+    for(int32_t y = clipped_top; y < clipped_bottom; ++y) {
+        const uint32_t sy = std::min<uint32_t>(
+            overlay.height - 1,
+            static_cast<uint32_t>(
+                (static_cast<uint64_t>(y - top) * overlay.height) /
+                dest_height));
+        const uint8_t *src_row =
+            overlay.rgba.data() + static_cast<size_t>(sy) * overlay.width * 4u;
+        uint8_t *dst_row = frame.data() + static_cast<size_t>(y) * stride;
+        for(int32_t x = clipped_left; x < clipped_right; ++x) {
+            const uint32_t sx = std::min<uint32_t>(
+                overlay.width - 1,
+                static_cast<uint32_t>(
+                    (static_cast<uint64_t>(x - left) * overlay.width) /
+                    dest_width));
+            const uint8_t *src = src_row + static_cast<size_t>(sx) * 4u;
+            uint8_t *dst = dst_row + static_cast<size_t>(x) * 4u;
+            const uint32_t alpha = src[3];
+            if(alpha == 255u) {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = 255u;
+            } else if(alpha != 0u) {
+                const uint32_t inv = 255u - alpha;
+                dst[0] = static_cast<uint8_t>((src[0] * alpha + dst[0] * inv) / 255u);
+                dst[1] = static_cast<uint8_t>((src[1] * alpha + dst[1] * inv) / 255u);
+                dst[2] = static_cast<uint8_t>((src[2] * alpha + dst[2] * inv) / 255u);
+                dst[3] = static_cast<uint8_t>(std::min<uint32_t>(
+                    255u, alpha + (static_cast<uint32_t>(dst[3]) * inv) / 255u));
+            }
+        }
+    }
+}
+
+void LogHostFinalFrameStats(const char *source, const uint8_t *rgba,
+                            uint32_t width, uint32_t height, uint32_t stride,
+                            uint64_t serial) {
+    if (rgba == nullptr || width == 0 || height == 0 || stride == 0) {
+        return;
+    }
+    const HostFrameStats full =
+        SampleHostFrameRegion(rgba, width, height, stride, 0, 0, width, height);
+    const HostFrameStats title_region =
+        SampleHostFrameRegion(rgba, width, height, stride, 160, 800, 1620, 1060);
+
+    static int log_count = 0;
+    static bool had_previous_visibility = false;
+    static bool previous_full_visible = false;
+    static bool previous_title_visible = false;
+    const bool full_visible = full.visible > 0;
+    const bool title_visible = title_region.visible > 0;
+    const bool visibility_changed =
+        !had_previous_visibility || full_visible != previous_full_visible ||
+        title_visible != previous_title_visible;
+    const bool periodic = serial % 120u == 0;
+    const bool should_log = log_count < 18 || visibility_changed || periodic;
+    had_previous_visibility = true;
+    previous_full_visible = full_visible;
+    previous_title_visible = title_visible;
+    if (!should_log || (log_count >= 500 && !periodic && !visibility_changed)) {
+        return;
+    }
+    ++log_count;
+    spdlog::info("host final frame: source={} serial={} size={}x{} full=[{}] "
+                 "title_region=[{}]",
+                 source, static_cast<unsigned long long>(serial), width, height,
+                 FormatHostFrameStats(full),
+                 FormatHostFrameStats(title_region));
+    if (HostMotionDebugEnabled() && g_host_window_owner != nullptr &&
+        (serial == 3000 || serial == 4200 || serial == 5160)) {
+        spdlog::info("host final frame layer tree dump: serial={}",
+                     static_cast<unsigned long long>(serial));
+        g_host_window_owner->DumpPrimaryLayerStructure();
+    }
+}
+
+bool StoreLatestCpuFrameFromTexture(iTVPTexture2D *tex) {
+    if (!tex) return false;
+    const tjs_uint tw = tex->GetWidth();
+    const tjs_uint th = tex->GetHeight();
+    if (tw == 0 || th == 0) return false;
+
+    const uint32_t dst_stride = static_cast<uint32_t>(tw * 4u);
+    // Keep a reusable staging buffer on the render thread.  This function is
+    // called once per presented frame; constructing a fresh multi-megapixel
+    // vector every time caused allocator churn and page zeroing before the
+    // frame was even handed to the host.  Swapping it into the protected
+    // front buffer leaves the previous front allocation in this TLS buffer,
+    // ready for the next frame without changing the reader's locking rules.
+    static thread_local std::vector<uint8_t> frame;
+    frame.resize(static_cast<size_t>(dst_stride) * th);
+    const tjs_int src_pitch = tex->GetPitch();
+    const void *pixel_data = tex->GetPixelData();
+    if (pixel_data) {
+        const auto *src = static_cast<const uint8_t *>(pixel_data);
+        for (tjs_uint y = 0; y < th; ++y) {
+            std::memcpy(frame.data() + static_cast<size_t>(y) * dst_stride,
+                        src + static_cast<size_t>(y) * src_pitch,
+                        dst_stride);
+        }
+    } else {
+        for (tjs_uint y = 0; y < th; ++y) {
+            const void *line = tex->GetScanLineForRead(y);
+            if (line) {
+                std::memcpy(frame.data() + static_cast<size_t>(y) * dst_stride,
+                            line, dst_stride);
+            }
+        }
+    }
+    CompositeHostVideoOverlay(frame, static_cast<uint32_t>(tw),
+                              static_cast<uint32_t>(th), dst_stride);
+
+    uint64_t serial = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+        serial = g_host_frame_serial + 1;
+        LogHostFinalFrameStats("cpu_store", frame.data(),
+                               static_cast<uint32_t>(tw),
+                               static_cast<uint32_t>(th), dst_stride, serial);
+        g_host_frame_rgba.swap(frame);
+        g_host_frame_width = static_cast<uint32_t>(tw);
+        g_host_frame_height = static_cast<uint32_t>(th);
+        g_host_frame_stride = dst_stride;
+        g_host_frame_serial = serial;
+        g_host_gpu_texture = 0;
+        g_host_gpu_width = 0;
+        g_host_gpu_height = 0;
+    }
+    return true;
+}
+
+void GetHostSurfaceSize(tjs_int fallback_w, tjs_int fallback_h,
+                        tjs_int &width, tjs_int &height) {
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
+    auto& egl = krkr::GetEngineEGLContext();
+    width = egl.IsValid() ? static_cast<tjs_int>(egl.GetWidth()) :
+                            static_cast<tjs_int>(g_host_surface_width);
+    height = egl.IsValid() ? static_cast<tjs_int>(egl.GetHeight()) :
+                             static_cast<tjs_int>(g_host_surface_height);
+#else
+    width = static_cast<tjs_int>(g_host_surface_width);
+    height = static_cast<tjs_int>(g_host_surface_height);
+#endif
+    if (width <= 0) width = fallback_w;
+    if (height <= 0) height = fallback_h;
+}
+
+void PublishHostGpuFrame(uint64_t texture, uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    g_host_gpu_texture = texture;
+    g_host_gpu_width = width;
+    g_host_gpu_height = height;
+    g_host_gpu_serial += 1;
+    g_host_frame_rgba.clear();
+    g_host_frame_width = width;
+    g_host_frame_height = height;
+    g_host_frame_stride = width * 4u;
+    g_host_frame_serial = g_host_gpu_serial;
+}
+
+void ApplyDrawDeviceSurfaceRect(iTVPDrawDevice *dd, const tTVPRect &rect,
+                                tjs_int surface_w, tjs_int surface_h) {
+    if (dd == nullptr) return;
+    dd->SetDestRectangle(rect);
+    dd->SetClipRectangle(rect);
+    dd->SetViewport(rect);
+    dd->SetWindowSize(surface_w, surface_h);
+}
+
+}
+
+extern "C" void TVPHostGetTextInputState(uint32_t *ime_active,
+                                          int32_t *ime_mode,
+                                          uint32_t *attention_point_valid,
+                                          int32_t *attention_x,
+                                          int32_t *attention_y,
+                                          uint32_t *text_available,
+                                          uint32_t *text_utf8_bytes,
+                                          int32_t *selection_start,
+                                          int32_t *selection_end) {
+    std::lock_guard<std::mutex> lock(g_host_text_input_mutex);
+    if(ime_active)
+        *ime_active = g_host_text_input_state.ime_active ? 1u : 0u;
+    if(ime_mode)
+        *ime_mode = static_cast<int32_t>(g_host_text_input_state.ime_mode);
+    if(attention_point_valid)
+        *attention_point_valid =
+            g_host_text_input_state.attention_point_valid ? 1u : 0u;
+    if(attention_x)
+        *attention_x = static_cast<int32_t>(g_host_text_input_state.attention_x);
+    if(attention_y)
+        *attention_y = static_cast<int32_t>(g_host_text_input_state.attention_y);
+    if(text_available)
+        *text_available = g_host_text_input_state.text_available ? 1u : 0u;
+    if(text_utf8_bytes)
+        *text_utf8_bytes = static_cast<uint32_t>(
+            std::min<size_t>(g_host_text_input_state.text_utf8.size(),
+                             UINT32_MAX));
+    if(selection_start)
+        *selection_start = g_host_text_input_state.selection_start;
+    if(selection_end)
+        *selection_end = g_host_text_input_state.selection_end;
+}
+
+extern "C" uint32_t TVPHostCopyTextInputText(char *out_buffer,
+                                               uint32_t buffer_size) {
+    if(out_buffer == nullptr || buffer_size == 0)
+        return 0;
+    std::lock_guard<std::mutex> lock(g_host_text_input_mutex);
+    const uint32_t bytes = static_cast<uint32_t>(std::min<size_t>(
+        g_host_text_input_state.text_utf8.size(),
+        static_cast<size_t>(buffer_size - 1)));
+    if(bytes > 0) {
+        std::memcpy(out_buffer, g_host_text_input_state.text_utf8.data(), bytes);
+    }
+    out_buffer[bytes] = '\0';
+    return bytes;
+}
+
+void TVPHostForceDrawDeviceShow() {
+    if (g_host_window_owner != nullptr) {
+        g_host_window_owner->UpdateContent();
+        g_host_window_owner->DeliverDrawDeviceShow();
+    }
+}
+
+extern "C" void TVPHostActivateMainWindow() {
+    if (Application != nullptr) {
+        Application->OnActivate();
+    }
+    if (g_host_window_owner != nullptr) {
+        g_host_window_owner->FireOnActivate(true);
+        g_host_window_owner->UpdateContent();
+        g_host_window_owner->DeliverDrawDeviceShow();
+        spdlog::info("TVPHostActivateMainWindow: dispatched activate event");
+    }
+}
+
+extern "C" void TVPHostSetPreferGpuFrame(bool prefer_gpu_frame) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    g_host_prefer_gpu_frame = prefer_gpu_frame;
+    if (!prefer_gpu_frame) {
+        g_host_gpu_texture = 0;
+        g_host_gpu_width = 0;
+        g_host_gpu_height = 0;
+    }
+}
+
+extern "C" void TVPHostSetPublishRawSourceFrame(bool publish_raw_source) {
+    const bool previous = g_host_publish_raw_source_frame.exchange(
+        publish_raw_source, std::memory_order_acq_rel);
+    if (previous == publish_raw_source) return;
+    // Never let the first frame after a hot switch reuse a texture published
+    // under the other mode. The next draw publishes the correct source.
+    {
+        std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+        g_host_frame_rgba.clear();
+        g_host_frame_width = 0;
+        g_host_frame_height = 0;
+        g_host_frame_stride = 0;
+        g_host_gpu_texture = 0;
+        g_host_gpu_width = 0;
+        g_host_gpu_height = 0;
+        ++g_host_frame_serial;
+        g_host_gpu_serial = g_host_frame_serial;
+    }
+    spdlog::info("Host frame output={}",
+                 publish_raw_source ? "raw_source" : "surface");
+}
+
+extern "C" void TVPHostSetSurfaceSize(uint32_t width, uint32_t height) {
+    if(width == 0 || height == 0) return;
+    g_host_surface_width = width;
+    g_host_surface_height = height;
+}
+
+extern "C" void TVPHostGetSurfaceSize(uint32_t *width, uint32_t *height) {
+    if(width) *width = g_host_surface_width;
+    if(height) *height = g_host_surface_height;
+}
+
+extern "C" void TVPHostResetForGameSession() {
+    {
+        std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+        g_host_frame_rgba.clear();
+        g_host_frame_width = 0;
+        g_host_frame_height = 0;
+        g_host_frame_stride = 0;
+        g_host_gpu_texture = 0;
+        g_host_gpu_width = 0;
+        g_host_gpu_height = 0;
+        // Keep serials monotonic so a newly published frame can never be
+        // mistaken for the final frame of the preceding game session.
+        ++g_host_frame_serial;
+        g_host_gpu_serial = g_host_frame_serial;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_host_text_input_mutex);
+        g_host_text_input_state = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_host_video_overlay_mutex);
+        g_host_video_overlay_active = false;
+        g_host_video_overlay_rgba.clear();
+        g_host_video_overlay_width = 0;
+        g_host_video_overlay_height = 0;
+        g_host_video_overlay_left = 0;
+        g_host_video_overlay_top = 0;
+        g_host_video_overlay_right = 0;
+        g_host_video_overlay_bottom = 0;
+    }
+    g_host_window_owner = nullptr;
+    g_host_window_owners.clear();
+    g_postDrawHook = nullptr;
+    spdlog::info("Host render state reset for next game session");
+}
+
+extern "C" bool TVPHostSubmitVideoOverlayFrame(const void *rgba,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                uint32_t stride_bytes,
+                                                int32_t left,
+                                                int32_t top,
+                                                int32_t right,
+                                                int32_t bottom) {
+    if(!rgba || width == 0 || height == 0 || stride_bytes < width * 4u)
+        return false;
+
+    std::vector<uint8_t> copy(static_cast<size_t>(width) * height * 4u);
+    const auto *src = static_cast<const uint8_t *>(rgba);
+    const uint32_t dst_stride = width * 4u;
+    for(uint32_t y = 0; y < height; ++y) {
+        std::memcpy(copy.data() + static_cast<size_t>(y) * dst_stride,
+                    src + static_cast<size_t>(y) * stride_bytes,
+                    dst_stride);
+    }
+
+    std::lock_guard<std::mutex> lock(g_host_video_overlay_mutex);
+    g_host_video_overlay_rgba.swap(copy);
+    g_host_video_overlay_width = width;
+    g_host_video_overlay_height = height;
+    g_host_video_overlay_left = left;
+    g_host_video_overlay_top = top;
+    g_host_video_overlay_right = right;
+    g_host_video_overlay_bottom = bottom;
+    g_host_video_overlay_active = true;
+    return true;
+}
+
+extern "C" void TVPHostClearVideoOverlayFrame() {
+    std::lock_guard<std::mutex> lock(g_host_video_overlay_mutex);
+    g_host_video_overlay_active = false;
+    g_host_video_overlay_rgba.clear();
+    g_host_video_overlay_width = 0;
+    g_host_video_overlay_height = 0;
+}
+
+extern "C" bool TVPHostGetLatestGodotGpuFrame(uint64_t *texture,
+                                               uint32_t *width,
+                                               uint32_t *height,
+                                               uint64_t *serial) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    if(g_host_gpu_texture == 0 || g_host_gpu_width == 0 ||
+       g_host_gpu_height == 0) {
+        return false;
+    }
+    if(texture) *texture = g_host_gpu_texture;
+    if(width) *width = g_host_gpu_width;
+    if(height) *height = g_host_gpu_height;
+    if(serial) *serial = g_host_gpu_serial;
+    return true;
+}
+
+extern "C" bool TVPHostGetLatestFrameDesc(uint32_t *width, uint32_t *height,
+                                           uint32_t *stride_bytes,
+                                           uint64_t *serial) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    if(g_host_frame_rgba.empty() || g_host_frame_width == 0 ||
+       g_host_frame_height == 0 || g_host_frame_stride == 0) {
+        if(g_host_gpu_texture == 0 || g_host_gpu_width == 0 ||
+           g_host_gpu_height == 0) {
+            return false;
+        }
+        if(width) *width = g_host_gpu_width;
+        if(height) *height = g_host_gpu_height;
+        if(stride_bytes) *stride_bytes = g_host_gpu_width * 4u;
+        if(serial) *serial = g_host_gpu_serial;
+        return true;
+    }
+    if(width) *width = g_host_frame_width;
+    if(height) *height = g_host_frame_height;
+    if(stride_bytes) *stride_bytes = g_host_frame_stride;
+    if(serial) *serial = g_host_frame_serial;
+    return true;
+}
+
+extern "C" bool TVPHostCopyLatestFrameRGBA(void *out_pixels,
+                                            size_t out_pixels_size,
+                                            uint32_t *width, uint32_t *height,
+                                            uint32_t *stride_bytes,
+                                            uint64_t *serial) {
+    if(!out_pixels) return false;
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    if(g_host_frame_rgba.empty() || out_pixels_size < g_host_frame_rgba.size()) {
+        return false;
+    }
+    std::memcpy(out_pixels, g_host_frame_rgba.data(), g_host_frame_rgba.size());
+    if(width) *width = g_host_frame_width;
+    if(height) *height = g_host_frame_height;
+    if(stride_bytes) *stride_bytes = g_host_frame_stride;
+    if(serial) *serial = g_host_frame_serial;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
-// FlutterWindowLayer — concrete iWindowLayer for Flutter host mode.
-// Provides a logical window backed by the ANGLE EGL Pbuffer surface.
+// HostWindowLayer — concrete iWindowLayer for embedded host mode.
+// Provides a logical window backed by the host pbuffer surface.
 // Rendering output goes through glReadPixels in the engine_api layer.
 // ---------------------------------------------------------------------------
-class FlutterWindowLayer : public iWindowLayer {
+class HostWindowLayer : public iWindowLayer {
 public:
-    explicit FlutterWindowLayer(tTJSNI_Window *owner)
+    explicit HostWindowLayer(tTJSNI_Window *owner)
         : owner_(owner), visible_(true), caption_("krkr2"),
           width_(0), height_(0), active_(true), closing_(false) {
-        // Get initial size from EGL context
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
         auto& egl = krkr::GetEngineEGLContext();
         if (egl.IsValid()) {
             width_  = static_cast<tjs_int>(egl.GetWidth());
@@ -56,10 +932,18 @@ public:
             width_  = 1280;
             height_ = 720;
         }
-        spdlog::info("FlutterWindowLayer created: {}x{}", width_, height_);
+#else
+        width_ = static_cast<tjs_int>(g_host_surface_width);
+        height_ = static_cast<tjs_int>(g_host_surface_height);
+#endif
+        spdlog::info("HostWindowLayer created: {}x{}", width_, height_);
     }
 
-    ~FlutterWindowLayer() {
+    ~HostWindowLayer() {
+        DetachOwner();
+        delete surface_texture_;
+        surface_texture_ = nullptr;
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
         if(blit_program_) {
             glDeleteProgram(blit_program_);
             blit_program_ = 0;
@@ -72,32 +956,21 @@ public:
             glDeleteTextures(1, &blit_texture_);
             blit_texture_ = 0;
         }
-        spdlog::debug("FlutterWindowLayer destroyed");
+#endif
+        spdlog::debug("HostWindowLayer destroyed");
     }
 
     // -- Pure virtual implementations --
 
     void SetPaintBoxSize(tjs_int w, tjs_int h) override {
-        // Only set WindowSize here — DestRect is exclusively managed by
-        // UpdateDrawBuffer() which knows the correct letterbox viewport.
-        // Setting DestRect here would overwrite the viewport offset and
-        // cause mouse Y-axis misalignment.
-        if (!owner_) return;
-        auto* dd = owner_->GetDrawDevice();
-        if (!dd) return;
-
-        width_ = w;
-        height_ = h;
-
-        auto& egl = krkr::GetEngineEGLContext();
-        tjs_int surf_w = egl.IsValid() ? static_cast<tjs_int>(egl.GetWidth())  : w;
-        tjs_int surf_h = egl.IsValid() ? static_cast<tjs_int>(egl.GetHeight()) : h;
-        if (surf_w <= 0) surf_w = w;
-        if (surf_h <= 0) surf_h = h;
-
-        dd->SetWindowSize(surf_w, surf_h);
-        spdlog::debug("FlutterWindowLayer::SetPaintBoxSize: layer={}x{}, surface={}x{}",
-                      w, h, surf_w, surf_h);
+        // Mirrors the Win32 form's paint-box state: this is the source layer
+        // size, not the script-visible client/window size.
+        paint_width_ = w;
+        paint_height_ = h;
+        SyncDrawDeviceWindowSize(w, h);
+        spdlog::debug(
+            "HostWindowLayer::SetPaintBoxSize: layer={}x{}, logical={}x{}",
+            w, h, width_, height_);
     }
 
     bool GetFormEnabled() override { return !closing_; }
@@ -122,7 +995,15 @@ public:
     void SetHintText(const ttstr &text) override {}
 
     void SetAttentionPoint(tjs_int left, tjs_int top,
-                           const struct tTVPFont *font) override {}
+                           const struct tTVPFont *font,
+                           iTJSDispatch2 *attention_owner) override {
+        SetHostTextInputAttentionPoint(owner_, true, left, top,
+                                       attention_owner);
+    }
+
+    void DisableAttentionPoint() override {
+        SetHostTextInputAttentionPoint(owner_, false);
+    }
 
     void ZoomRectangle(tjs_int &left, tjs_int &top, tjs_int &right,
                        tjs_int &bottom) override {
@@ -132,7 +1013,25 @@ public:
     void BringToFront() override {}
 
     void ShowWindowAsModal() override {
-        spdlog::warn("FlutterWindowLayer::ShowWindowAsModal: stub");
+        // The engine runs on the host UI thread, so returning immediately
+        // would make Window.showModal() read its default result and destroy
+        // the dialog. Use the platform's nested modal loop instead. This is
+        // also usable on mobile, where the platform implementation keeps its
+        // native run loop alive while waiting for the selected button.
+        const ttstr prompt = TJS_W("Continue with this operation?");
+        const ttstr caption = caption_.empty()
+                                  ? ttstr(TJS_W("Confirmation"))
+                                  : ttstr(caption_.c_str());
+        const bool accepted =
+            TVPShowSimpleMessageBoxYesNo(prompt, caption) == 0;
+
+        if(owner_ != nullptr) {
+            if(iTJSDispatch2 *script_owner = owner_->GetOwnerNoAddRef()) {
+                tTJSVariant value(accepted ? 1 : 0);
+                script_owner->PropSet(TJS_MEMBERENSURE, TJS_W("result"),
+                                      nullptr, &value, script_owner);
+            }
+        }
     }
 
     bool GetVisible() override { return visible_; }
@@ -143,13 +1042,20 @@ public:
 
     void SetCaption(const std::string &cap) override { caption_ = cap; }
 
-    void SetWidth(tjs_int w) override { width_ = w; }
+    void SetWidth(tjs_int w) override {
+        if (w > 0) width_ = w;
+        SyncDrawDeviceWindowSize(width_, height_);
+    }
 
-    void SetHeight(tjs_int h) override { height_ = h; }
+    void SetHeight(tjs_int h) override {
+        if (h > 0) height_ = h;
+        SyncDrawDeviceWindowSize(width_, height_);
+    }
 
     void SetSize(tjs_int w, tjs_int h) override {
-        width_ = w;
-        height_ = h;
+        if (w > 0) width_ = w;
+        if (h > 0) height_ = h;
+        SyncDrawDeviceWindowSize(width_, height_);
     }
 
     void GetSize(tjs_int &w, tjs_int &h) override {
@@ -172,15 +1078,138 @@ public:
     }
 
     void UpdateDrawBuffer(iTVPTexture2D *tex) override {
+#if !defined(KRKR_ENABLE_GPU_BRIDGE)
+        if (!tex || !owner_) return;
+        const tjs_uint tw = tex->GetWidth();
+        const tjs_uint th = tex->GetHeight();
+        if(tw == 0 || th == 0) return;
+
+        tjs_int surface_w = 0;
+        tjs_int surface_h = 0;
+        GetHostSurfaceSize(static_cast<tjs_int>(tw), static_cast<tjs_int>(th),
+                           surface_w, surface_h);
+        tTVPRect surface_rect(0, 0, surface_w, surface_h);
+
+        if(g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame()) {
+        if(auto *godot_tex = dynamic_cast<GodotTexture2D *>(tex);
+           godot_tex != nullptr && godot_tex->EnsureGpuHandle() &&
+           godot_tex->UploadCpuToGpu(false)) {
+            const bool publish_raw_source =
+                g_host_publish_raw_source_frame.load(std::memory_order_acquire);
+            GodotTexture2D *output_tex = publish_raw_source
+                ? godot_tex
+                : PrepareGodotSurfaceTexture(godot_tex, tw, th, surface_w,
+                                             surface_h);
+            if (output_tex == nullptr) output_tex = godot_tex;
+            if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
+                spdlog::info(
+                    "host_render_trace path=godot_gpu_prefer tex={}x{} surface={}x{} output={}x{} frame_output={}",
+                    tw, th, surface_w, surface_h, output_tex->GetWidth(),
+                    output_tex->GetHeight(),
+                    publish_raw_source ? "raw_source" : "surface");
+            }
+            PublishHostGpuFrame(output_tex->GetGodotGpuHandle(),
+                                static_cast<uint32_t>(output_tex->GetWidth()),
+                                static_cast<uint32_t>(output_tex->GetHeight()));
+
+            auto* dd = owner_->GetDrawDevice();
+            if (!dd) return;
+            // Raw publication changes only the host image. Keep the engine's
+            // logical window/input surface unchanged.
+            ApplyDrawDeviceSurfaceRect(dd, surface_rect, surface_w, surface_h);
+            if (g_postDrawHook) g_postDrawHook();
+            return;
+        }
+        }
+
+        StoreLatestCpuFrameFromTexture(tex);
+
+        auto* dd = owner_->GetDrawDevice();
+        if (!dd) return;
+        ApplyDrawDeviceSurfaceRect(dd, surface_rect, surface_w, surface_h);
+        if (g_postDrawHook) g_postDrawHook();
+        return;
+#else
         // Blit the composited scene texture to the render target.
         // When an IOSurface is attached, this goes directly to the shared
-        // IOSurface (zero-copy to Flutter). Otherwise, falls back to
+        // IOSurface (zero-copy to Application host). Otherwise, falls back to
         // the EGL Pbuffer for glReadPixels-based retrieval.
         if (!tex) return;
 
         const tjs_uint tw = tex->GetWidth();
         const tjs_uint th = tex->GetHeight();
         if (tw == 0 || th == 0) return;
+
+        tjs_int surface_w = 0;
+        tjs_int surface_h = 0;
+        GetHostSurfaceSize(static_cast<tjs_int>(tw), static_cast<tjs_int>(th),
+                           surface_w, surface_h);
+        tTVPRect surface_rect(0, 0, surface_w, surface_h);
+
+        if(HasHostVideoOverlayFrame()) {
+            StoreLatestCpuFrameFromTexture(tex);
+            auto* dd = owner_ ? owner_->GetDrawDevice() : nullptr;
+            if (!dd) return;
+            ApplyDrawDeviceSurfaceRect(dd, surface_rect, surface_w, surface_h);
+            if (g_postDrawHook) g_postDrawHook();
+            return;
+        }
+
+        tjs_int primary_w = 0;
+        tjs_int primary_h = 0;
+        if (owner_ != nullptr) {
+            auto *dd = owner_->GetDrawDevice();
+            if (dd != nullptr) {
+                dd->GetSrcSize(primary_w, primary_h);
+            }
+        }
+
+        if (auto *godot_tex = dynamic_cast<GodotTexture2D *>(tex)) {
+            if (g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame() &&
+                godot_tex->EnsureGpuHandle() &&
+                godot_tex->UploadCpuToGpu(false)) {
+                const bool publish_raw_source =
+                    g_host_publish_raw_source_frame.load(std::memory_order_acquire);
+                GodotTexture2D *output_tex = publish_raw_source
+                    ? godot_tex
+                    : PrepareGodotSurfaceTexture(godot_tex, tw, th, surface_w,
+                                                 surface_h);
+                if (output_tex == nullptr) output_tex = godot_tex;
+                if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
+                    spdlog::info(
+                        "host_render_trace path=godot_gpu tex={}x{} surface={}x{} output={}x{} frame_output={}",
+                        tw, th, surface_w, surface_h, output_tex->GetWidth(),
+                        output_tex->GetHeight(),
+                        publish_raw_source ? "raw_source" : "surface");
+                }
+                PublishHostGpuFrame(
+                    output_tex->GetGodotGpuHandle(),
+                    static_cast<uint32_t>(output_tex->GetWidth()),
+                    static_cast<uint32_t>(output_tex->GetHeight()));
+            } else {
+                StoreLatestCpuFrameFromTexture(tex);
+            }
+
+            auto* dd = owner_->GetDrawDevice();
+            if (!dd) return;
+            ApplyDrawDeviceSurfaceRect(dd, surface_rect, surface_w, surface_h);
+            if (g_postDrawHook) g_postDrawHook();
+            return;
+        }
+
+        if (tex->GetNativeGLTextureId() == 0) {
+            if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
+                spdlog::info(
+                    "host_render_trace path=cpu_no_native primary={}x{} tex={}x{}",
+                    primary_w, primary_h, tw, th);
+            }
+            StoreLatestCpuFrameFromTexture(tex);
+            auto* dd = owner_->GetDrawDevice();
+            if (!dd) return;
+            ApplyDrawDeviceSurfaceRect(dd, surface_rect, surface_w, surface_h);
+            if (g_postDrawHook) g_postDrawHook();
+            return;
+        }
 
         EnsureBlitResources();
 
@@ -282,7 +1311,6 @@ public:
             vpW = static_cast<GLsizei>(static_cast<float>(fbH) * texAspect);
             vpX = static_cast<GLsizei>((fbW - vpW) / 2);
         }
-
         // Clear entire framebuffer to black (produces the letterbox bars)
         glViewport(0, 0, static_cast<GLsizei>(fbW), static_cast<GLsizei>(fbH));
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -312,6 +1340,7 @@ public:
         // Bind the source texture for the fullscreen blit
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, blitSrcTexture);
+        ApplyHostTextureFilter(GL_TEXTURE_2D);
 
         // Draw fullscreen quad
         glUseProgram(blit_program_);
@@ -319,7 +1348,7 @@ public:
         // In IOSurface mode, the surface has a top-down coordinate system
         // while OpenGL renders bottom-up, so we need to flip Y.
         // Android SurfaceTexture (WindowSurface) does NOT need flipping
-        // because eglSwapBuffers → SurfaceTexture → Flutter Texture widget
+        // because eglSwapBuffers → SurfaceTexture → host texture
         // handles the coordinate transform automatically.
         // When using a native OGL texture from the engine (GPU path), the
         // texture is already in OGL convention (bottom-up), so we may need
@@ -337,6 +1366,13 @@ public:
                 uvScaleU = static_cast<float>(tw) / static_cast<float>(intW);
                 uvScaleV = static_cast<float>(th) / static_cast<float>(intH);
             }
+        }
+        if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
+            spdlog::info(
+                "host_render_trace path=gl_blit primary={}x{} tex={}x{} native_gl={} fb={}x{} viewport={}x{}+{},{} uv_scale={:.4f},{:.4f} filter={}",
+                primary_w, primary_h, tw, th, nativeGLTex, fbW, fbH, vpW, vpH,
+                vpX, vpY, uvScaleU, uvScaleV,
+                HostTextureFilter() == GL_NEAREST ? "nearest" : "linear");
         }
         glUniform2f(blit_uvscale_uniform_, uvScaleU, uvScaleV);
 
@@ -378,18 +1414,30 @@ public:
         // double-buffer flicker (alternating between current and stale
         // back-buffer contents).
         egl.MarkFrameDirty();
+#endif
     }
 
     void InvalidateClose() override {
         closing_ = true;
+        DetachOwner();
+        // HostWindowLayer is allocated by TVPCreateAndAddWindow and, unlike
+        // the native Win32 form, has no application/window-system owner that
+        // will delete it later. Match the Win32 InvalidateClose contract by
+        // releasing the layer (and its surface texture) immediately.
+        delete this;
     }
 
     bool GetWindowActive() override { return active_; }
 
     void Close() override {
         closing_ = true;
-        spdlog::debug("FlutterWindowLayer::Close called");
-        TVPTerminateAsync(0);
+        spdlog::debug("HostWindowLayer::Close called");
+        if(owner_ == TVPMainWindow) {
+            TVPTerminateAsync(0);
+        } else {
+            visible_ = false;
+            DetachOwner();
+        }
     }
 
     void OnCloseQueryCalled(bool b) override {
@@ -409,9 +1457,13 @@ public:
         return imDisable;
     }
 
-    void SetImeMode(tTVPImeMode mode) override {}
+    void SetImeMode(tTVPImeMode mode) override {
+        SetHostTextInputMode(owner_, mode);
+    }
 
-    void ResetImeMode() override {}
+    void ResetImeMode() override {
+        SetHostTextInputMode(owner_, imDisable);
+    }
 
     void UpdateWindow(tTVPUpdateType type) override {
         // Rendering is driven by engine_tick / engine_read_frame_rgba
@@ -433,13 +1485,88 @@ public:
     }
 
     void TickBeat() override {
-        // Called every ~50ms; nothing to do in Flutter mode
+        // Called every ~50ms; nothing to do in embedded host mode
     }
 
     TVPOverlayNode *GetPrimaryArea() override { return nullptr; }
 
 private:
+    void DetachOwner() {
+        if(owner_ == nullptr)
+            return;
+        ClearHostTextInputState(owner_);
+        UnregisterHostWindow(owner_);
+        owner_ = nullptr;
+    }
+
+    void SyncDrawDeviceWindowSize(tjs_int fallback_w, tjs_int fallback_h) {
+        if (!owner_) return;
+        auto* dd = owner_->GetDrawDevice();
+        if (!dd) return;
+
+        tjs_int surf_w = 0;
+        tjs_int surf_h = 0;
+        GetHostSurfaceSize(fallback_w, fallback_h, surf_w, surf_h);
+        dd->SetWindowSize(surf_w, surf_h);
+    }
+
+    GodotTexture2D *PrepareGodotSurfaceTexture(GodotTexture2D *source,
+                                               tjs_uint source_w,
+                                               tjs_uint source_h,
+                                               tjs_int surface_w,
+                                               tjs_int surface_h) {
+        if (source == nullptr || surface_w <= 0 || surface_h <= 0) {
+            return nullptr;
+        }
+        if (static_cast<tjs_uint>(surface_w) == source_w &&
+            static_cast<tjs_uint>(surface_h) == source_h) {
+            return source;
+        }
+        if (surface_texture_ == nullptr ||
+            surface_texture_->GetWidth() != surface_w ||
+            surface_texture_->GetHeight() != surface_h) {
+            delete surface_texture_;
+            surface_texture_ = new GodotTexture2D(
+                nullptr, 0, static_cast<unsigned int>(surface_w),
+                static_cast<unsigned int>(surface_h), TVPTextureFormat::RGBA);
+        }
+        if (!surface_texture_->EnsureGpuHandle()) {
+            return nullptr;
+        }
+
+        const tTVPRect clip(0, 0, surface_w, surface_h);
+        const tTVPPointD dst_pt[6] = {
+            {0.0, 0.0},
+            {static_cast<double>(surface_w), 0.0},
+            {0.0, static_cast<double>(surface_h)},
+            {static_cast<double>(surface_w), 0.0},
+            {0.0, static_cast<double>(surface_h)},
+            {static_cast<double>(surface_w), static_cast<double>(surface_h)},
+        };
+        const tTVPPointD src_pt[6] = {
+            {0.0, 0.0},
+            {static_cast<double>(source_w), 0.0},
+            {0.0, static_cast<double>(source_h)},
+            {static_cast<double>(source_w), 0.0},
+            {0.0, static_cast<double>(source_h)},
+            {static_cast<double>(source_w), static_cast<double>(source_h)},
+        };
+        if (!surface_texture_->CopyTrianglesGpuFrom(source, 2, clip, dst_pt,
+                                                    src_pt)) {
+            return nullptr;
+        }
+        // The Godot host copies the published texture through a synchronous
+        // bridge operation before presenting it. Keep the scale copy on the
+        // same ordered queue; flushing here split every animated frame into
+        // several Metal submissions without making the frame any safer.
+        surface_texture_->UploadCpuToGpu(false);
+        return surface_texture_;
+    }
+
     void EnsureBlitResources() {
+#if !defined(KRKR_ENABLE_GPU_BRIDGE)
+        return;
+#else
         if (blit_program_ != 0) return;
 
         // Vertex shader: fullscreen quad with optional Y flip and UV scale
@@ -523,14 +1650,14 @@ private:
         // Create blit texture
         glGenTextures(1, &blit_texture_);
         glBindTexture(GL_TEXTURE_2D, blit_texture_);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        ApplyHostTextureFilter(GL_TEXTURE_2D);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, 0);
 
-        spdlog::info("FlutterWindowLayer: blit resources initialized (program={})",
+        spdlog::info("HostWindowLayer: blit resources initialized (program={})",
                      blit_program_);
+#endif
     }
 
     tTJSNI_Window *owner_;
@@ -538,6 +1665,8 @@ private:
     std::string caption_;
     tjs_int width_;
     tjs_int height_;
+    tjs_int paint_width_ = 0;
+    tjs_int paint_height_ = 0;
     bool active_;
     bool closing_;
 
@@ -545,8 +1674,10 @@ private:
     // Updated by EngineLoop on pointer events, read by GetCursorPos().
     tjs_int last_mouse_x_ = 0;
     tjs_int last_mouse_y_ = 0;
+    GodotTexture2D *surface_texture_ = nullptr;
 
-    // Blit resources for rendering to EGL pbuffer
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
+    // Blit resources for rendering to external GPU targets.
     GLuint blit_program_ = 0;
     GLuint blit_vbo_ = 0;
     GLuint blit_texture_ = 0;
@@ -556,6 +1687,7 @@ private:
     GLint  blit_flipy_uniform_ = -1;
     GLint  blit_uvscale_uniform_ = -1;
     std::vector<uint8_t> blit_pixel_buf_;
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -563,17 +1695,22 @@ private:
 // Registered custom UI widgets (PageView, etc.)
 // ---------------------------------------------------------------------------
 void TVPInitUIExtension() {
-    spdlog::debug("TVPInitUIExtension: stub (UI handled by Flutter)");
+    spdlog::debug("TVPInitUIExtension: stub (UI handled by host)");
 }
 
 // ---------------------------------------------------------------------------
 // TVPCreateAndAddWindow — originally in MainScene.cpp
-// Creates a FlutterWindowLayer and registers it with the application.
+// Creates a HostWindowLayer and registers it with the application.
 // ---------------------------------------------------------------------------
 iWindowLayer *TVPCreateAndAddWindow(tTJSNI_Window *w) {
-    auto *layer = new FlutterWindowLayer(w);
-    spdlog::info("TVPCreateAndAddWindow: created FlutterWindowLayer ({}x{})",
+    RegisterHostWindow(w);
+    auto *layer = new HostWindowLayer(w);
+    spdlog::info("TVPCreateAndAddWindow: created HostWindowLayer ({}x{})",
                  layer->GetWidth(), layer->GetHeight());
+#if defined(__EMSCRIPTEN__)
+    if(TVPEngineApiNotifyWebStartupReady)
+        TVPEngineApiNotifyWebStartupReady();
+#endif
     return layer;
 }
 
@@ -635,7 +1772,11 @@ static std::string s_internalPreferencePath;
 
 const std::string &TVPGetInternalPreferencePath() {
     if (s_internalPreferencePath.empty()) {
-#if defined(__APPLE__)
+#if defined(__EMSCRIPTEN__)
+        s_internalPreferencePath = "/userfs/krkr2/";
+        mkdir("/userfs", 0777);
+        mkdir("/userfs/krkr2", 0777);
+#elif defined(__APPLE__)
         const char *home = getenv("HOME");
         if (home) {
             s_internalPreferencePath = std::string(home) + "/Library/Application Support/krkr2/";
@@ -661,7 +1802,9 @@ const std::string &TVPGetInternalPreferencePath() {
 #else
         s_internalPreferencePath = "/tmp/krkr2/";
 #endif
+#if !defined(__EMSCRIPTEN__)
         std::filesystem::create_directories(s_internalPreferencePath);
+#endif
     }
     return s_internalPreferencePath;
 }
@@ -671,16 +1814,45 @@ const std::string &TVPGetInternalPreferencePath() {
 // Returns list of directories where the application searches for data files.
 // ---------------------------------------------------------------------------
 static std::vector<std::string> s_appHomeDirs;
+static ttstr s_appHomeProjectPath;
 
 const std::vector<std::string> &TVPGetApplicationHomeDirectory() {
-    if (s_appHomeDirs.empty()) {
+    // Aether can start multiple visual novels in one process. The native
+    // project directory therefore changes without restarting the iOS host.
+    // Keep the application-home snapshot tied to that directory instead of
+    // retaining the first title (or built-in demo) for the process lifetime.
+    if (s_appHomeDirs.empty() ||
+        !(s_appHomeProjectPath == TVPNativeProjectDir)) {
+        s_appHomeDirs.clear();
+        s_appHomeProjectPath = TVPNativeProjectDir;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // iOS stores imported projects and runtime-generated files below the
+        // app's data container, while TVPNativeProjectDir can still identify
+        // the host bundle in this process. Keep the sandbox root available to
+        // file media so normalized absolute paths can recover their exact
+        // on-disk casing without attempting to enumerate from `/`.
+        if (const char *home = std::getenv("HOME"); home && *home) {
+            std::string sandboxHome(home);
+            while (sandboxHome.size() > 1 && sandboxHome.back() == '/') {
+                sandboxHome.pop_back();
+            }
+            s_appHomeDirs.push_back(std::move(sandboxHome));
+        }
+#endif
         if (!TVPNativeProjectDir.IsEmpty()) {
-            std::string dir = TVPNativeProjectDir.AsNarrowStdString();
-            while (!dir.empty() && dir.back() == '/')
-                dir.pop_back();
-            s_appHomeDirs.push_back(dir);
+            const ttstr dir =
+                TVPGetNativeProjectDirectory(TVPNativeProjectDir);
+            std::string projectHome = dir.AsNarrowStdString();
+            if (std::find(s_appHomeDirs.begin(), s_appHomeDirs.end(),
+                          projectHome) == s_appHomeDirs.end()) {
+                s_appHomeDirs.push_back(std::move(projectHome));
+            }
         } else {
+#if defined(__EMSCRIPTEN__)
+            s_appHomeDirs.push_back("/userfs");
+#else
             s_appHomeDirs.push_back(std::filesystem::current_path().string());
+#endif
         }
     }
     return s_appHomeDirs;
@@ -703,23 +1875,23 @@ bool TVPCopyFile(const std::string &from, const std::string &to) {
 
 // ---------------------------------------------------------------------------
 // TVPShowFileSelector — originally in ui/FileSelectorForm.cpp
-// Shows a file selection dialog. In Flutter mode, this is handled by the
-// Flutter host layer. Returns empty string (no selection).
+// Shows a file selection dialog. In host mode, this is handled by the host
+// layer. Returns empty string (no selection).
 // ---------------------------------------------------------------------------
 std::string TVPShowFileSelector(const std::string &title,
                                 const std::string &init_dir,
                                 std::string default_ext,
                                 bool is_save) {
-    spdlog::warn("TVPShowFileSelector: stub — file selection handled by Flutter");
+    spdlog::warn("TVPShowFileSelector: stub - file selection handled by host");
     return "";
 }
 
 // ---------------------------------------------------------------------------
 // TVPShowPopMenu — originally in ui/InGameMenuForm.cpp
-// Shows a popup context menu. In Flutter mode, handled by Flutter host.
+// Shows a popup context menu. In host mode, handled by host UI.
 // ---------------------------------------------------------------------------
 void TVPShowPopMenu(tTJSNI_MenuItem *menu) {
-    spdlog::warn("TVPShowPopMenu: stub — popup menus handled by Flutter");
+    spdlog::warn("TVPShowPopMenu: stub - popup menus handled by host");
 }
 
 // ---------------------------------------------------------------------------
@@ -727,5 +1899,5 @@ void TVPShowPopMenu(tTJSNI_MenuItem *menu) {
 // Opens the URL for the patch library website.
 // ---------------------------------------------------------------------------
 void TVPOpenPatchLibUrl() {
-    spdlog::warn("TVPOpenPatchLibUrl: stub — URL opening handled by Flutter");
+    spdlog::warn("TVPOpenPatchLibUrl: stub - URL opening handled by host");
 }

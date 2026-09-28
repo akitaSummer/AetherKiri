@@ -11,9 +11,12 @@
 #define _USE_MATH_DEFINES
 #include "tjsCommHead.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
-#include <stdlib.h>
 #include <math.h>
+#include <mutex>
 
 #include "LayerBitmapIntf.h"
 #include "LayerBitmapImpl.h"
@@ -36,6 +39,7 @@ void TVPInitWindowOptions();
 // #include "TVPSysFont.h"
 #include "CharacterData.h"
 #include "PrerenderedFont.h"
+#include "FontBaseline.h"
 #include "FontSystem.h"
 #include "FreeType.h"
 #include "FreeTypeFontRasterizer.h"
@@ -64,19 +68,23 @@ enum {
 static FontRasterizer *TVPFontRasterizers[FONT_RASTER_EOT];
 static bool TVPFontRasterizersInit = false;
 static tjs_int TVPCurrentFontRasterizers = FONT_RASTER_FREE_TYPE;
+static std::mutex TVPFontRasterizersMutex;
 // static tjs_int TVPCurrentFontRasterizers = FONT_RASTER_GDI;
 void TVPInializeFontRasterizers() {
-    if(TVPFontRasterizersInit == false) {
+    std::lock_guard<std::mutex> lock(TVPFontRasterizersMutex);
+    if(TVPFontRasterizers[FONT_RASTER_FREE_TYPE] == nullptr) {
         TVPFontRasterizers[FONT_RASTER_FREE_TYPE] =
             new FreeTypeFontRasterizer();
         //		TVPFontRasterizers[FONT_RASTER_GDI] = new
         // GDIFontRasterizer();
-
-        TVPFontSystem = new FontSystem();
-        TVPFontRasterizersInit = true;
     }
+    if(TVPFontSystem == nullptr) {
+        TVPFontSystem = new FontSystem();
+    }
+    TVPFontRasterizersInit = true;
 }
 void TVPUninitializeFontRasterizers() {
+    std::lock_guard<std::mutex> lock(TVPFontRasterizersMutex);
     for(tjs_int i = 0; i < FONT_RASTER_EOT; i++) {
         if(TVPFontRasterizers[i]) {
             TVPFontRasterizers[i]->Release();
@@ -87,6 +95,7 @@ void TVPUninitializeFontRasterizers() {
         delete TVPFontSystem;
         TVPFontSystem = nullptr;
     }
+    TVPFontRasterizersInit = false;
 }
 static tTVPAtExit TVPUninitializeFontRaster(TVP_ATEXIT_PRI_RELEASE,
                                             TVPUninitializeFontRasterizers);
@@ -147,6 +156,13 @@ void TVPMapPrerenderedFont(const tTVPFont &font, const ttstr &storage) {
         i != TVPPrerenderedFontMapVector.end(); i++) {
         if(i->Font == font) {
             // found font
+            // Font hooks commonly map the same face/storage before measuring
+            // each UI group.  Repeating an identical mapping used to clear
+            // the entire glyph cache and invalidate every bitmap font state.
+            if(i->Object == object) {
+                object->Release();
+                return;
+            }
             // replace existing
             i->Object->Release();
             i->Object = object;
@@ -278,7 +294,8 @@ static tTVPCharacterData *TVPGetCharacter(const tTVPFontAndCharacterData &font,
         data->Metrics.CellIncX = pitem->IncX;
         data->Metrics.CellIncY = pitem->IncY;
         data->OriginX = pitem->OriginX + aofsx;
-        data->OriginY = -pitem->OriginY + aofsy;
+        data->OriginY = krkr::font::ComputeGlyphOriginY(
+            aofsy, pitem->OriginY);
 
         data->Antialiased = font.Antialiased;
 
@@ -492,6 +509,7 @@ tTVPNativeBaseBitmap::tTVPNativeBaseBitmap(const tTVPNativeBaseBitmap &r) {
 }
 //---------------------------------------------------------------------------
 tTVPNativeBaseBitmap::~tTVPNativeBaseBitmap() {
+    ClearPendingTextDraws();
     if(Bitmap)
         Bitmap->Release();
     if(PrerenderedFont)
@@ -513,6 +531,7 @@ void tTVPNativeBaseBitmap::SetHeight(tjs_uint h) {
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::SetSize(tjs_uint w, tjs_uint h, bool keepimage) {
+    FlushPendingTextDraws();
     if(w == 0)
         w = 1;
     if(h == 0)
@@ -556,6 +575,7 @@ void tTVPNativeBaseBitmap::SetSize(tjs_uint w, tjs_uint h, bool keepimage) {
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::SetSizeAndImageBuffer(tTVPBitmap *bmp) {
+    ClearPendingTextDraws();
     // create a new bitmap and copy existing bitmap
     iTVPTexture2D *newbitmap = GetRenderManager()->CreateTexture2D(bmp);
     Bitmap->Release();
@@ -592,12 +612,24 @@ bool tTVPNativeBaseBitmap::IsOpaque() const { return Bitmap->IsOpaque(); }
 
 //---------------------------------------------------------------------------
 bool tTVPNativeBaseBitmap::Assign(const tTVPNativeBaseBitmap &rhs) {
-    if(this == &rhs || Bitmap == rhs.Bitmap)
+    if(this == &rhs)
         return false;
 
-    Bitmap->Release();
+    // Assign shares the source texture. Materialize deferred glyph draws first
+    // so a temporary text work bitmap cannot hand out its pre-draw texture.
+    const_cast<tTVPNativeBaseBitmap &>(rhs).FlushPendingTextDraws();
+    FlushPendingTextDraws();
+    if(Bitmap == rhs.Bitmap)
+        return false;
+
+    if(Bitmap)
+        Bitmap->Release();
     Bitmap = rhs.Bitmap;
-    Bitmap->AddRef();
+    if(Bitmap)
+        Bitmap->AddRef();
+    else
+        Bitmap = GetRenderManager()->CreateTexture2D(
+            nullptr, 0, 1, 1, TVPTextureFormat::RGBA);
 
     Font = rhs.Font;
     FontChanged = true; // informs internal font information is invalidated
@@ -607,12 +639,22 @@ bool tTVPNativeBaseBitmap::Assign(const tTVPNativeBaseBitmap &rhs) {
 //---------------------------------------------------------------------------
 bool tTVPNativeBaseBitmap::AssignBitmap(const tTVPNativeBaseBitmap &rhs) {
     // assign only bitmap
-    if(this == &rhs || Bitmap == rhs.Bitmap)
+    if(this == &rhs)
         return false;
 
-    Bitmap->Release();
+    const_cast<tTVPNativeBaseBitmap &>(rhs).FlushPendingTextDraws();
+    FlushPendingTextDraws();
+    if(Bitmap == rhs.Bitmap)
+        return false;
+
+    if(Bitmap)
+        Bitmap->Release();
     Bitmap = rhs.Bitmap;
-    Bitmap->AddRef();
+    if(Bitmap)
+        Bitmap->AddRef();
+    else
+        Bitmap = GetRenderManager()->CreateTexture2D(
+            nullptr, 0, 1, 1, TVPTextureFormat::RGBA);
 
     // font information are not copyed
     FontChanged = true; // informs internal font information is invalidated
@@ -620,12 +662,18 @@ bool tTVPNativeBaseBitmap::AssignBitmap(const tTVPNativeBaseBitmap &rhs) {
     return true;
 }
 bool tTVPNativeBaseBitmap::AssignTexture(iTVPTexture2D *tex) {
+    FlushPendingTextDraws();
     if(Bitmap == tex)
         return false;
 
-    Bitmap->Release();
+    if(Bitmap)
+        Bitmap->Release();
     Bitmap = tex; // CreateTexture2D(bmp);
-    Bitmap->AddRef();
+    if(Bitmap)
+        Bitmap->AddRef();
+    else
+        Bitmap = GetRenderManager()->CreateTexture2D(
+            nullptr, 0, 1, 1, TVPTextureFormat::RGBA);
 
     // font information are not copyed
     FontChanged = true; // informs internal font information is invalidated
@@ -634,10 +682,12 @@ bool tTVPNativeBaseBitmap::AssignTexture(iTVPTexture2D *tex) {
 }
 //---------------------------------------------------------------------------
 const void *tTVPNativeBaseBitmap::GetScanLine(tjs_uint l) const {
+    const_cast<tTVPNativeBaseBitmap *>(this)->FlushPendingTextDraws();
     return Bitmap->GetScanLineForRead(l);
 }
 //---------------------------------------------------------------------------
 void *tTVPNativeBaseBitmap::GetScanLineForWrite(tjs_uint l) {
+    FlushPendingTextDraws();
     Independ();
     return Bitmap->GetScanLineForWrite(l);
 }
@@ -649,6 +699,7 @@ tjs_int tTVPNativeBaseBitmap::GetPitchBytes() const {
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::Independ() {
+    FlushPendingTextDraws();
     // sever Bitmap's image sharing
     if(Bitmap->IsIndependent() && !Bitmap->IsStatic())
         return;
@@ -660,6 +711,7 @@ void tTVPNativeBaseBitmap::Independ() {
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::IndependNoCopy() {
+    FlushPendingTextDraws();
     // indepent the bitmap, but not to copy the original bitmap
     if(!Bitmap->IsStatic() && Bitmap->IsIndependent())
         return;
@@ -773,6 +825,62 @@ struct tTVPDrawTextData {
 
 static iTVPTexture2D *_CharacterTexture = nullptr,
                      *_CharacterTextureRGBA = nullptr;
+// Scratch bitmap backing the text batch blit above; kept alive between
+// batches so a full backlog repaint stops reallocating one per batch.
+static tTVPBitmap *TextBatchScratchBitmap = nullptr;
+
+static tjs_int TVPTextScratchTextureMinSize() {
+    const char *value = std::getenv("AETHERKIRI_TEXT_SCRATCH_TEXTURE_MIN_SIZE");
+    constexpr tjs_int kDefaultMinSize = 256;
+    if(value == nullptr || value[0] == '\0')
+        return kDefaultMinSize;
+    char *end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if(end == value || parsed < 1)
+        return kDefaultMinSize;
+    if(parsed > 2048)
+        return 2048;
+    return static_cast<tjs_int>(parsed);
+}
+
+// Glyph batches are rewritten from (0,0) on every flush, and the backlog
+// repaint runs thousands of them per frame; hand out one shared scratch
+// bitmap (growing as needed) instead of allocating a multi-megabyte bitmap
+// per batch.  Text composition is driven from the layer/script thread, which
+// is also the only caller of the two batch flushers below.
+static tTVPBitmap *AcquireTextBatchScratchBitmap(tjs_int w, tjs_int h) {
+    if(TextBatchScratchBitmap == nullptr ||
+       static_cast<tjs_int>(TextBatchScratchBitmap->GetWidth()) < w ||
+       static_cast<tjs_int>(TextBatchScratchBitmap->GetHeight()) < h) {
+        if(TextBatchScratchBitmap) {
+            TextBatchScratchBitmap->Release();
+            TextBatchScratchBitmap = nullptr;
+        }
+        TextBatchScratchBitmap =
+            new tTVPBitmap(std::max(w, TVPTextScratchTextureMinSize()),
+                           std::max(h, TVPTextScratchTextureMinSize()), 32);
+    }
+    return TextBatchScratchBitmap;
+}
+
+static inline tjs_uint8 TVPCombineTextScratchAlpha(tjs_uint8 dst,
+                                                   tjs_uint8 src) {
+    tjs_uint32 out = dst + src - ((static_cast<tjs_uint32>(dst) * src) >> 8);
+    out -= out >> 8;
+    return static_cast<tjs_uint8>(out > 255 ? 255 : out);
+}
+
+static inline void TVPWriteTextScratchPixel(tjs_uint32 &dst,
+                                            tjs_uint32 color,
+                                            tjs_uint8 alpha) {
+    if(alpha == 0)
+        return;
+    const tjs_uint8 dst_alpha = static_cast<tjs_uint8>(dst >> 24);
+    const tjs_uint8 out_alpha =
+        dst_alpha == 0 ? alpha : TVPCombineTextScratchAlpha(dst_alpha, alpha);
+    dst = (color & 0x00ffffff) |
+        (static_cast<tjs_uint32>(out_alpha) << 24);
+}
 
 bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
                                              tTVPDrawTextData *dtdata,
@@ -797,7 +905,7 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
     opa_id = _opa_id;                                                          \
     clr_id = _clr_id;
 
-    static bool fastGPURoute = !TVPIsSoftwareRenderManager() &&
+    const bool fastGPURoute = !TVPIsSoftwareRenderManager() &&
         !IndividualConfigManager::GetInstance()->GetValue<bool>(
             "ogl_accurate_render", false);
 
@@ -811,9 +919,9 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
         tjs_uint8 *dst = (tjs_uint8 *)tmp->GetBits();
         for(tjs_int y = 0; y < h; ++y) {
             for(tjs_int x = 0; x < w; ++x) {
-                ((tjs_uint32 *)dst)[x] = (color & 0xFFFFFF) | (src[x] << 24);
+                TVPWriteTextScratchPixel(((tjs_uint32 *)dst)[x], color,
+                                         src[x]);
             }
-            TVPConvertAlphaToAdditiveAlpha((tjs_uint32 *)dst, w);
             dst += dpitch;
             src += spitch;
         }
@@ -823,17 +931,20 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
                 _CharacterTextureRGBA = nullptr;
             }
         }
+        const tjs_int texturew = std::max(w, TVPTextScratchTextureMinSize());
+        const tjs_int textureh = std::max(h, TVPTextScratchTextureMinSize());
         if(!_CharacterTextureRGBA) {
             _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
-                tmp->GetBits(), dpitch, w, h, TVPTextureFormat::RGBA,
+                nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
                 RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
         } else if(_CharacterTextureRGBA->GetInternalWidth() < w ||
                   _CharacterTextureRGBA->GetInternalHeight() < h) {
             _CharacterTextureRGBA->Release();
             _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
-                tmp->GetBits(), dpitch, w, h, TVPTextureFormat::RGBA,
+                nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
                 RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
-        } else {
+        }
+        if(_CharacterTextureRGBA) {
             _CharacterTextureRGBA->Update(tmp->GetBits(),
                                           TVPTextureFormat::RGBA, dpitch,
                                           tTVPRect(0, 0, w, h));
@@ -841,7 +952,7 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
 
         tmp->Release();
 
-        GEMTHOD_OPA_CLR(AlphaBlend_a);
+        GEMTHOD_OPA_CLR(AlphaBlend_d);
         method->SetParameterOpa(opa_id, dtdata->opa);
         pTexSrc = _CharacterTextureRGBA;
     } else {
@@ -859,14 +970,16 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
         }
 
         // blend to the texture
+        const tjs_int texturew = std::max(w, TVPTextScratchTextureMinSize());
+        const tjs_int textureh = std::max(h, TVPTextScratchTextureMinSize());
         if(!_CharacterTexture) {
             _CharacterTexture = GetRenderManager()->CreateTexture2D(
-                nullptr, pitch, w, h, TVPTextureFormat::Gray);
+                nullptr, 0, texturew, textureh, TVPTextureFormat::Gray);
         } else if(_CharacterTexture->GetInternalWidth() < w ||
                   _CharacterTexture->GetInternalHeight() < h) {
             _CharacterTexture->Release();
             _CharacterTexture = GetRenderManager()->CreateTexture2D(
-                nullptr, pitch, w, h, TVPTextureFormat::Gray);
+                nullptr, 0, texturew, textureh, TVPTextureFormat::Gray);
         }
         _CharacterTexture->Update(bp, TVPTextureFormat::Gray, pitch,
                                   tTVPRect(0, 0, w, h));
@@ -901,6 +1014,107 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData *data,
 #endif
     tRenderTexRectArray::Element src_tex[] = { tRenderTexRectArray::Element(
         pTexSrc, tTVPRect(0, 0, w, h)) };
+    TVPGetRenderManager()->OperateRect(
+        method, GetTextureForRender(method->IsBlendTarget(), &drect), nullptr,
+        drect, tRenderTexRectArray(src_tex));
+    return true;
+}
+
+static tjs_uint32 TVPLerpColor24(tjs_uint32 top, tjs_uint32 bottom,
+                                 tjs_int row, tjs_int rowCount) {
+    if(rowCount <= 1)
+        return top;
+    const tjs_int den = rowCount - 1;
+    const tjs_int inv = den - row;
+    tjs_uint32 result = 0;
+    for(int shift = 0; shift <= 16; shift += 8) {
+        const tjs_int a = static_cast<tjs_int>((top >> shift) & 0xff);
+        const tjs_int b = static_cast<tjs_int>((bottom >> shift) & 0xff);
+        const tjs_int v = (a * inv + b * row + den / 2) / den;
+        result |= static_cast<tjs_uint32>(std::max(0, std::min(255, v)))
+                  << shift;
+    }
+    return result;
+}
+
+bool tTVPNativeBaseBitmap::InternalBlendTextVerticalGradient(
+    tTVPCharacterData *data, tTVPDrawTextData *dtdata, tjs_uint32 topcolor,
+    tjs_uint32 bottomcolor, const tTVPRect &srect, tTVPRect &drect,
+    tjs_int gradientTop, tjs_int gradientHeight) {
+    if(dtdata->bltmode != bmAlphaOnAlpha || dtdata->opa <= 0)
+        return InternalBlendText(data, dtdata, bottomcolor, srect, drect);
+
+    const tjs_int pitch = data->Pitch;
+    const tjs_int h = drect.bottom - drect.top;
+    const tjs_int w = drect.right - drect.left;
+    if(TVPIsSoftwareRenderManager()) {
+        bool drawn = false;
+        gradientHeight = std::max<tjs_int>(1, gradientHeight);
+        for(tjs_int y = 0; y < h; ++y) {
+            tTVPRect row_srect(srect.left, srect.top + y, srect.right,
+                               srect.top + y + 1);
+            tTVPRect row_drect(drect.left, drect.top + y, drect.right,
+                               drect.top + y + 1);
+            const tjs_int row = std::max<tjs_int>(
+                0, std::min<tjs_int>(gradientHeight - 1, srect.top + y));
+            const tjs_uint32 color =
+                TVPLerpColor24(topcolor, bottomcolor, row, gradientHeight);
+            drawn = InternalBlendText(data, dtdata, color, row_srect,
+                                      row_drect) || drawn;
+        }
+        return drawn;
+    }
+
+    const tjs_uint8 *bp = data->GetData() + pitch * srect.top + srect.left;
+    gradientHeight = std::max<tjs_int>(1, gradientHeight);
+
+    tTVPBitmap *tmp = new tTVPBitmap(w, h, 32);
+    const tjs_int dpitch = tmp->GetPitch();
+    tjs_uint8 *dst = (tjs_uint8 *)tmp->GetBits();
+    for(tjs_int y = 0; y < h; ++y) {
+        tjs_uint32 *out = reinterpret_cast<tjs_uint32 *>(dst);
+        const tjs_uint8 *src = bp + pitch * y;
+        const tjs_int row = std::max<tjs_int>(
+            0, std::min<tjs_int>(gradientHeight - 1, srect.top + y));
+        const tjs_uint32 color =
+            TVPLerpColor24(topcolor, bottomcolor, row, gradientHeight);
+        for(tjs_int x = 0; x < w; ++x)
+            TVPWriteTextScratchPixel(out[x], color, src[x]);
+        dst += dpitch;
+    }
+
+    if(_CharacterTextureRGBA) {
+        if(_CharacterTextureRGBA->GetFormat() != TVPTextureFormat::RGBA) {
+            _CharacterTextureRGBA->Release();
+            _CharacterTextureRGBA = nullptr;
+        }
+    }
+    const tjs_int texturew = std::max(w, TVPTextScratchTextureMinSize());
+    const tjs_int textureh = std::max(h, TVPTextScratchTextureMinSize());
+    if(!_CharacterTextureRGBA) {
+        _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
+            nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
+            RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
+    } else if(_CharacterTextureRGBA->GetInternalWidth() < w ||
+              _CharacterTextureRGBA->GetInternalHeight() < h) {
+        _CharacterTextureRGBA->Release();
+        _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
+            nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
+            RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
+    }
+    if(_CharacterTextureRGBA) {
+        _CharacterTextureRGBA->Update(tmp->GetBits(), TVPTextureFormat::RGBA,
+                                      dpitch, tTVPRect(0, 0, w, h));
+    }
+    tmp->Release();
+
+    static iTVPRenderMethod *method =
+        TVPGetRenderManager()->GetRenderMethod("AlphaBlend_d");
+    static int opa_id = method->EnumParameterID("opacity");
+    method->SetParameterOpa(opa_id, dtdata->opa);
+
+    tRenderTexRectArray::Element src_tex[] = {tRenderTexRectArray::Element(
+        _CharacterTextureRGBA, tTVPRect(0, 0, w, h))};
     TVPGetRenderManager()->OperateRect(
         method, GetTextureForRender(method->IsBlendTarget(), &drect), nullptr,
         drect, tRenderTexRectArray(src_tex));
@@ -950,6 +1164,47 @@ bool tTVPNativeBaseBitmap::InternalDrawText(tTVPCharacterData *data, tjs_int x,
         return false; // not drawable
 
     return InternalBlendText(data, dtdata, color, srect, drect);
+}
+
+bool tTVPNativeBaseBitmap::InternalDrawTextVerticalGradient(
+    tTVPCharacterData *data, tjs_int x, tjs_int y, tjs_uint32 topcolor,
+    tjs_uint32 bottomcolor, tTVPDrawTextData *dtdata, tTVPRect &drect,
+    tjs_int gradientHeight) {
+    drect.left = x + data->OriginX;
+    drect.top = y + data->OriginY;
+    drect.right = drect.left + data->BlackBoxX;
+    drect.bottom = drect.top + data->BlackBoxY;
+
+    tTVPRect srect;
+    srect.left = srect.top = 0;
+    srect.right = data->BlackBoxX;
+    srect.bottom = data->BlackBoxY;
+
+    if(drect.left < dtdata->rect.left) {
+        srect.left += (dtdata->rect.left - drect.left);
+        drect.left = dtdata->rect.left;
+    }
+    if(drect.right > dtdata->rect.right) {
+        srect.right -= (drect.right - dtdata->rect.right);
+        drect.right = dtdata->rect.right;
+    }
+    if(srect.left >= srect.right)
+        return false;
+
+    if(drect.top < dtdata->rect.top) {
+        srect.top += (dtdata->rect.top - drect.top);
+        drect.top = dtdata->rect.top;
+    }
+    if(drect.bottom > dtdata->rect.bottom) {
+        srect.bottom -= (drect.bottom - dtdata->rect.bottom);
+        drect.bottom = dtdata->rect.bottom;
+    }
+    if(srect.top >= srect.bottom)
+        return false;
+
+    return InternalBlendTextVerticalGradient(data, dtdata, topcolor,
+                                             bottomcolor, srect, drect, drect.top,
+                                             gradientHeight);
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::DrawGlyph(
@@ -1074,6 +1329,93 @@ void tTVPNativeBaseBitmap::DrawGlyph(
                 tTVPRect drect;
                 tTVPRect shadowdrect;
 
+                const bool queueGPURoute = !TVPIsSoftwareRenderManager() &&
+                    !IndividualConfigManager::GetInstance()->GetValue<bool>(
+                        "ogl_accurate_render", false) &&
+                    bltmode == bmAlphaOnAlpha && opa > 0;
+                if(queueGPURoute) {
+                    auto clipped_rect = [&](tTVPCharacterData *ch,
+                                            tjs_int dx, tjs_int dy,
+                                            tTVPRect &out) -> bool {
+                        out.left = dx + ch->OriginX;
+                        out.top = dy + ch->OriginY;
+                        out.right = out.left + ch->BlackBoxX;
+                        out.bottom = out.top + ch->BlackBoxY;
+
+                        tTVPRect srect;
+                        srect.left = srect.top = 0;
+                        srect.right = ch->BlackBoxX;
+                        srect.bottom = ch->BlackBoxY;
+
+                        if(out.left < dtdata.rect.left) {
+                            srect.left += (dtdata.rect.left - out.left);
+                            out.left = dtdata.rect.left;
+                        }
+                        if(out.right > dtdata.rect.right) {
+                            srect.right -= (out.right - dtdata.rect.right);
+                            out.right = dtdata.rect.right;
+                        }
+                        if(srect.left >= srect.right)
+                            return false;
+                        if(out.top < dtdata.rect.top) {
+                            srect.top += (dtdata.rect.top - out.top);
+                            out.top = dtdata.rect.top;
+                        }
+                        if(out.bottom > dtdata.rect.bottom) {
+                            srect.bottom -= (out.bottom - dtdata.rect.bottom);
+                            out.bottom = dtdata.rect.bottom;
+                        }
+                        return srect.top < srect.bottom;
+                    };
+
+                    const bool shadowdrawn = shadow &&
+                        clipped_rect(shadow, x + shofsx, y + shofsy,
+                                     shadowdrect);
+                    const bool drawn = clipped_rect(data, x, y, drect);
+                    if(drawn || shadowdrawn) {
+                        tTVPPendingTextDraw pending;
+                        pending.DestRect = destrect;
+                        pending.X = x;
+                        pending.Y = y;
+                        pending.Color = color;
+                        pending.BltMode = bltmode;
+                        pending.Opa = opa;
+                        pending.HoldAlpha = holdalpha;
+                        pending.ShadowColor = shadowcolor;
+                        pending.ShLevel = shlevel;
+                        pending.ShWidth = shwidth;
+                        pending.ShOfsX = shofsx;
+                        pending.ShOfsY = shofsy;
+                        pending.Data = data;
+                        pending.Shadow = shadow;
+                        if(pending.Data)
+                            pending.Data->AddRef();
+                        if(pending.Shadow)
+                            pending.Shadow->AddRef();
+                        PendingTextDraws.push_back(pending);
+                    }
+
+                    if(updaterects) {
+                        if(!shadowdrawn) {
+                            if(drawn)
+                                updaterects->Or(drect);
+                        } else {
+                            if(drawn) {
+                                tTVPRect d;
+                                TVPUnionRect(&d, drect, shadowdrect);
+                                updaterects->Or(d);
+                            } else {
+                                updaterects->Or(shadowdrect);
+                            }
+                        }
+                    }
+                    if(data)
+                        data->Release();
+                    if(shadow)
+                        shadow->Release();
+                    return;
+                }
+
                 bool shadowdrawn = false;
 
                 if(shadow) {
@@ -1139,7 +1481,13 @@ void tTVPNativeBaseBitmap::DrawTextSingle(
     if(opa == 0)
         return; // nothing to do
 
-    Independ();
+    const bool queueGPURoute = !TVPIsSoftwareRenderManager() &&
+        !IndividualConfigManager::GetInstance()->GetValue<bool>(
+            "ogl_accurate_render", false) &&
+        bltmode == bmAlphaOnAlpha && opa > 0;
+
+    if(!queueGPURoute || !IsIndependent())
+        Independ();
 
     ApplyFont();
 
@@ -1188,6 +1536,89 @@ void tTVPNativeBaseBitmap::DrawTextSingle(
                 tTVPRect drect;
                 tTVPRect shadowdrect;
 
+                if(queueGPURoute) {
+                    auto clipped_rect = [&](tTVPCharacterData *ch,
+                                            tjs_int dx, tjs_int dy,
+                                            tTVPRect &out) -> bool {
+                        out.left = dx + ch->OriginX;
+                        out.top = dy + ch->OriginY;
+                        out.right = out.left + ch->BlackBoxX;
+                        out.bottom = out.top + ch->BlackBoxY;
+
+                        tTVPRect srect;
+                        srect.left = srect.top = 0;
+                        srect.right = ch->BlackBoxX;
+                        srect.bottom = ch->BlackBoxY;
+
+                        if(out.left < dtdata.rect.left) {
+                            srect.left += (dtdata.rect.left - out.left);
+                            out.left = dtdata.rect.left;
+                        }
+                        if(out.right > dtdata.rect.right) {
+                            srect.right -= (out.right - dtdata.rect.right);
+                            out.right = dtdata.rect.right;
+                        }
+                        if(srect.left >= srect.right)
+                            return false;
+                        if(out.top < dtdata.rect.top) {
+                            srect.top += (dtdata.rect.top - out.top);
+                            out.top = dtdata.rect.top;
+                        }
+                        if(out.bottom > dtdata.rect.bottom) {
+                            srect.bottom -= (out.bottom - dtdata.rect.bottom);
+                            out.bottom = dtdata.rect.bottom;
+                        }
+                        return srect.top < srect.bottom;
+                    };
+
+                    const bool shadowdrawn = shadow &&
+                        clipped_rect(shadow, x + shofsx, y + shofsy,
+                                     shadowdrect);
+                    const bool drawn = clipped_rect(data, x, y, drect);
+                    if(drawn || shadowdrawn) {
+                        tTVPPendingTextDraw pending;
+                        pending.DestRect = destrect;
+                        pending.X = x;
+                        pending.Y = y;
+                        pending.Color = color;
+                        pending.BltMode = bltmode;
+                        pending.Opa = opa;
+                        pending.HoldAlpha = holdalpha;
+                        pending.ShadowColor = shadowcolor;
+                        pending.ShLevel = shlevel;
+                        pending.ShWidth = shwidth;
+                        pending.ShOfsX = shofsx;
+                        pending.ShOfsY = shofsy;
+                        pending.Data = data;
+                        pending.Shadow = shadow;
+                        if(pending.Data)
+                            pending.Data->AddRef();
+                        if(pending.Shadow)
+                            pending.Shadow->AddRef();
+                        PendingTextDraws.push_back(pending);
+                    }
+
+                    if(updaterects) {
+                        if(!shadowdrawn) {
+                            if(drawn)
+                                updaterects->Or(drect);
+                        } else {
+                            if(drawn) {
+                                tTVPRect d;
+                                TVPUnionRect(&d, drect, shadowdrect);
+                                updaterects->Or(d);
+                            } else {
+                                updaterects->Or(shadowdrect);
+                            }
+                        }
+                    }
+                    if(data)
+                        data->Release();
+                    if(shadow)
+                        shadow->Release();
+                    return;
+                }
+
                 bool shadowdrawn = false;
 
                 if(shadow) {
@@ -1226,6 +1657,75 @@ void tTVPNativeBaseBitmap::DrawTextSingle(
         data->Release();
     if(shadow)
         shadow->Release();
+}
+
+void tTVPNativeBaseBitmap::DrawTextVerticalGradient(
+    const tTVPRect &destrect, tjs_int x, tjs_int y, const ttstr &text,
+    tjs_uint32 topcolor, tjs_uint32 bottomcolor, tTVPBBBltMethod bltmode,
+    tjs_int opa, bool holdalpha, bool aa, tjs_int gradientHeight,
+    tTVPComplexRect *updaterects) {
+    if(!Is32BPP())
+        TVPThrowExceptionMessage(TVPInvalidOperationFor8BPP);
+
+    if(bltmode == bmAlphaOnAlpha) {
+        if(opa < -255)
+            opa = -255;
+        if(opa > 255)
+            opa = 255;
+    } else {
+        if(opa < 0)
+            opa = 0;
+        if(opa > 255)
+            opa = 255;
+    }
+    if(opa == 0)
+        return;
+
+    Independ();
+    ApplyFont();
+
+    tTVPDrawTextData dtdata;
+    dtdata.rect = destrect;
+    dtdata.bmppitch = GetPitchBytes();
+    dtdata.bltmode = bltmode;
+    dtdata.opa = opa;
+    dtdata.holdalpha = holdalpha;
+
+    tTVPFontAndCharacterData font;
+    font.Font = Font;
+    font.Antialiased = aa;
+    font.Hinting = true;
+    font.BlurLevel = 0;
+    font.BlurWidth = 0;
+    font.FontHash = FontHash;
+    font.Blured = false;
+
+    const tjs_char *p = text.c_str();
+    const tjs_int len = text.GetLen();
+    tjs_int cursorX = x;
+    for(tjs_int i = 0; i < len; ++i) {
+        font.Character = p[i];
+        tTVPCharacterData *data =
+            TVPGetCharacter(font, this, PrerenderedFont, AscentOfsX, AscentOfsY);
+        try {
+            if(data && data->BlackBoxX != 0 && data->BlackBoxY != 0) {
+                tTVPRect drect;
+                const bool drawn = InternalDrawTextVerticalGradient(
+                    data, cursorX, y, topcolor, bottomcolor, &dtdata, drect,
+                    gradientHeight);
+                if(drawn && updaterects)
+                    updaterects->Or(drect);
+            }
+            if(data)
+                cursorX += data->Metrics.CellIncX;
+        } catch(...) {
+            if(data)
+                data->Release();
+            throw;
+        }
+        if(data)
+            data->Release();
+    }
 }
 //---------------------------------------------------------------------------
 // structure for holding data for a character
@@ -1285,6 +1785,237 @@ struct tTVPCharacterDrawData {
     }
 };
 //---------------------------------------------------------------------------
+void tTVPNativeBaseBitmap::ClearPendingTextDraws() {
+    for(auto &draw : PendingTextDraws) {
+        if(draw.Data)
+            draw.Data->Release();
+        if(draw.Shadow)
+            draw.Shadow->Release();
+        draw.Data = nullptr;
+        draw.Shadow = nullptr;
+    }
+    PendingTextDraws.clear();
+}
+//---------------------------------------------------------------------------
+void tTVPNativeBaseBitmap::FlushPendingTextDraws() {
+    if(FlushingPendingTextDraws || PendingTextDraws.empty())
+        return;
+
+    FlushingPendingTextDraws = true;
+    try {
+        auto keys_equal = [](const tTVPPendingTextDraw &a,
+                             const tTVPPendingTextDraw &b) -> bool {
+            return a.Color == b.Color && a.BltMode == b.BltMode &&
+                a.Opa == b.Opa && a.HoldAlpha == b.HoldAlpha &&
+                a.ShadowColor == b.ShadowColor && a.ShLevel == b.ShLevel &&
+                a.ShWidth == b.ShWidth && a.ShOfsX == b.ShOfsX &&
+                a.ShOfsY == b.ShOfsY;
+        };
+
+        size_t begin = 0;
+        while(begin < PendingTextDraws.size()) {
+            size_t end = begin + 1;
+            while(end < PendingTextDraws.size() &&
+                  keys_equal(PendingTextDraws[begin], PendingTextDraws[end])) {
+                ++end;
+            }
+
+            const auto &key = PendingTextDraws[begin];
+            tTVPDrawTextData dtdata;
+            dtdata.rect = key.DestRect;
+            dtdata.bmppitch = GetPitchBytes();
+            dtdata.bltmode = key.BltMode;
+            dtdata.opa = key.Opa;
+            dtdata.holdalpha = key.HoldAlpha;
+
+            std::vector<tTVPCharacterDrawData> drawdata;
+            std::vector<tTVPRect> drawrects;
+            drawdata.reserve(end - begin);
+            drawrects.reserve(end - begin);
+            for(size_t i = begin; i < end; ++i) {
+                const auto &pending = PendingTextDraws[i];
+                drawdata.push_back(tTVPCharacterDrawData(
+                    pending.Data, pending.Shadow, pending.X, pending.Y));
+                drawrects.push_back(pending.DestRect);
+            }
+
+            struct tTVPTextBatchGlyph {
+                size_t Index;
+                tTVPCharacterData *Data;
+                tTVPRect SrcRect;
+                tTVPRect DstRect;
+            };
+
+            auto prepare_batch = [&](bool use_shadow, tjs_int ofs_x,
+                                     tjs_int ofs_y,
+                                     std::vector<tTVPTextBatchGlyph> &glyphs,
+                                     tTVPRect &batch_rect) -> bool {
+                glyphs.clear();
+                bool has_rect = false;
+                for(size_t idx = 0; idx < drawdata.size(); ++idx) {
+                    tTVPCharacterData *data =
+                        use_shadow ? drawdata[idx].Shadow : drawdata[idx].Data;
+                    if(!data)
+                        continue;
+
+                    tTVPRect drect;
+                    drect.left = drawdata[idx].X + ofs_x + data->OriginX;
+                    drect.top = drawdata[idx].Y + ofs_y + data->OriginY;
+                    drect.right = drect.left + data->BlackBoxX;
+                    drect.bottom = drect.top + data->BlackBoxY;
+
+                    tTVPRect srect;
+                    srect.left = srect.top = 0;
+                    srect.right = data->BlackBoxX;
+                    srect.bottom = data->BlackBoxY;
+
+                    const tTVPRect &cliprect = drawrects[idx];
+                    if(drect.left < cliprect.left) {
+                        srect.left += (cliprect.left - drect.left);
+                        drect.left = cliprect.left;
+                    }
+                    if(drect.right > cliprect.right) {
+                        srect.right -= (drect.right - cliprect.right);
+                        drect.right = cliprect.right;
+                    }
+                    if(srect.left >= srect.right)
+                        continue;
+                    if(drect.top < cliprect.top) {
+                        srect.top += (cliprect.top - drect.top);
+                        drect.top = cliprect.top;
+                    }
+                    if(drect.bottom > cliprect.bottom) {
+                        srect.bottom -= (drect.bottom - cliprect.bottom);
+                        drect.bottom = cliprect.bottom;
+                    }
+                    if(srect.top >= srect.bottom)
+                        continue;
+
+                    glyphs.push_back({idx, data, srect, drect});
+                    if(!has_rect) {
+                        batch_rect = drect;
+                        has_rect = true;
+                    } else {
+                        batch_rect.do_union(drect);
+                    }
+                }
+                return has_rect;
+            };
+
+            auto draw_prepared_batch =
+                [&](const std::vector<tTVPTextBatchGlyph> &glyphs,
+                    const tTVPRect &batch_rect,
+                    tjs_uint32 draw_color) -> bool {
+                if(glyphs.empty() || batch_rect.is_empty())
+                    return false;
+
+                const tjs_int batch_w = batch_rect.get_width();
+                const tjs_int batch_h = batch_rect.get_height();
+                // Reuse one scratch bitmap instead of allocating (and freeing)
+                // a multi-megabyte bitmap per batch; it grows but never
+                // shrinks, matching the cached scratch texture below.
+                tTVPBitmap *tmp =
+                    AcquireTextBatchScratchBitmap(batch_w, batch_h);
+                if(tmp == nullptr)
+                    return false;
+                tjs_int dpitch = tmp->GetPitch();
+                tjs_uint8 *bits =
+                    const_cast<tjs_uint8 *>(
+                        static_cast<const tjs_uint8 *>(tmp->GetBits()));
+                std::memset(bits, 0, static_cast<size_t>(dpitch) * batch_h);
+
+                for(const auto &glyph : glyphs) {
+                    const tTVPCharacterData *data = glyph.Data;
+                    const tTVPRect &srect = glyph.SrcRect;
+                    const tTVPRect &drect = glyph.DstRect;
+                    const tjs_int w = drect.get_width();
+                    const tjs_int h = drect.get_height();
+                    const tjs_uint8 *src =
+                        data->GetData() + data->Pitch * srect.top + srect.left;
+                    tjs_uint8 *dst =
+                        bits + (drect.top - batch_rect.top) * dpitch +
+                        (drect.left - batch_rect.left) * 4;
+                    for(tjs_int yy = 0; yy < h; ++yy) {
+                        tjs_uint32 *dst32 =
+                            reinterpret_cast<tjs_uint32 *>(dst);
+                        for(tjs_int xx = 0; xx < w; ++xx) {
+                            TVPWriteTextScratchPixel(dst32[xx], draw_color,
+                                                     src[xx]);
+                        }
+                        src += data->Pitch;
+                        dst += dpitch;
+                    }
+                }
+
+                if(_CharacterTextureRGBA) {
+                    if(_CharacterTextureRGBA->GetFormat() !=
+                       TVPTextureFormat::RGBA) {
+                        _CharacterTextureRGBA->Release();
+                        _CharacterTextureRGBA = nullptr;
+                    }
+                }
+                const tjs_int texturew =
+                    std::max(batch_w, TVPTextScratchTextureMinSize());
+                const tjs_int textureh =
+                    std::max(batch_h, TVPTextScratchTextureMinSize());
+                if(!_CharacterTextureRGBA) {
+                    _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
+                        nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
+                        RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
+                } else if(_CharacterTextureRGBA->GetInternalWidth() <
+                              batch_w ||
+                          _CharacterTextureRGBA->GetInternalHeight() <
+                              batch_h) {
+                    _CharacterTextureRGBA->Release();
+                    _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
+                        nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
+                        RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
+                }
+                if(_CharacterTextureRGBA) {
+                    _CharacterTextureRGBA->Update(
+                        tmp->GetBits(), TVPTextureFormat::RGBA, dpitch,
+                        tTVPRect(0, 0, batch_w, batch_h));
+                }
+                if(!_CharacterTextureRGBA)
+                    return false;
+
+                static iTVPRenderMethod *method =
+                    TVPGetRenderManager()->GetRenderMethod("AlphaBlend_d");
+                static int opa_id = method->EnumParameterID("opacity");
+                method->SetParameterOpa(opa_id, dtdata.opa);
+                tRenderTexRectArray::Element src_tex[] = {
+                    tRenderTexRectArray::Element(
+                        _CharacterTextureRGBA,
+                        tTVPRect(0, 0, batch_w, batch_h))};
+                TVPGetRenderManager()->OperateRect(
+                    method,
+                    GetTextureForRender(method->IsBlendTarget(), &batch_rect),
+                    nullptr, batch_rect, tRenderTexRectArray(src_tex));
+                return true;
+            };
+
+            std::vector<tTVPTextBatchGlyph> glyphs;
+            tTVPRect batch_rect;
+            if(key.ShLevel != 0 &&
+               prepare_batch(true, key.ShOfsX, key.ShOfsY, glyphs,
+                             batch_rect)) {
+                draw_prepared_batch(glyphs, batch_rect, key.ShadowColor);
+            }
+            if(prepare_batch(false, 0, 0, glyphs, batch_rect)) {
+                draw_prepared_batch(glyphs, batch_rect, key.Color);
+            }
+
+            begin = end;
+        }
+        ClearPendingTextDraws();
+        FlushingPendingTextDraws = false;
+    } catch(...) {
+        ClearPendingTextDraws();
+        FlushingPendingTextDraws = false;
+        throw;
+    }
+}
+//---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::DrawTextMultiple(
     const tTVPRect &destrect, tjs_int x, tjs_int y, const ttstr &text,
     tjs_uint32 color, tTVPBBBltMethod bltmode, tjs_int opa, bool holdalpha,
@@ -1310,7 +2041,15 @@ void tTVPNativeBaseBitmap::DrawTextMultiple(
     if(opa == 0)
         return; // nothing to do
 
+#ifdef __ANDROID__
+    // Keep consecutive text calls pending while this bitmap is already safe to
+    // render into.  Independ() flushes the pending queue even when no copy is
+    // needed, which turns settings-page construction into many tiny uploads.
+    if(!IsIndependent())
+        Independ();
+#else
     Independ();
+#endif
 
     ApplyFont();
 
@@ -1390,10 +2129,286 @@ void tTVPNativeBaseBitmap::DrawTextMultiple(
         }
         if(data)
             data->Release();
-        if(shadow)
-            shadow->Release();
+    if(shadow)
+        shadow->Release();
 
         p++;
+    }
+
+    const bool batchGPURoute = !TVPIsSoftwareRenderManager() &&
+        !IndividualConfigManager::GetInstance()->GetValue<bool>(
+            "ogl_accurate_render", false) &&
+        bltmode == bmAlphaOnAlpha && opa > 0 && !drawdata.empty();
+
+#ifdef __ANDROID__
+    if(batchGPURoute) {
+        auto clipped_rect = [&](tTVPCharacterData *data, tjs_int dx,
+                                tjs_int dy, tTVPRect &out) -> bool {
+            out.left = dx + data->OriginX;
+            out.top = dy + data->OriginY;
+            out.right = out.left + data->BlackBoxX;
+            out.bottom = out.top + data->BlackBoxY;
+
+            if(out.left < destrect.left)
+                out.left = destrect.left;
+            if(out.right > destrect.right)
+                out.right = destrect.right;
+            if(out.top < destrect.top)
+                out.top = destrect.top;
+            if(out.bottom > destrect.bottom)
+                out.bottom = destrect.bottom;
+            return !out.is_empty();
+        };
+
+        for(const auto &draw : drawdata) {
+            tTVPRect main_rect;
+            tTVPRect shadow_rect;
+            const bool shadow_drawn = shlevel != 0 && draw.Shadow &&
+                clipped_rect(draw.Shadow, draw.X + shofsx,
+                             draw.Y + shofsy, shadow_rect);
+            const bool main_drawn = draw.Data &&
+                clipped_rect(draw.Data, draw.X, draw.Y, main_rect);
+            if(!main_drawn && !shadow_drawn)
+                continue;
+
+            tTVPPendingTextDraw pending;
+            pending.DestRect = destrect;
+            pending.X = draw.X;
+            pending.Y = draw.Y;
+            pending.Color = color;
+            pending.BltMode = bltmode;
+            pending.Opa = opa;
+            pending.HoldAlpha = holdalpha;
+            pending.ShadowColor = shadowcolor;
+            pending.ShLevel = shlevel;
+            pending.ShWidth = shwidth;
+            pending.ShOfsX = shofsx;
+            pending.ShOfsY = shofsy;
+            pending.Data = draw.Data;
+            pending.Shadow = draw.Shadow;
+            if(pending.Data)
+                pending.Data->AddRef();
+            if(pending.Shadow)
+                pending.Shadow->AddRef();
+            PendingTextDraws.push_back(pending);
+
+            if(updaterects) {
+                if(main_drawn && shadow_drawn) {
+                    tTVPRect combined;
+                    TVPUnionRect(&combined, main_rect, shadow_rect);
+                    updaterects->Or(combined);
+                } else {
+                    updaterects->Or(main_drawn ? main_rect : shadow_rect);
+                }
+            }
+        }
+
+        // Bound retained glyph memory for unusually large script-generated
+        // pages while preserving cross-call batching for normal UI screens.
+        if(PendingTextDraws.size() >= 8192)
+            FlushPendingTextDraws();
+        return;
+    }
+#endif
+
+    if(batchGPURoute) {
+        struct tTVPTextBatchGlyph {
+            size_t Index;
+            tTVPCharacterData *Data;
+            tTVPRect SrcRect;
+            tTVPRect DstRect;
+        };
+
+        auto prepare_batch = [&](bool use_shadow, tjs_int ofs_x,
+                                 tjs_int ofs_y,
+                                 std::vector<tTVPTextBatchGlyph> &glyphs,
+                                 tTVPRect &batch_rect) -> bool {
+            glyphs.clear();
+            bool has_rect = false;
+
+            for(size_t idx = 0; idx < drawdata.size(); ++idx) {
+                tTVPCharacterData *data =
+                    use_shadow ? drawdata[idx].Shadow : drawdata[idx].Data;
+                if(!data)
+                    continue;
+
+                tTVPRect drect;
+                drect.left = drawdata[idx].X + ofs_x + data->OriginX;
+                drect.top = drawdata[idx].Y + ofs_y + data->OriginY;
+                drect.right = drect.left + data->BlackBoxX;
+                drect.bottom = drect.top + data->BlackBoxY;
+
+                tTVPRect srect;
+                srect.left = srect.top = 0;
+                srect.right = data->BlackBoxX;
+                srect.bottom = data->BlackBoxY;
+
+                if(drect.left < dtdata.rect.left) {
+                    srect.left += (dtdata.rect.left - drect.left);
+                    drect.left = dtdata.rect.left;
+                }
+                if(drect.right > dtdata.rect.right) {
+                    srect.right -= (drect.right - dtdata.rect.right);
+                    drect.right = dtdata.rect.right;
+                }
+                if(srect.left >= srect.right)
+                    continue;
+
+                if(drect.top < dtdata.rect.top) {
+                    srect.top += (dtdata.rect.top - drect.top);
+                    drect.top = dtdata.rect.top;
+                }
+                if(drect.bottom > dtdata.rect.bottom) {
+                    srect.bottom -= (drect.bottom - dtdata.rect.bottom);
+                    drect.bottom = dtdata.rect.bottom;
+                }
+                if(srect.top >= srect.bottom)
+                    continue;
+
+                glyphs.push_back({idx, data, srect, drect});
+                if(!has_rect) {
+                    batch_rect = drect;
+                    has_rect = true;
+                } else {
+                    batch_rect.do_union(drect);
+                }
+            }
+
+            return has_rect;
+        };
+
+        auto draw_prepared_batch =
+            [&](const std::vector<tTVPTextBatchGlyph> &glyphs,
+                const tTVPRect &batch_rect, tjs_uint32 draw_color) -> bool {
+            if(glyphs.empty() || batch_rect.is_empty())
+                return false;
+
+            const tjs_int batch_w = batch_rect.get_width();
+            const tjs_int batch_h = batch_rect.get_height();
+            // Same shared scratch buffer as the deferred flush: the immediate
+            // draw path issues one batch per text call, so a per-batch
+            // allocation dominated backlog repaints here as well.
+            tTVPBitmap *tmp =
+                AcquireTextBatchScratchBitmap(batch_w, batch_h);
+            if(tmp == nullptr)
+                return false;
+            tjs_int dpitch = tmp->GetPitch();
+            tjs_uint8 *bits =
+                const_cast<tjs_uint8 *>(
+                    static_cast<const tjs_uint8 *>(tmp->GetBits()));
+            std::memset(bits, 0, static_cast<size_t>(dpitch) * batch_h);
+
+            for(const auto &glyph : glyphs) {
+                const tTVPCharacterData *data = glyph.Data;
+                const tTVPRect &srect = glyph.SrcRect;
+                const tTVPRect &drect = glyph.DstRect;
+                const tjs_int w = drect.get_width();
+                const tjs_int h = drect.get_height();
+                const tjs_uint8 *src =
+                    data->GetData() + data->Pitch * srect.top + srect.left;
+                tjs_uint8 *dst =
+                    bits + (drect.top - batch_rect.top) * dpitch +
+                    (drect.left - batch_rect.left) * 4;
+
+                for(tjs_int yy = 0; yy < h; ++yy) {
+                    tjs_uint32 *dst32 = reinterpret_cast<tjs_uint32 *>(dst);
+                    for(tjs_int xx = 0; xx < w; ++xx) {
+                        TVPWriteTextScratchPixel(dst32[xx], draw_color,
+                                                 src[xx]);
+                    }
+                    src += data->Pitch;
+                    dst += dpitch;
+                }
+            }
+
+            if(_CharacterTextureRGBA) {
+                if(_CharacterTextureRGBA->GetFormat() !=
+                   TVPTextureFormat::RGBA) {
+                    _CharacterTextureRGBA->Release();
+                    _CharacterTextureRGBA = nullptr;
+                }
+            }
+            const tjs_int texturew =
+                std::max(batch_w, TVPTextScratchTextureMinSize());
+            const tjs_int textureh =
+                std::max(batch_h, TVPTextScratchTextureMinSize());
+            if(!_CharacterTextureRGBA) {
+                _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
+                    nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
+                    RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
+            } else if(_CharacterTextureRGBA->GetInternalWidth() < batch_w ||
+                      _CharacterTextureRGBA->GetInternalHeight() < batch_h) {
+                _CharacterTextureRGBA->Release();
+                _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
+                    nullptr, 0, texturew, textureh, TVPTextureFormat::RGBA,
+                    RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
+            }
+
+            if(_CharacterTextureRGBA) {
+                _CharacterTextureRGBA->Update(
+                    tmp->GetBits(), TVPTextureFormat::RGBA, dpitch,
+                    tTVPRect(0, 0, batch_w, batch_h));
+            }
+            // The scratch bitmap is owned by the shared pool above and is
+            // rewritten from (0,0) by the next batch, so it is not released
+            // here.
+
+            if(!_CharacterTextureRGBA)
+                return false;
+
+            static iTVPRenderMethod *method =
+                TVPGetRenderManager()->GetRenderMethod("AlphaBlend_d");
+            static int opa_id = method->EnumParameterID("opacity");
+            method->SetParameterOpa(opa_id, dtdata.opa);
+
+            tRenderTexRectArray::Element src_tex[] = {
+                tRenderTexRectArray::Element(
+                    _CharacterTextureRGBA,
+                    tTVPRect(0, 0, batch_w, batch_h))};
+            TVPGetRenderManager()->OperateRect(
+                method, GetTextureForRender(method->IsBlendTarget(),
+                                            &batch_rect),
+                nullptr, batch_rect, tRenderTexRectArray(src_tex));
+            return true;
+        };
+
+        std::vector<tTVPTextBatchGlyph> glyphs;
+        tTVPRect batch_rect;
+
+        if(shlevel != 0 &&
+           prepare_batch(true, shofsx, shofsy, glyphs, batch_rect) &&
+           draw_prepared_batch(glyphs, batch_rect, shadowcolor)) {
+            for(const auto &glyph : glyphs) {
+                drawdata[glyph.Index].ShadowDrawn = true;
+                drawdata[glyph.Index].ShadowRect = glyph.DstRect;
+            }
+        }
+
+        std::vector<bool> main_drawn(drawdata.size(), false);
+        if(prepare_batch(false, 0, 0, glyphs, batch_rect) &&
+           draw_prepared_batch(glyphs, batch_rect, color)) {
+            for(const auto &glyph : glyphs) {
+                main_drawn[glyph.Index] = true;
+                if(updaterects) {
+                    if(!drawdata[glyph.Index].ShadowDrawn) {
+                        updaterects->Or(glyph.DstRect);
+                    } else {
+                        tTVPRect d;
+                        TVPUnionRect(&d, glyph.DstRect,
+                                     drawdata[glyph.Index].ShadowRect);
+                        updaterects->Or(d);
+                    }
+                }
+            }
+        }
+
+        if(updaterects) {
+            for(size_t idx = 0; idx < drawdata.size(); ++idx) {
+                if(drawdata[idx].ShadowDrawn && !main_drawn[idx])
+                    updaterects->Or(drawdata[idx].ShadowRect);
+            }
+        }
+        return;
     }
 
     // draw shadows first
@@ -1471,6 +2486,30 @@ void tTVPNativeBaseBitmap::GetTextSize(const ttstr &text) {
             TextWidth = width;
             TextHeight = std::abs(Font.Height);
         }
+
+#ifndef __ANDROID__
+        // Desktop historically warms the glyph bitmap cache while measuring.
+        // On Android, UI parsers call getTextWidth hundreds of times while
+        // constructing a page; eager rasterization turns a metrics query into
+        // a main-thread rendering workload. DrawText will populate the same
+        // cache on demand for glyphs that are actually displayed.
+        tTVPFontAndCharacterData font;
+        font.Font = Font;
+        font.Antialiased = true;
+        font.Hinting = true;
+        font.BlurLevel = 0;
+        font.BlurWidth = 0;
+        font.FontHash = FontHash;
+        const tjs_char *buf = text.c_str();
+        while(*buf) {
+            font.Character = *buf;
+            tTVPCharacterData *data = TVPGetCharacter(
+                font, this, PrerenderedFont, AscentOfsX, AscentOfsY);
+            if(data)
+                data->Release();
+            buf++;
+        }
+#endif
     }
 }
 //---------------------------------------------------------------------------
@@ -1511,6 +2550,8 @@ void tTVPNativeBaseBitmap::GetFontGlyphDrawRect(const ttstr &text,
 }
 iTVPTexture2D *tTVPNativeBaseBitmap::GetTextureForRender(bool isBlendTarget,
                                                          const tTVPRect *rc) {
+    if(!FlushingPendingTextDraws)
+        FlushPendingTextDraws();
     if(isBlendTarget || !rc)
         Independ();
     else {

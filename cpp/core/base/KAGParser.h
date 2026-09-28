@@ -23,9 +23,16 @@
 #include "CharacterSet.h"
 #include "TransIntf.h"
 #include "tjsHashSearch.h"
+#include <deque>
 #include <vector>
 
 using namespace TJS;
+
+typedef bool (*tTVPCompiledScenarioLabelResolver)(const ttstr &storage,
+                                                  const ttstr &label);
+
+TJS_EXP_FUNC_DEF(void, TVPRegisterCompiledScenarioLabelResolver,
+                 (tTVPCompiledScenarioLabelResolver resolver));
 /*[*/
 //---------------------------------------------------------------------------
 // KAG Parser debug level
@@ -262,6 +269,11 @@ private:
     bool Interrupted;
     bool MultiLineTagEnabled;
 
+    // Tags produced from one translated text run.  KAG scripts can encode
+    // dialogue either as plain text or as consecutive explicit [ch] tags;
+    // this queue gives both representations the same parser-level boundary.
+    std::deque<iTJSDispatch2 *> TextTagQueue;
+
 public:
     void operator=(const tTJSNI_KAGParser &ref);
 
@@ -333,6 +345,11 @@ private:
 private:
     iTJSDispatch2 *_GetNextTag();
 
+    iTJSDispatch2 *CloneTag(iTJSDispatch2 *source);
+
+    void ClearTextTagQueue();
+    void PrefetchTextLookahead(tjs_int current_run_end);
+
 public:
     iTJSDispatch2 *GetNextTag();
 
@@ -368,6 +385,8 @@ public:
 
     void SetMultiLineTagEnabled(bool b) { MultiLineTagEnabled = b; }
     bool GetMultiLineTagEnabled() const { return MultiLineTagEnabled; }
+
+    iTJSDispatch2 *CopyTag(tjs_int numparams, tTJSVariant **param);
 };
 
 extern iTJSDispatch2 *TVPCreateNativeClass_KAGParser();

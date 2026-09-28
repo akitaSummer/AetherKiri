@@ -15,7 +15,77 @@
 #include "tjsArray.h"
 #include "tjsBinarySerializer.h"
 #include "tjsDebug.h"
+#include "../base/ScriptMgnIntf.h"
+#include "../base/TextStream.h"
 #include <atomic>
+#include <spdlog/spdlog.h>
+
+namespace {
+
+bool TJSDictionaryStructTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_STRUCT_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+tjs_error TJSLoadDictionaryStructuredText(tTJSVariant *result,
+                                          const ttstr &name,
+                                          const ttstr &mode,
+                                          iTJSDispatch2 *context) {
+    iTJSTextReadStream *stream = TVPCreateTextStreamForRead(name, mode);
+    if(!stream)
+        return TJS_E_INVALIDPARAM;
+
+    ttstr buffer;
+    try {
+        stream->Read(buffer, 0);
+    } catch(...) {
+        stream->Destruct();
+        throw;
+    }
+    stream->Destruct();
+
+    if(TJSDictionaryStructTraceEnabled()) {
+        std::string prefix = buffer.AsStdString();
+        if(prefix.size() > 160)
+            prefix.resize(160);
+        for(char &ch : prefix) {
+            if(ch == '\r' || ch == '\n' || ch == '\t')
+                ch = ' ';
+        }
+        spdlog::info(
+            "Dictionary.loadStruct text-fallback file={} mode={} chars={} "
+            "prefix=\"{}\"",
+            name.AsStdString(), mode.AsStdString(),
+            static_cast<long long>(buffer.length()), prefix);
+    }
+
+    const tjs_int length = buffer.length();
+    tjs_char *top = buffer.AppendBuffer(9);
+    memmove(top + 8, top, sizeof(tjs_char) * length);
+    memcpy(top, TJS_W("(const)["), sizeof(tjs_char) * 8);
+    top[8 + length] = TJS_W(']');
+    buffer.FixLen();
+
+    tTJSVariant values;
+    TVPExecuteExpression(buffer, TVPExtractStorageName(name), 0, context,
+                         &values);
+
+    if(result) {
+        const tTJSVariantClosure closure = values.AsObjectClosureNoAddRef();
+        if(!closure.Object)
+            return TJS_E_INVALIDPARAM;
+        const tjs_error hr = closure.PropGetByNum(TJS_IGNOREPROP, 0, result,
+                                                  nullptr);
+        if(TJS_FAILED(hr))
+            return hr;
+    }
+    return TJS_S_OK;
+}
+
+} // namespace
 
 static std::atomic<int64_t> sTJSDictCreateCount{0};
 static std::atomic<int64_t> sTJSDictDestroyCount{0};
@@ -82,6 +152,10 @@ namespace TJS {
             ttstr mode;
             if(numparams >= 2 && param[1]->Type() != tvtVoid)
                 mode = *param[1];
+            iTJSDispatch2 *context = numparams >= 3 &&
+                    param[2]->Type() != tvtVoid
+                ? param[2]->AsObjectNoAddRef()
+                : nullptr;
 
             tTJSBinaryStream *stream = TJSCreateBinaryStreamForRead(name, mode);
             if(!stream)
@@ -112,6 +186,10 @@ namespace TJS {
                         }
                     }
                 }
+                if(!isbin) {
+                    stream->SetPosition(0);
+                    isbin = TJSLoadStructuredDataPack(stream, result);
+                }
             } catch(...) {
                 delete stream;
                 if(dicfree) {
@@ -124,7 +202,8 @@ namespace TJS {
             delete stream;
             if(isbin)
                 return TJS_S_OK;
-            return TJS_E_INVALIDPARAM;
+            return TJSLoadDictionaryStructuredText(result, name, mode,
+                                                   context);
         }
         TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ loadStruct)
         //----------------------------------------------------------------------
@@ -252,6 +331,229 @@ namespace TJS {
             return TJS_S_OK;
         }
         TJS_END_NATIVE_STATIC_METHOD_DECL(/*func.name*/ clear)
+        // Artemis character scripts use these as Dictionary static helpers.
+        // Keep the key ordering deterministic to match Scripts.getObjectKeys.
+        TJS_BEGIN_NATIVE_METHOD_DECL(/*func.name*/ keys) {
+            if(numparams < 1 || !param || !param[0])
+                return TJS_E_BADPARAMCOUNT;
+            if(param[0]->Type() != tvtObject)
+                return TJS_E_INVALIDTYPE;
+
+            tTJSVariantClosure &source =
+                param[0]->AsObjectClosureNoAddRef();
+            if(!source.Object)
+                return TJS_E_INVALIDOBJECT;
+            if(!result)
+                return TJS_S_OK;
+
+            struct tKeysCallback final : public tTJSDispatch {
+                explicit tKeysCallback(iTJSDispatch2 *array) : Array(array) {}
+
+                tjs_error FuncCall(tjs_uint32 /*flag*/,
+                                   const tjs_char * /*membername*/,
+                                   tjs_uint32 * /*hint*/, tTJSVariant *result,
+                                   tjs_int numparams, tTJSVariant **param,
+                                   iTJSDispatch2 * /*objthis*/) override {
+                    tjs_error hr = TJS_S_OK;
+                    if(numparams > 1 && param && param[0] && param[1] &&
+                       !(static_cast<tjs_uint32>(param[1]->AsInteger()) &
+                         TJS_HIDDENMEMBER)) {
+                        static tjs_uint addHint = 0;
+                        hr = Array->FuncCall(0, TJS_W("add"), &addHint,
+                                             nullptr, 1, &param[0], Array);
+                    }
+                    if(result)
+                        *result = TJS_SUCCEEDED(hr);
+                    return hr;
+                }
+
+                iTJSDispatch2 *Array;
+            };
+
+            iTJSDispatch2 *array = TJSCreateArrayObject();
+            try {
+                tKeysCallback enumCallback(array);
+                tTJSVariantClosure enumClosure(&enumCallback, nullptr);
+                tjs_error hr = source.EnumMembers(
+                    TJS_IGNOREPROP | TJS_ENUM_NO_VALUE, &enumClosure, nullptr);
+                if(TJS_FAILED(hr)) {
+                    array->Release();
+                    return hr;
+                }
+
+                static tjs_uint sortHint = 0;
+                hr = array->FuncCall(0, TJS_W("sort"), &sortHint, nullptr, 0,
+                                     nullptr, array);
+                if(TJS_FAILED(hr)) {
+                    array->Release();
+                    return hr;
+                }
+                *result = tTJSVariant(array, array);
+            } catch(...) {
+                array->Release();
+                throw;
+            }
+            array->Release();
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_STATIC_METHOD_DECL(/*func.name*/ keys)
+        //----------------------------------------------------------------------
+        // Some KiriKiri titles use Dictionary.values as a static helper and
+        // then apply Array helpers such as includes to the returned values.
+        TJS_BEGIN_NATIVE_METHOD_DECL(/*func.name*/ values) {
+            if(numparams < 1 || !param || !param[0])
+                return TJS_E_BADPARAMCOUNT;
+            if(param[0]->Type() != tvtObject)
+                return TJS_E_INVALIDTYPE;
+
+            tTJSVariantClosure &source =
+                param[0]->AsObjectClosureNoAddRef();
+            if(!source.Object)
+                return TJS_E_INVALIDOBJECT;
+            if(!result)
+                return TJS_S_OK;
+
+            struct tValuesCallback final : public tTJSDispatch {
+                explicit tValuesCallback(iTJSDispatch2 *array) : Array(array) {}
+
+                tjs_error FuncCall(tjs_uint32 /*flag*/,
+                                   const tjs_char * /*membername*/,
+                                   tjs_uint32 * /*hint*/, tTJSVariant *result,
+                                   tjs_int numparams, tTJSVariant **param,
+                                   iTJSDispatch2 * /*objthis*/) override {
+                    tjs_error hr = TJS_S_OK;
+                    if(numparams > 2 && param && param[1] && param[2] &&
+                       !(static_cast<tjs_uint32>(param[1]->AsInteger()) &
+                         TJS_HIDDENMEMBER)) {
+                        static tjs_uint addHint = 0;
+                        hr = Array->FuncCall(0, TJS_W("add"), &addHint,
+                                             nullptr, 1, &param[2], Array);
+                    }
+                    if(result)
+                        *result = TJS_SUCCEEDED(hr);
+                    return hr;
+                }
+
+                iTJSDispatch2 *Array;
+            };
+
+            iTJSDispatch2 *array = TJSCreateArrayObject();
+            try {
+                tValuesCallback enumCallback(array);
+                tTJSVariantClosure enumClosure(&enumCallback, nullptr);
+                const tjs_error hr = source.EnumMembers(
+                    TJS_IGNOREPROP, &enumClosure, nullptr);
+                if(TJS_FAILED(hr)) {
+                    array->Release();
+                    return hr;
+                }
+                *result = tTJSVariant(array, array);
+            } catch(...) {
+                array->Release();
+                throw;
+            }
+            array->Release();
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_STATIC_METHOD_DECL(/*func.name*/ values)
+        //----------------------------------------------------------------------
+        TJS_BEGIN_NATIVE_METHOD_DECL(/*func.name*/ getCount) {
+            if(numparams < 1 || !param || !param[0])
+                return TJS_E_BADPARAMCOUNT;
+            if(param[0]->Type() != tvtObject)
+                return TJS_E_INVALIDTYPE;
+
+            tTJSVariantClosure &source =
+                param[0]->AsObjectClosureNoAddRef();
+            if(!source.Object)
+                return TJS_E_INVALIDOBJECT;
+
+            tjs_int count = 0;
+            const tjs_error hr =
+                source.GetCount(&count, nullptr, nullptr, nullptr);
+            if(TJS_FAILED(hr))
+                return hr;
+            if(result)
+                *result = count;
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_STATIC_METHOD_DECL(/*func.name*/ getCount)
+        //----------------------------------------------------------------------
+        // Artemis titles use Dictionary.forEach as a static helper rather
+        // than as an instance method.  Keep the callback bridge in the same
+        // shape used by the Artemis helper: (value, key, ...extras).  In
+        // particular,
+        // pass the EnumMembers-owned variants through a temporary parameter
+        // list instead of copying their closures into a callback object.  A
+        // few older TJS objects expose an ObjThis closure, and copying that
+        // closure past the enum callback is not safe.
+        TJS_BEGIN_NATIVE_METHOD_DECL(/*func.name*/ forEach) {
+            if(numparams < 2 || !param || !param[0] || !param[1])
+                return TJS_E_BADPARAMCOUNT;
+
+            if(param[0]->Type() != tvtObject ||
+               param[1]->Type() != tvtObject)
+                return TJS_E_INVALIDTYPE;
+
+            tTJSVariantClosure &source =
+                param[0]->AsObjectClosureNoAddRef();
+            tTJSVariantClosure &callback =
+                param[1]->AsObjectClosureNoAddRef();
+
+            iTJSDispatch2 *func = callback.Object;
+            iTJSDispatch2 *funcThis = callback.ObjThis;
+            if(!funcThis)
+                funcThis = objthis;
+            if(!source.Object || !func)
+                return TJS_E_INVALIDOBJECT;
+
+            struct tForEachCallback final : public tTJSDispatch {
+                iTJSDispatch2 *Func = nullptr;
+                iTJSDispatch2 *FuncThis = nullptr;
+                tTJSVariant **Params = nullptr;
+                tjs_int ParamCount = 0;
+                tTJSVariant BreakResult;
+
+                tjs_error FuncCall(tjs_uint32 /*flag*/,
+                                   const tjs_char * /*membername*/,
+                                   tjs_uint32 * /*hint*/, tTJSVariant *result,
+                                   tjs_int numparams, tTJSVariant **param,
+                                   iTJSDispatch2 * /*objthis*/) override {
+                    BreakResult.Clear();
+                    if(numparams > 1 && param && param[0] && param[1] &&
+                       param[2] &&
+                       !(static_cast<tjs_uint32>(
+                             static_cast<tjs_int>(*param[1])) &
+                         TJS_HIDDENMEMBER)) {
+                        // EnumMembers supplies (name, flags, value).  The
+                        // legacy helper exposes (value, key, ...extras).
+                        Params[0] = param[2];
+                        Params[1] = param[0];
+                        Func->FuncCall(0, nullptr, nullptr, &BreakResult,
+                                       ParamCount, Params, FuncThis);
+                    }
+                    if(result)
+                        *result = BreakResult.Type() == tvtVoid;
+                    return TJS_S_OK;
+                }
+            };
+
+            tForEachCallback enumCallback;
+            enumCallback.Func = func;
+            enumCallback.FuncThis = funcThis;
+            enumCallback.Params = new tTJSVariant *[numparams];
+            enumCallback.ParamCount = numparams;
+            for(tjs_int i = 2; i < numparams; ++i)
+                enumCallback.Params[i] = param[i];
+
+            tTJSVariantClosure enumClosure(&enumCallback, nullptr);
+            source.EnumMembers(TJS_IGNOREPROP, &enumClosure, nullptr);
+            if(result)
+                *result = enumCallback.BreakResult;
+            delete[] enumCallback.Params;
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_STATIC_METHOD_DECL(/*func.name*/ forEach)
         //----------------------------------------------------------------------
 
         ClassID_Dictionary = TJS_NCM_CLASSID;
@@ -562,7 +864,7 @@ namespace TJS {
         iTJSDispatch2 *objthis) {
         // called indirectly from
         // tTJSDictionaryNI::SaveStructuredBinary
-        if(numparams < 3)
+        if(numparams < 2)
             return TJS_E_BADPARAMCOUNT;
         // hidden members are not processed
         tjs_uint32 flags = (tjs_int)*param[1];
@@ -595,7 +897,10 @@ namespace TJS {
                 // reserve area
                 tSaveMemberCountCallback countCallback;
                 tTJSVariantClosure cclo(&countCallback, nullptr);
-                dsp->EnumMembers(TJS_IGNOREPROP, &cclo, dsp);
+                // Sizing only needs names and flags. Copying every value here
+                // adds a second round of object/string refcount traffic to
+                // each dictionary in a deep history snapshot.
+                dsp->EnumMembers(TJS_IGNOREPROP | TJS_ENUM_NO_VALUE, &cclo, dsp);
                 tjs_int reqcount = countCallback.Count + Owner->Count;
                 Owner->RebuildHash(reqcount);
 

@@ -3,10 +3,15 @@
 //
 
 #include "RuntimeSupport.h"
+#include "PsbValueReader.h"
+#include "MotionPlayerExtension.h"
+#include "ResourceManager.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -29,18 +34,35 @@
 namespace motion::detail {
 
     namespace {
+        using psb::dictionaryBool;
+        using psb::dictionaryList;
+        using psb::dictionaryNumber;
+        using psb::dictionaryString;
+        using psb::valueNumber;
+        using psb::valueString;
 
         std::mutex &snapshotRegistryMutex() {
             static std::mutex mutex;
             return mutex;
         }
 
-        std::unordered_map<const iTJSDispatch2 *, std::shared_ptr<MotionSnapshot>>
+        std::unordered_map<const iTJSDispatch2 *, std::weak_ptr<MotionSnapshot>>
         &snapshotRegistry() {
             static std::unordered_map<const iTJSDispatch2 *,
-                                      std::shared_ptr<MotionSnapshot>>
+                                      std::weak_ptr<MotionSnapshot>>
                 registry;
             return registry;
+        }
+
+        void pruneExpiredSnapshotsLocked() {
+            auto &registry = snapshotRegistry();
+            for(auto it = registry.begin(); it != registry.end();) {
+                if(it->second.expired()) {
+                    it = registry.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
 
         struct LogoChainTraceSession {
@@ -99,9 +121,95 @@ namespace motion::detail {
             return slash == std::string::npos ? value : value.substr(slash + 1);
         }
 
+        void appendMotionCandidate(std::vector<ttstr> &candidates,
+                                   const std::string &value) {
+            if(value.empty()) {
+                return;
+            }
+            const auto exists =
+                std::any_of(candidates.begin(), candidates.end(),
+                            [&value](const ttstr &candidate) {
+                                return narrow(candidate) == value;
+                            });
+            if(!exists) {
+                candidates.emplace_back(ttstr{ value });
+            }
+        }
+
+        void appendSplitEmoteBaseCandidates(std::vector<ttstr> &candidates,
+                                            const std::string &raw) {
+            if(raw.empty()) {
+                return;
+            }
+
+            const auto lowered = lowercase(raw);
+            const auto slash = raw.find_last_of("/\\");
+            const auto nameStart =
+                slash == std::string::npos ? std::string::size_type{ 0 }
+                                           : slash + 1;
+            auto stemEnd = raw.size();
+            std::string preferredExt;
+            if(const auto dot = lowered.find_last_of('.');
+               dot != std::string::npos && dot > nameStart) {
+                const auto ext = lowered.substr(dot);
+                if(ext == ".mtn" || ext == ".psb" || ext == ".mt") {
+                    preferredExt = ext;
+                    stemEnd = dot;
+                }
+            }
+
+            const auto stemLength = stemEnd - nameStart;
+            if(stemLength <= 3) {
+                return;
+            }
+            const auto stemLower = lowered.substr(nameStart, stemLength);
+            if(stemLower.compare(stemLower.size() - 3, 3, "emo") != 0) {
+                return;
+            }
+
+            const auto prefix = raw.substr(0, nameStart);
+            const auto baseStem = raw.substr(nameStart, stemLength - 3);
+            if(baseStem.empty()) {
+                return;
+            }
+
+            std::vector<std::string> extensions;
+            if(!preferredExt.empty()) {
+                extensions.push_back(preferredExt);
+            }
+            for(const auto *ext : { ".mtn", ".psb", ".mt" }) {
+                if(std::find(extensions.begin(), extensions.end(), ext) ==
+                   extensions.end()) {
+                    extensions.emplace_back(ext);
+                }
+            }
+
+            for(const auto &ext : extensions) {
+                appendMotionCandidate(candidates, prefix + baseStem + ext);
+            }
+
+            if(slash == std::string::npos) {
+                for(const auto &ext : extensions) {
+                    appendMotionCandidate(candidates,
+                                          "motion/" + baseStem + ext);
+                }
+            }
+        }
+
         bool isTargetLogoMotionPath(const std::string &motionPath) {
             const auto lowered = lowercase(motionPath);
             return lowered.find("yuzulogo.mtn") != std::string::npos ||
+                lowered.find("m2logo.mtn") != std::string::npos;
+        }
+
+        bool shouldLogMotionSnapshotPath(const std::string &motionPath) {
+            const char *enabled = std::getenv("AETHERKIRI_MOTION_DEBUG");
+            if(!enabled || !*enabled || std::strcmp(enabled, "0") == 0) {
+                return false;
+            }
+            const auto lowered = lowercase(motionPath);
+            return lowered.find("title") != std::string::npos ||
+                lowered.find("yuzulogo.mtn") != std::string::npos ||
                 lowered.find("m2logo.mtn") != std::string::npos;
         }
 
@@ -201,96 +309,6 @@ namespace motion::detail {
                                [&lowered](const char *ext) {
                                    return hasSuffix(lowered, ext);
                                });
-        }
-
-        std::optional<std::string>
-        psbString(const std::shared_ptr<PSB::IPSBValue> &value) {
-            if(auto str = std::dynamic_pointer_cast<PSB::PSBString>(value)) {
-                return str->value;
-            }
-            return std::nullopt;
-        }
-
-        std::optional<double>
-        psbNumber(const std::shared_ptr<PSB::IPSBValue> &value) {
-            if(auto number = std::dynamic_pointer_cast<PSB::PSBNumber>(value)) {
-                switch(number->numberType) {
-                    case PSB::PSBNumberType::Float:
-                        return number->getValue<float>();
-                    case PSB::PSBNumberType::Double:
-                        return number->getValue<double>();
-                    case PSB::PSBNumberType::Int:
-                        return static_cast<double>(number->getValue<int>());
-                    case PSB::PSBNumberType::Long:
-                    default:
-                        return static_cast<double>(number->getValue<tjs_int64>());
-                }
-            }
-            if(auto boolean = std::dynamic_pointer_cast<PSB::PSBBool>(value)) {
-                return boolean->value ? 1.0 : 0.0;
-            }
-            return std::nullopt;
-        }
-
-        std::optional<bool>
-        psbBool(const std::shared_ptr<PSB::IPSBValue> &value) {
-            if(auto boolean = std::dynamic_pointer_cast<PSB::PSBBool>(value)) {
-                return boolean->value;
-            }
-            if(auto number = psbNumber(value)) {
-                return *number != 0.0;
-            }
-            return std::nullopt;
-        }
-
-        std::optional<std::string>
-        dictionaryString(const std::shared_ptr<const PSB::PSBDictionary> &dic,
-                         const std::vector<std::string> &keys) {
-            for(const auto &key : keys) {
-                if(const auto value = (*dic)[key]) {
-                    if(const auto result = psbString(value)) {
-                        return result;
-                    }
-                }
-            }
-            return std::nullopt;
-        }
-
-        std::optional<double>
-        dictionaryNumber(const std::shared_ptr<const PSB::PSBDictionary> &dic,
-                         const std::vector<std::string> &keys) {
-            for(const auto &key : keys) {
-                if(const auto value = (*dic)[key]) {
-                    if(const auto result = psbNumber(value)) {
-                        return result;
-                    }
-                }
-            }
-            return std::nullopt;
-        }
-
-        std::optional<bool>
-        dictionaryBool(const std::shared_ptr<const PSB::PSBDictionary> &dic,
-                       const std::vector<std::string> &keys) {
-            for(const auto &key : keys) {
-                if(const auto value = (*dic)[key]) {
-                    if(const auto result = psbBool(value)) {
-                        return result;
-                    }
-                }
-            }
-            return std::nullopt;
-        }
-
-        std::shared_ptr<PSB::PSBList>
-        dictionaryList(const std::shared_ptr<const PSB::PSBDictionary> &dic,
-                       const std::vector<std::string> &keys) {
-            for(const auto &key : keys) {
-                if(auto value = std::dynamic_pointer_cast<PSB::PSBList>((*dic)[key])) {
-                    return value;
-                }
-            }
-            return nullptr;
         }
 
         bool dictionaryHasKey(const std::shared_ptr<const PSB::PSBDictionary> &dic,
@@ -413,11 +431,12 @@ namespace motion::detail {
                                                             std::to_string(
                                                                 frameIndex));
                             const double frameValue = dictionaryNumber(
-                                frameDic, {"f"}).value_or(0.0);
+                                frameDic, {"frame", "f", "value"})
+                                                          .value_or(0.0);
                             frames.push_back({frameLabel, frameValue});
                             minValue = std::min(minValue, frameValue);
                             maxValue = std::max(maxValue, frameValue);
-                        } else if(const auto value = psbNumber(frameItem)) {
+                        } else if(const auto value = valueNumber(frameItem)) {
                             frames.push_back({std::to_string(frameIndex), *value});
                             minValue = std::min(minValue, *value);
                             maxValue = std::max(maxValue, *value);
@@ -462,7 +481,7 @@ namespace motion::detail {
             snapshot.instantVariableLabels.clear();
             for(const auto &item : *list) {
                 std::optional<std::string> label;
-                if(const auto text = psbString(item)) {
+                if(const auto text = valueString(item)) {
                     label = *text;
                 } else if(const auto dic =
                               std::dynamic_pointer_cast<PSB::PSBDictionary>(item)) {
@@ -730,7 +749,7 @@ namespace motion::detail {
 
             if(const auto list = dictionaryList(mirrorDic, {"variableMatchList"})) {
                 for(const auto &item : *list) {
-                    if(const auto label = psbString(item); label && !label->empty()) {
+                    if(const auto label = valueString(item); label && !label->empty()) {
                         appendUnique(snapshot.mirrorVariableMatchList, *label);
                     }
                 }
@@ -808,8 +827,19 @@ namespace motion::detail {
         }
 
         void collectControlMetadata(MotionSnapshot &snapshot) {
-            const auto base =
+            const auto metadata =
+                navigateDictionaryPath(snapshot.root, "metadata");
+            auto base =
                 navigateDictionaryPath(snapshot.root, "metadata/base");
+            // E-mote 3 PSBs used by Nekopara store the control tables directly
+            // in the root `metadata` dictionary.  The companion TJS module
+            // wraps that dictionary as `metadata.base`, but the native Player
+            // is initialized from the PSB itself and accepts both layouts.
+            if(!base ||
+               (metadata && !dictionaryHasKey(base, "variableList") &&
+                dictionaryHasKey(metadata, "variableList"))) {
+                base = metadata;
+            }
             if(!base) {
                 return;
             }
@@ -841,6 +871,10 @@ namespace motion::detail {
                                    snapshot);
             collectControlBindings(base, "transitionControl", 7,
                                    {{"label", "label"}}, snapshot);
+            if(const auto *extension = motionPlayerExtension();
+               extension && extension->collectControlMetadata) {
+                extension->collectControlMetadata(base, snapshot);
+            }
             collectSelectorControlMetadata(base, snapshot);
             collectClampControlMetadata(base, snapshot);
             collectMirrorControlMetadata(base, snapshot);
@@ -911,12 +945,48 @@ namespace motion::detail {
         void collectValueSources(const std::shared_ptr<PSB::IPSBValue> &value,
                                  std::vector<std::string> &sources);
 
+        double collectSelfSyncTimeFromLayer(
+            const std::shared_ptr<const PSB::PSBDictionary> &layer) {
+            if(!layer) {
+                return 0.0;
+            }
+
+            double result = 0.0;
+            if(const auto frameList = dictionaryList(layer, { "frameList" })) {
+                for(const auto &frameValue : *frameList) {
+                    const auto frame =
+                        std::dynamic_pointer_cast<PSB::PSBDictionary>(
+                            frameValue);
+                    if(!frame) {
+                        continue;
+                    }
+                    if(static_cast<bool>((*frame)["content"])) {
+                        result = std::max(
+                            result,
+                            dictionaryNumber(frame, { "time" }).value_or(0.0));
+                    }
+                }
+            }
+
+            if(const auto children = dictionaryList(layer, { "children" })) {
+                for(const auto &childValue : *children) {
+                    const auto child =
+                        std::dynamic_pointer_cast<PSB::PSBDictionary>(
+                            childValue);
+                    result = std::max(result,
+                                      collectSelfSyncTimeFromLayer(child));
+                }
+            }
+
+            return result;
+        }
+
         void collectDictionarySources(
             const std::shared_ptr<PSB::PSBDictionary> &dic,
             std::vector<std::string> &sources) {
             for(const auto &[key, child] : *dic) {
                 const auto loweredKey = lowercase(key);
-                if(const auto text = psbString(child)) {
+                if(const auto text = valueString(child)) {
                     if(looksLikeStoragePath(*text) ||
                        loweredKey.find("source") != std::string::npos ||
                        loweredKey == "path" || loweredKey == "file" ||
@@ -941,7 +1011,7 @@ namespace motion::detail {
                 collectDictionarySources(dic, sources);
             } else if(auto list = std::dynamic_pointer_cast<PSB::PSBList>(value)) {
                 collectListSources(list, sources);
-            } else if(const auto text = psbString(value)) {
+            } else if(const auto text = valueString(value)) {
                 if(looksLikeStoragePath(*text)) {
                     appendUnique(sources, *text);
                 }
@@ -951,34 +1021,112 @@ namespace motion::detail {
         void maybeRecordMotionClip(const std::vector<std::string> &path,
                                    const std::shared_ptr<PSB::PSBDictionary> &dic,
                                    MotionSnapshot &snapshot) {
-            if(path.size() < 4 ||
-               lowercase(path[path.size() - 2]) != "motion" ||
-               lowercase(path[path.size() - 4]) != "object") {
+            if(path.size() < 3) {
                 return;
             }
 
-            const auto label = path.back();
+            std::string label;
+            std::string owner;
+            if(path.size() >= 4 &&
+               lowercase(path[path.size() - 2]) == "motion" &&
+               lowercase(path[path.size() - 4]) == "object") {
+                label = path.back();
+                owner = path[path.size() - 3];
+            } else if(lowercase(path[path.size() - 3]) == "motion") {
+                // Some Yuzu PSBs store SD clips as motion/<chara>/<label>
+                // rather than object/<chara>/motion/<label>.
+                label = path.back();
+                owner = path[path.size() - 2];
+            } else {
+                return;
+            }
+
             if(label.empty()) {
                 return;
             }
 
-            auto &clip = snapshot.clipsByLabel[label];
-            clip.label = label;
-            clip.owner = path[path.size() - 3];
-            clip.totalFrames =
-                dictionaryNumber(dic, { "lastTime", "frameCount", "frame_count",
-                                        "totalFrameCount", "total_frame_count",
-                                        "frames", "length", "end" })
-                    .value_or(0.0);
-            if(const auto loopTime = dictionaryNumber(dic, { "loopTime" })) {
-                clip.loopTime = *loopTime;
-                clip.loop = *loopTime >= 0.0;
-            } else if(const auto loop = dictionaryBool(dic, { "loop", "repeat", "is_loop" })) {
-                clip.loop = *loop;
-                clip.loopTime = *loop ? 0.0 : -1.0;
+            const auto layers = dictionaryList(dic, { "layer" });
+            if(!layers) {
+                return;
             }
 
-            if(const auto layers = dictionaryList(dic, { "layer" })) {
+            const auto populateClip = [&](MotionClip &clip) {
+                clip.label = label;
+                clip.owner = owner;
+                clip.totalFrames =
+                    dictionaryNumber(
+                        dic, { "lastTime", "frameCount", "frame_count",
+                               "totalFrameCount", "total_frame_count", "frames",
+                               "length", "end" })
+                        .value_or(0.0);
+                clip.syncTime =
+                    dictionaryNumber(dic, { "syncTime", "sync_time" })
+                        .value_or(0.0);
+                clip.selfSyncTime =
+                    dictionaryNumber(dic, { "selfSyncTime", "self_sync_time" })
+                        .value_or(0.0);
+                if(const auto loopTime =
+                       dictionaryNumber(dic, { "loopTime" })) {
+                    clip.loopTime = *loopTime;
+                    clip.loop = *loopTime >= 0.0;
+                } else if(const auto loop = dictionaryBool(
+                              dic, { "loop", "repeat", "is_loop" })) {
+                    clip.loop = *loop;
+                    clip.loopTime = *loop ? 0.0 : -1.0;
+                }
+
+                const auto appendParameter = [&](
+                    const std::shared_ptr<PSB::PSBDictionary> &parameter) {
+                    if(!parameter) {
+                        return;
+                    }
+                    MotionParameterInfo info;
+                    info.id = dictionaryString(
+                                  parameter, { "id", "label", "name" })
+                                  .value_or(std::string{});
+                    info.discretization =
+                        dictionaryBool(parameter, { "discretization" })
+                            .value_or(false);
+                    info.rangeBegin =
+                        dictionaryNumber(parameter, { "rangeBegin" })
+                            .value_or(0.0);
+                    info.rangeEnd =
+                        dictionaryNumber(parameter, { "rangeEnd" })
+                            .value_or(0.0);
+                    const double range = info.rangeEnd - info.rangeBegin;
+                    info.division =
+                        dictionaryNumber(parameter, { "division" })
+                            .value_or(range > 0.0 ? range : 1.0);
+                    clip.parameters.push_back(std::move(info));
+                };
+
+                if(clip.parameters.empty()) {
+                    if(const auto parameterList =
+                           dictionaryList(dic, { "parameter" })) {
+                        for(const auto &parameterItem : *parameterList) {
+                            appendParameter(
+                                std::dynamic_pointer_cast<PSB::PSBDictionary>(
+                                    parameterItem));
+                        }
+                    }
+
+                    const auto parameterizeValue = (*dic)["parameterize"];
+                    if(const auto parameterize =
+                           std::dynamic_pointer_cast<PSB::PSBDictionary>(
+                               parameterizeValue)) {
+                        if(clip.parameters.empty()) {
+                            appendParameter(parameterize);
+                        }
+                        if(!clip.parameters.empty()) {
+                            clip.defaultParameterIndex = 0;
+                        }
+                    } else if(const auto defaultIndex =
+                                  valueNumber(parameterizeValue)) {
+                        clip.defaultParameterIndex =
+                            static_cast<int>(*defaultIndex);
+                    }
+                }
+
                 for(const auto &item : *layers) {
                     const auto layer =
                         std::dynamic_pointer_cast<PSB::PSBDictionary>(item);
@@ -992,16 +1140,61 @@ namespace motion::detail {
                         continue;
                     }
 
+                    clip.orderedLayers.push_back(layer);
                     if(clip.layersByName.find(*layerLabel) ==
                        clip.layersByName.end()) {
                         clip.layersByName[*layerLabel] = layer;
                         clip.layerNames.push_back(*layerLabel);
                     }
-                    collectValueSources(layer, clip.sourceCandidates);
+                    clip.selfSyncTime = std::max(
+                        clip.selfSyncTime,
+                        collectSelfSyncTimeFromLayer(layer));
                 }
-            }
 
-            collectValueSources(dic, clip.sourceCandidates);
+                // The clip dictionary contains every layer visited above, so
+                // one recursive source pass is sufficient.  Scanning each
+                // layer separately first made large E-mote models walk the
+                // same PSB subtrees twice.
+                collectValueSources(dic, clip.sourceCandidates);
+            };
+
+            auto &ownerClip =
+                snapshot.clipsByOwnerAndLabel[owner][label];
+            populateClip(ownerClip);
+
+            // clipsByLabel is a compatibility index over the same parsed
+            // clip.  Building it by calling populateClip a second time used
+            // to repeat all self-sync and source-tree recursion.  Copy the
+            // already parsed metadata while retaining the legacy behavior of
+            // accumulating layers if different owners share a label.
+            auto &clip = snapshot.clipsByLabel[label];
+            clip.label = ownerClip.label;
+            clip.owner = ownerClip.owner;
+            clip.totalFrames = ownerClip.totalFrames;
+            clip.syncTime = ownerClip.syncTime;
+            clip.selfSyncTime = ownerClip.selfSyncTime;
+            clip.loopTime = ownerClip.loopTime;
+            clip.loop = ownerClip.loop;
+            if(clip.parameters.empty()) {
+                clip.parameters = ownerClip.parameters;
+                clip.defaultParameterIndex = ownerClip.defaultParameterIndex;
+            }
+            for(const auto &layer : ownerClip.orderedLayers) {
+                clip.orderedLayers.push_back(layer);
+            }
+            for(const auto &layerName : ownerClip.layerNames) {
+                const auto layerIt = ownerClip.layersByName.find(layerName);
+                if(layerIt == ownerClip.layersByName.end() ||
+                   clip.layersByName.find(layerName) !=
+                       clip.layersByName.end()) {
+                    continue;
+                }
+                clip.layersByName.emplace(layerName, layerIt->second);
+                clip.layerNames.push_back(layerName);
+            }
+            for(const auto &source : ownerClip.sourceCandidates) {
+                appendUnique(clip.sourceCandidates, source);
+            }
 
             appendUnique(snapshot.mainTimelineLabels, clip.label);
             snapshot.loopTimelines[clip.label] = clip.loop;
@@ -1009,13 +1202,21 @@ namespace motion::detail {
             snapshot.timelineTotalFrames[clip.label] = clip.totalFrames;
         }
 
+        bool looksLikeEmbeddedSourceKey(const std::string &value) {
+            return looksLikeStoragePath(value) ||
+                value.find('/') != std::string::npos ||
+                value.find('\\') != std::string::npos;
+        }
+
         void scanValue(const std::shared_ptr<PSB::IPSBValue> &value,
                        std::vector<std::string> &path,
-                       MotionSnapshot &snapshot);
+                       MotionSnapshot &snapshot,
+                       std::vector<std::string> &embeddedResourcePaths);
 
         void scanDictionary(const std::shared_ptr<PSB::PSBDictionary> &dic,
                             std::vector<std::string> &path,
-                            MotionSnapshot &snapshot) {
+                            MotionSnapshot &snapshot,
+                            std::vector<std::string> &embeddedResourcePaths) {
             maybeRecordMotionClip(path, dic, snapshot);
             maybeRecordLayer(path, dic, snapshot);
             maybeRecordTimeline(path, dic, snapshot);
@@ -1030,80 +1231,29 @@ namespace motion::detail {
             }
 
             for(const auto &[key, child] : *dic) {
-                const auto loweredKey = lowercase(key);
-                if(const auto text = psbString(child)) {
-                    if(looksLikeStoragePath(*text) ||
-                       loweredKey.find("source") != std::string::npos ||
-                       loweredKey == "path" || loweredKey == "file" ||
-                       loweredKey == "src") {
-                        appendUnique(snapshot.sourceCandidates, *text);
-                    }
-                }
-
                 path.push_back(key);
-                scanValue(child, path, snapshot);
+                scanValue(child, path, snapshot, embeddedResourcePaths);
                 path.pop_back();
             }
         }
 
         void scanList(const std::shared_ptr<PSB::PSBList> &list,
-                      std::vector<std::string> &path, MotionSnapshot &snapshot) {
+                      std::vector<std::string> &path, MotionSnapshot &snapshot,
+                      std::vector<std::string> &embeddedResourcePaths) {
             for(size_t index = 0; index < list->size(); ++index) {
                 path.push_back(std::to_string(index));
-                scanValue((*list)[static_cast<int>(index)], path, snapshot);
+                scanValue((*list)[static_cast<int>(index)], path, snapshot,
+                          embeddedResourcePaths);
                 path.pop_back();
             }
         }
 
         void scanValue(const std::shared_ptr<PSB::IPSBValue> &value,
                        std::vector<std::string> &path,
-                       MotionSnapshot &snapshot) {
-            if(auto dic = std::dynamic_pointer_cast<PSB::PSBDictionary>(value)) {
-                scanDictionary(dic, path, snapshot);
-            } else if(auto list = std::dynamic_pointer_cast<PSB::PSBList>(value)) {
-                scanList(list, path, snapshot);
-            } else if(const auto text = psbString(value)) {
-                if(looksLikeStoragePath(*text)) {
-                    appendUnique(snapshot.sourceCandidates, *text);
-                }
-            }
-        }
-
-        bool looksLikeEmbeddedSourceKey(const std::string &value) {
-            return looksLikeStoragePath(value) ||
-                value.find('/') != std::string::npos ||
-                value.find('\\') != std::string::npos;
-        }
-
-        void collectResourceMap(const std::shared_ptr<PSB::IPSBValue> &value,
-                                std::vector<std::string> &path,
-                                MotionSnapshot &snapshot);
-
-        void collectDictionaryResourceMap(
-            const std::shared_ptr<PSB::PSBDictionary> &dic,
-            std::vector<std::string> &path, MotionSnapshot &snapshot) {
-            for(const auto &[key, child] : *dic) {
-                path.push_back(key);
-                collectResourceMap(child, path, snapshot);
-                path.pop_back();
-            }
-        }
-
-        void collectListResourceMap(const std::shared_ptr<PSB::PSBList> &list,
-                                    std::vector<std::string> &path,
-                                    MotionSnapshot &snapshot) {
-            for(size_t index = 0; index < list->size(); ++index) {
-                path.push_back(std::to_string(index));
-                collectResourceMap((*list)[static_cast<int>(index)], path,
-                                   snapshot);
-                path.pop_back();
-            }
-        }
-
-        void collectResourceMap(const std::shared_ptr<PSB::IPSBValue> &value,
-                                std::vector<std::string> &path,
-                                MotionSnapshot &snapshot) {
-            if(auto resource = std::dynamic_pointer_cast<PSB::PSBResource>(value)) {
+                       MotionSnapshot &snapshot,
+                       std::vector<std::string> &embeddedResourcePaths) {
+            if(auto resource =
+                   std::dynamic_pointer_cast<PSB::PSBResource>(value)) {
                 std::string joined;
                 for(size_t index = 0; index < path.size(); ++index) {
                     if(index != 0) {
@@ -1114,39 +1264,69 @@ namespace motion::detail {
                 if(!joined.empty()) {
                     snapshot.resourcesByPath.emplace(joined, resource);
                     if(looksLikeEmbeddedSourceKey(joined)) {
-                        appendUnique(snapshot.sourceCandidates, joined);
+                        appendUnique(embeddedResourcePaths, joined);
                     }
                 }
                 return;
             }
 
             if(auto dic = std::dynamic_pointer_cast<PSB::PSBDictionary>(value)) {
-                collectDictionaryResourceMap(dic, path, snapshot);
+                scanDictionary(dic, path, snapshot, embeddedResourcePaths);
             } else if(auto list = std::dynamic_pointer_cast<PSB::PSBList>(value)) {
-                collectListResourceMap(list, path, snapshot);
+                scanList(list, path, snapshot, embeddedResourcePaths);
+            } else if(const auto text = valueString(value)) {
+                const auto loweredKey =
+                    path.empty() ? std::string{} : lowercase(path.back());
+                if(looksLikeStoragePath(*text) ||
+                   loweredKey.find("source") != std::string::npos ||
+                   loweredKey == "path" || loweredKey == "file" ||
+                   loweredKey == "src") {
+                    appendUnique(snapshot.sourceCandidates, *text);
+                }
             }
         }
 
-        void collectRootResources(const std::shared_ptr<const PSB::PSBDictionary> &root,
-                                  MotionSnapshot &snapshot) {
+        std::string describeObjectMotionKeys(
+            const std::shared_ptr<const PSB::PSBDictionary> &root) {
             if(!root) {
-                return;
+                return {};
+            }
+            const auto objectTree =
+                std::dynamic_pointer_cast<PSB::PSBDictionary>((*root)["object"]);
+            if(!objectTree) {
+                return {};
             }
 
-            std::vector<std::string> path;
-            collectResourceMap(
-                std::const_pointer_cast<PSB::PSBDictionary>(root), path, snapshot);
-
-            for(const auto &[key, value] : *root) {
-                const auto resource =
-                    std::dynamic_pointer_cast<PSB::PSBResource>(value);
-                if(!resource) {
+            std::string out;
+            for(const auto &[objectName, objectValue] : *objectTree) {
+                const auto objectDict =
+                    std::dynamic_pointer_cast<PSB::PSBDictionary>(objectValue);
+                if(!objectDict) {
                     continue;
                 }
-                if(looksLikeEmbeddedSourceKey(key)) {
-                    appendUnique(snapshot.sourceCandidates, key);
+                const auto motionDict =
+                    std::dynamic_pointer_cast<PSB::PSBDictionary>(
+                        (*objectDict)["motion"]);
+                if(!motionDict) {
+                    continue;
                 }
+
+                if(!out.empty()) {
+                    out += "; ";
+                }
+                out += objectName;
+                out += "[";
+                bool first = true;
+                for(const auto &[motionName, _] : *motionDict) {
+                    if(!first) {
+                        out += ",";
+                    }
+                    out += motionName;
+                    first = false;
+                }
+                out += "]";
             }
+            return out;
         }
 
         void appendResourceAlias(MotionSnapshot &snapshot, const ttstr &alias) {
@@ -1161,6 +1341,11 @@ namespace motion::detail {
                                                   const tjs_int decryptSeed) {
             auto file = std::make_shared<PSB::PSBFile>();
             file->setSeed(decryptSeed);
+            file->setPreParseCallback(
+                [](std::uint8_t *data, const size_t size) {
+                    return ResourceManager::applyEmotePSBDecryptFunc(
+                        data, size);
+                });
             if(!file->loadPSBFile(path)) {
                 LOGGER->error("motion load file: {} failed", path.AsStdString());
                 return nullptr;
@@ -1172,6 +1357,59 @@ namespace motion::detail {
 
     std::shared_ptr<PlayerRuntime> makePlayerRuntime() {
         return std::make_shared<PlayerRuntime>();
+    }
+
+    const MotionClip *findMotionClip(const MotionSnapshot &snapshot,
+                                     const std::string &owner,
+                                     const std::string &label,
+                                     const bool allowLabelFallback) {
+        if(!owner.empty()) {
+            if(const auto ownerIt = snapshot.clipsByOwnerAndLabel.find(owner);
+               ownerIt != snapshot.clipsByOwnerAndLabel.end()) {
+                if(const auto clipIt = ownerIt->second.find(label);
+                   clipIt != ownerIt->second.end()) {
+                    return &clipIt->second;
+                }
+            }
+        }
+        if(!allowLabelFallback) {
+            return nullptr;
+        }
+        if(const auto it = snapshot.clipsByLabel.find(label);
+           it != snapshot.clipsByLabel.end()) {
+            return &it->second;
+        }
+        return nullptr;
+    }
+
+    MotionCompositionEntryPoint resolveMotionCompositionEntryPoint(
+        const MotionSnapshot &snapshot,
+        const std::string &fallbackOwner,
+        const std::string &fallbackLabel) {
+        MotionCompositionEntryPoint result{
+            fallbackOwner,
+            fallbackLabel,
+        };
+        // A hierarchical motion source is an explicit reference. When that
+        // exact owner/clip pair exists in the selected companion module, keep
+        // it instead of replacing it with metadata/base. Split CG projects
+        // commonly expose both 全体構造 (the requested character composite)
+        // and タイムライン構造 (the module's default/background entry point).
+        if(findMotionClip(snapshot, fallbackOwner, fallbackLabel, false)) {
+            return result;
+        }
+        const auto base =
+            navigateDictionaryPath(snapshot.root, "metadata/base");
+        const auto authoredOwner =
+            dictionaryString(base, { "chara" }).value_or(std::string{});
+        const auto authoredLabel =
+            dictionaryString(base, { "motion" }).value_or(std::string{});
+        if(!authoredOwner.empty() && !authoredLabel.empty() &&
+           findMotionClip(snapshot, authoredOwner, authoredLabel, false)) {
+            result.owner = authoredOwner;
+            result.label = authoredLabel;
+        }
+        return result;
     }
 
     std::string narrow(const ttstr &value) { return value.AsStdString(); }
@@ -1196,6 +1434,7 @@ namespace motion::detail {
             candidates.emplace_back(ttstr{ "motion/" + raw + ".mtn" });
             candidates.emplace_back(ttstr{ "motion/" + raw + ".psb" });
         }
+        appendSplitEmoteBaseCandidates(candidates, raw);
 
         return candidates;
     }
@@ -1227,7 +1466,9 @@ namespace motion::detail {
 
     std::shared_ptr<MotionSnapshot> loadMotionSnapshot(const ttstr &path,
                                                        const tjs_int decryptSeed) {
+        const auto timingStart = std::chrono::steady_clock::now();
         const auto file = loadPSBFile(path, decryptSeed);
+        const auto timingFileLoaded = std::chrono::steady_clock::now();
         if(!file) {
             return nullptr;
         }
@@ -1245,8 +1486,10 @@ namespace motion::detail {
         auto snapshot = std::make_shared<MotionSnapshot>();
         snapshot->path = narrow(path);
         snapshot->file = file;
+        snapshot->objectImage = file->getObjectImage();
         snapshot->root = root;
         snapshot->moduleValue = root->toTJSVal();
+        const auto timingModuleBuilt = std::chrono::steady_clock::now();
         if(logoChainTraceEnabled(snapshot)) {
             resetLogoChainTraceSession(snapshot->path);
             logoChainTraceLogf(snapshot->path, "snapshot.load", "PSB parse",
@@ -1257,10 +1500,43 @@ namespace motion::detail {
         PSB::registerRootResources({ path, TVPExtractStorageName(path) }, *file);
 
         std::vector<std::string> pathParts;
+        std::vector<std::string> embeddedResourcePaths;
         scanValue(std::const_pointer_cast<PSB::PSBDictionary>(root), pathParts,
-                  *snapshot);
+                  *snapshot, embeddedResourcePaths);
+        for(const auto &resourcePath : embeddedResourcePaths) {
+            appendUnique(snapshot->sourceCandidates, resourcePath);
+        }
+        const auto timingTreeScanned = std::chrono::steady_clock::now();
         collectControlMetadata(*snapshot);
-        collectRootResources(root, *snapshot);
+        const auto timingControlsCollected = std::chrono::steady_clock::now();
+        if(LOGGER && shouldLogMotionSnapshotPath(snapshot->path)) {
+            const auto elapsedMs = [](const auto begin, const auto end) {
+                return std::chrono::duration<double, std::milli>(end - begin)
+                    .count();
+            };
+            LOGGER->info(
+                "motion snapshot timing: path={} file_ms={:.2f} module_ms={:.2f} scan_ms={:.2f} controls_ms={:.2f} total_ms={:.2f}",
+                snapshot->path,
+                elapsedMs(timingStart, timingFileLoaded),
+                elapsedMs(timingFileLoaded, timingModuleBuilt),
+                elapsedMs(timingModuleBuilt, timingTreeScanned),
+                elapsedMs(timingTreeScanned, timingControlsCollected),
+                elapsedMs(timingStart, timingControlsCollected));
+        }
+        if(LOGGER && shouldLogMotionSnapshotPath(snapshot->path)) {
+            LOGGER->info(
+                "motion snapshot parsed: path={} clips={} mainLabels={} diffLabels={} rootLayers={} sources={}",
+                snapshot->path, snapshot->clipsByLabel.size(),
+                joinStrings(snapshot->mainTimelineLabels),
+                joinStrings(snapshot->diffTimelineLabels),
+                joinStrings(snapshot->layerNames),
+                snapshot->sourceCandidates.size());
+            const auto objectMotionKeys = describeObjectMotionKeys(root);
+            if(!objectMotionKeys.empty()) {
+                LOGGER->info("motion snapshot object motions: path={} {}",
+                             snapshot->path, objectMotionKeys);
+            }
+        }
         if(logoChainTraceEnabled(snapshot)) {
             logoChainTraceLogf(
                 snapshot->path, "snapshot.parsed", "PSB parse", -1.0,
@@ -1320,9 +1596,18 @@ namespace motion::detail {
         return snapshot;
     }
 
-    tTJSVariant loadPSBVariant(const ttstr &path, const tjs_int decryptSeed) {
+    tTJSVariant loadPSBVariant(
+        const ttstr &path, const tjs_int decryptSeed,
+        std::shared_ptr<MotionSnapshot> *loadedSnapshot) {
         if(const auto snapshot = loadMotionSnapshot(path, decryptSeed)) {
+            if(loadedSnapshot != nullptr) {
+                *loadedSnapshot = snapshot;
+            }
             return snapshot->moduleValue;
+        }
+
+        if(loadedSnapshot != nullptr) {
+            loadedSnapshot->reset();
         }
 
         const auto file = loadPSBFile(path, decryptSeed);
@@ -1341,6 +1626,7 @@ namespace motion::detail {
         }
 
         std::lock_guard lock(snapshotRegistryMutex());
+        pruneExpiredSnapshotsLocked();
         snapshotRegistry()[module.AsObjectNoAddRef()] = snapshot;
     }
 
@@ -1351,7 +1637,14 @@ namespace motion::detail {
 
         std::lock_guard lock(snapshotRegistryMutex());
         const auto it = snapshotRegistry().find(module.AsObjectNoAddRef());
-        return it != snapshotRegistry().end() ? it->second : nullptr;
+        if(it == snapshotRegistry().end()) {
+            return nullptr;
+        }
+        auto snapshot = it->second.lock();
+        if(!snapshot) {
+            snapshotRegistry().erase(it);
+        }
+        return snapshot;
     }
 
     tTJSVariant makeArray(const std::vector<tTJSVariant> &items) {
@@ -1657,8 +1950,11 @@ namespace motion::detail {
 
         // Also scan clips' layers
         for(const auto &[clipLabel, clip] : snapshot.clipsByLabel) {
-            for(const auto &[layerName, layerDict] : clip.layersByName) {
+            for(const auto &layerDict : clip.orderedLayers) {
                 if(!layerDict) continue;
+                const auto layerName =
+                    dictionaryString(layerDict, { "label", "name", "id" })
+                        .value_or(std::string{});
                 auto frameList = std::dynamic_pointer_cast<PSB::PSBList>(
                     (*layerDict)["frameList"]);
                 if(!frameList) continue;

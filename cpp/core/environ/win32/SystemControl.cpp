@@ -3,7 +3,13 @@
 
 //---------------------------------------------------------------------------
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <spdlog/spdlog.h>
 #include "SystemControl.h"
+
+#include "../../plugins/motionplayer/MotionRenderProfile.h"
 #include "EventIntf.h"
 #include "MsgIntf.h"
 // #include "WindowFormUnit.h"
@@ -104,7 +110,7 @@ tjs_int TVPResolveBudgetMB(tjs_int configured_budget_mb) {
     const tjs_int total_mb = TVPGetSystemTotalMemoryMB();
     if(total_mb <= 0)
         return 768;
-    return TVPClampInt(total_mb / 4, 512, 1024);
+    return TVPClampInt(total_mb / 4, 512, 4096);
 }
 } // namespace
 
@@ -173,38 +179,21 @@ void tTVPSystemControl::RunMemoryGovernor(uint32_t tick) {
     }
 #endif
 
-    const tjs_int base_graphic_limit_mb =
-        TVPClampInt(budget_mb / (MemoryProfile ? 10 : 12), 16,
-                    MemoryProfile ? 64 : 96);
-    tjs_int target_graphic_limit_mb = base_graphic_limit_mb;
-    if(pressure == 1)
-        target_graphic_limit_mb = TVPClampInt(base_graphic_limit_mb * 2 / 3, 24, 64);
-    else if(pressure >= 2)
-        target_graphic_limit_mb = TVPClampInt(base_graphic_limit_mb / 3, 24, 48);
+    // Keep every decoded-graphic cache at the same desktop budget.  The
+    // renderer owns eviction and the caller explicitly requests a 256 MiB
+    // budget; the governor must not silently shrink it back to the old
+    // 48/64/96 MiB pressure values while a game is running.
+    constexpr tjs_int target_graphic_limit_mb = 256;
 
     const tjs_uint64 target_graphic_bytes =
         static_cast<tjs_uint64>(target_graphic_limit_mb) * 1024ULL * 1024ULL;
     if(TVPGetGraphicCacheLimit() != target_graphic_bytes)
         TVPSetGraphicCacheLimit(target_graphic_bytes);
 
-    tjs_uint archive_limit = MemoryProfile ? 48 : 128;
-    if(budget_mb > 2500)
-        archive_limit = 128;
-    if(pressure == 1)
-        archive_limit = std::max<tjs_uint>(32, archive_limit * 3 / 4);
-    else if(pressure == 2)
-        archive_limit = std::max<tjs_uint>(20, archive_limit / 2);
-    else if(pressure >= 3)
-        archive_limit = 12;
+    tjs_uint archive_limit = 256;
     TVPSetArchiveCacheCount(archive_limit);
 
-    tjs_uint auto_path_limit = 256;
-    if(pressure == 1)
-        auto_path_limit = 192;
-    else if(pressure == 2)
-        auto_path_limit = 128;
-    else if(pressure >= 3)
-        auto_path_limit = 96;
+    constexpr tjs_uint auto_path_limit = 256;
     TVPSetAutoPathCacheMaxCount(auto_path_limit);
 
     TVPFreeUnusedLayerCache = (MemoryProfile == 1 || pressure >= 1);
@@ -228,11 +217,24 @@ void tTVPSystemControl::RunMemoryGovernor(uint32_t tick) {
 
     const uint32_t idle_compact_interval =
         static_cast<uint32_t>(MemoryProfile ? 20000 : 40000);
-    if(pressure == 0 && tick - LastIdleCompactTick >= idle_compact_interval) {
+    // The low-pressure idle pass used to be emitted unconditionally while
+    // the game was still active.  That is not an idle/deactivation event from
+    // the engine's point of view: every layer receives it and drops its
+    // decoded/cache-backed images synchronously.  Godot native then has to
+    // recreate those textures on the next present, which shows up as a brief
+    // black flash when the pointer is moving over an animated title screen.
+    // Real host deactivation still calls OnDeactivate() and keeps this
+    // compaction path; only suppress the periodic maintenance pass while the
+    // application owns the active window.
+    const bool hostActive = Application == nullptr || Application->GetActivating();
+    if(pressure == 0 && !hostActive &&
+       tick - LastIdleCompactTick >= idle_compact_interval) {
         LastIdleCompactTick = tick;
+#ifndef __ANDROID__
         TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_DEACTIVATE);
 #ifdef __APPLE__
         malloc_zone_pressure_relief(nullptr, 0);
+#endif
 #endif
     }
 
@@ -265,7 +267,7 @@ void tTVPSystemControl::RunMemoryGovernor(uint32_t tick) {
 
 #ifdef __APPLE__
     {
-        const tjs_int heap_ceiling_mb = budget_mb * 45 / 100;
+        const tjs_int heap_ceiling_mb = budget_mb * 75 / 100;
         if(heap_in_use_mb > heap_ceiling_mb &&
            tick - LastHeapCeilingTick >= 30000) {
             LastHeapCeilingTick = tick;
@@ -489,6 +491,19 @@ void tTVPSystemControl::DeliverEvents() {
 }
 
 void tTVPSystemControl::SystemWatchTimerTimer() {
+    static const bool profileEnabled = [] {
+        const char *value = std::getenv("AETHERKIRI_MOTION_RENDER_PROFILE");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    const auto profileStarted = profileEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    // A script onFire can be entered before DeliverEvents() and can post
+    // onPaint callbacks that run later in this same host tick. Keep the
+    // render counters alive for the complete system-watch pass so the
+    // profile describes the user-visible stall rather than one queue slice.
+    motion::detail::ScopedMotionRenderBatchProfile systemWatchBatchProfile(
+        profileEnabled);
     if(TVPTerminated) {
         // this will ensure terminating the application.
         // the WM_QUIT message disappears in some unknown
@@ -532,15 +547,28 @@ void tTVPSystemControl::SystemWatchTimerTimer() {
 	}
 #endif
     // check status and deliver events
+    const auto eventsStarted = profileEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     DeliverEvents();
+    const auto eventsFinished = profileEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
     // call TickBeat
+    const auto tickBeatStarted = profileEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     tjs_int count = TVPGetWindowCount();
     for(tjs_int i = 0; i < count; i++) {
         tTJSNI_Window *win = TVPGetWindowListAt(i);
         win->TickBeat();
     }
+    const auto tickBeatFinished = profileEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
+#ifndef __ANDROID__
     if(!ContinuousEventCalling && tick - LastCompactedTick > 4000) {
         // idle state over 4 sec.
         LastCompactedTick = tick;
@@ -551,6 +579,7 @@ void tTVPSystemControl::SystemWatchTimerTimer() {
         LastCompactedTick = tick;
         TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_IDLE);
     }
+#endif
 
     RunMemoryGovernor(tick);
 
@@ -563,6 +592,35 @@ void tTVPSystemControl::SystemWatchTimerTimer() {
         // events to prevent hash table fragmentation and memory waste.
         LastRehashedTick = tick;
         TJSDoRehash();
+    }
+    if(profileEnabled) {
+        const double eventsMs = std::chrono::duration<double, std::milli>(
+            eventsFinished - eventsStarted).count();
+        const double tickBeatMs = std::chrono::duration<double, std::milli>(
+            tickBeatFinished - tickBeatStarted).count();
+        const double totalMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - profileStarted).count();
+        if(systemWatchBatchProfile.owns()) {
+            const auto &stats = systemWatchBatchProfile.stats();
+            if(const auto logger = spdlog::get("core")) {
+                logger->info(
+                    "motion system watch render batch: events_ms={:.3f} "
+                    "total_ms={:.3f} onPaint_calls={} onPaint_ms={:.3f} "
+                    "drawCompat_calls={} drawCompat_ms={:.3f} "
+                    "native_render_calls={} native_render_ms={:.3f}",
+                    eventsMs, totalMs, stats.onPaintCalls, stats.onPaintMs,
+                    stats.drawCompatCalls, stats.drawCompatMs,
+                    stats.nativeRenderCalls, stats.nativeRenderMs);
+            }
+        }
+        if(eventsMs >= 5.0 || tickBeatMs >= 5.0 || totalMs >= 20.0) {
+            if(const auto logger = spdlog::get("core")) {
+                logger->info(
+                    "system watch profile: events_ms={:.3f} tickbeat_ms={:.3f} "
+                    "total_ms={:.3f} windows={}",
+                    eventsMs, tickBeatMs, totalMs, count);
+            }
+        }
     }
     // ensure modal window visible
     if(tick > LastShowModalWindowSentTick + 4100) {

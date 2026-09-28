@@ -43,14 +43,11 @@ set(VISUAL_SOURCE_FILES
     ${VISUAL_PATH}/gl/ResampleImage.cpp
     ${VISUAL_PATH}/gl/WeightFunctor.cpp
 
-    ${VISUAL_PATH}/ogl/astcrt.cpp
     ${VISUAL_PATH}/ogl/etcpak.cpp
-    ${VISUAL_PATH}/ogl/imagepacker.cpp
-    ${VISUAL_PATH}/ogl/pvrtc.cpp
     ${VISUAL_PATH}/ogl/PVRTDecompress.cpp
-    ${VISUAL_PATH}/ogl/RenderManager_ogl.cpp
-    ${VISUAL_PATH}/ogl/krkr_gl.cpp
-    ${VISUAL_PATH}/ogl/krkr_egl_context.cpp
+
+    ${VISUAL_PATH}/godot/GodotGpuBridge.cpp
+    ${VISUAL_PATH}/godot/GodotRenderManager.cpp
 
     ${VISUAL_PATH}/impl/BasicDrawDevice.cpp
     ${VISUAL_PATH}/impl/BitmapBitsAlloc.cpp
@@ -75,6 +72,7 @@ set(VISUAL_HEADERS_DIR
     ${VISUAL_PATH}/
     ${VISUAL_PATH}/gl
     ${VISUAL_PATH}/ogl
+    ${VISUAL_PATH}/godot
     ${VISUAL_PATH}/impl
 )
 
@@ -84,28 +82,45 @@ target_link_libraries(${PROJECT_NAME} PUBLIC tjs2 PRIVATE core_base_module core_
 
 target_link_libraries(${PROJECT_NAME} PRIVATE libbpg)
 
-find_package(WebP CONFIG REQUIRED)
-target_link_libraries(${PROJECT_NAME} INTERFACE WebP::webp WebP::webpdecoder WebP::webpdemux)
-
-# ANGLE (EGL + GLES2) — provides GL context and rendering.
-# All platforms (including Android) use ANGLE for consistent EGL/GLES2.
-find_package(unofficial-angle CONFIG QUIET)
-if(unofficial-angle_FOUND)
-    target_link_libraries(${PROJECT_NAME} PRIVATE
-        unofficial::angle::libEGL
-        unofficial::angle::libGLESv2
+if(ANDROID AND NOT BUILD_GPU_BRIDGE)
+    target_sources(${PROJECT_NAME} PRIVATE
+        ${VISUAL_PATH}/ogl/krkr_gl.cpp
+        ${VISUAL_PATH}/ogl/krkr_egl_context.cpp
     )
-    target_compile_definitions(${PROJECT_NAME} PRIVATE KRKR_USE_ANGLE=1)
-    message(STATUS "ANGLE found — EGL + GLES2 libraries linked")
-else()
+    target_link_libraries(${PROJECT_NAME} PRIVATE EGL GLESv2)
+endif()
+
+if(BUILD_GPU_BRIDGE)
+    target_sources(${PROJECT_NAME} PRIVATE
+        ${VISUAL_PATH}/ogl/astcrt.cpp
+        ${VISUAL_PATH}/ogl/imagepacker.cpp
+        ${VISUAL_PATH}/ogl/pvrtc.cpp
+        ${VISUAL_PATH}/ogl/RenderManager_ogl.cpp
+        ${VISUAL_PATH}/ogl/krkr_gl.cpp
+        ${VISUAL_PATH}/ogl/krkr_egl_context.cpp
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE KRKR_ENABLE_GPU_BRIDGE=1)
     if(ANDROID)
-        # Fallback: link system EGL/GLES2 on Android if ANGLE is not available
         target_link_libraries(${PROJECT_NAME} PRIVATE EGL GLESv2)
-        message(STATUS "ANGLE not found — Android fallback to system EGL/GLES2")
-    else()
-        message(WARNING "ANGLE not found — GL rendering may not work")
     endif()
 endif()
+
+find_package(WebP CONFIG REQUIRED)
+# Keep the engine debuggable without paying the full cost of an unoptimized
+# third-party WebP decoder.  The vcpkg Debug archive is built without decoder
+# optimizations and makes multi-megapixel PSD layers take hundreds of ms to
+# materialize.  Use the ABI-compatible Release WebP archives for Debug builds;
+# this only affects the third-party codec, not the engine's own debug symbols.
+if(NOT WIN32)
+    foreach(_webp_target WebP::webp WebP::webpdecoder WebP::webpdemux WebP::sharpyuv)
+        if(TARGET ${_webp_target})
+            set_property(TARGET ${_webp_target} PROPERTY
+                         MAP_IMPORTED_CONFIG_DEBUG Release)
+        endif()
+    endforeach()
+endif()
+target_link_libraries(${PROJECT_NAME} INTERFACE WebP::webp WebP::webpdecoder WebP::webpdemux)
+
 
 find_package(JXR REQUIRED)
 target_compile_definitions(${PROJECT_NAME} PRIVATE -D__ANSI__)
@@ -138,6 +153,28 @@ target_link_libraries(${PROJECT_NAME} PRIVATE PNG::PNG)
 find_package(ZLIB REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE ZLIB::ZLIB)
 
+if(NOT WIN32)
+    # Keep Debug symbols/assertions in the engine while using the optimized
+    # codec archives. Image decoding is on the script thread for legacy KAG
+    # paths, and the vcpkg Debug PNG/JPEG/Zlib builds dominate long frames.
+    foreach(_codec_target PNG::PNG ZLIB::ZLIB Freetype::Freetype
+                           libjpeg-turbo::turbojpeg
+                           libjpeg-turbo::turbojpeg-static)
+        if(TARGET ${_codec_target})
+            set_property(TARGET ${_codec_target} PROPERTY
+                         MAP_IMPORTED_CONFIG_DEBUG Release)
+        endif()
+    endforeach()
+endif()
+
 # Highway SIMD optimization module
 add_subdirectory(simd)
 target_link_libraries(${PROJECT_NAME} PRIVATE tvpgl_simd)
+
+# The animation compositor spends most of its frame time in the templated
+# stretch/affine raster loops in this module. Keep assertions and debug symbols,
+# but allow those hot loops to inline and vectorize in Debug builds as well;
+# -Og makes layered 1080p SD motions too slow to coexist with typewriter text.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE -O2 -g)
+endif()

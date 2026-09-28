@@ -6,9 +6,14 @@
 //
 #include <spdlog/spdlog.h>
 #include <cassert>
+#include <cstdlib>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "tjs.h"
 #include "ncbind.hpp"
+#include "KAGParser.h"
 #include "PSBFile.h"
 #include "PSBHeader.h"
 #include "PSBMediaRegistry.h"
@@ -22,6 +27,26 @@
 
 using namespace PSB;
 static PSBMedia *psbMedia = nullptr;
+
+static bool psbDebugEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_PSB_DEBUG");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+static std::string describeVariant(const tTJSVariant *value) {
+    if(!value)
+        return "<null>";
+    std::string text = "type=" + std::to_string(static_cast<int>(value->Type()));
+    try {
+        text += " value=" + ttstr(*value).AsStdString();
+    } catch(...) {
+        text += " value=<unprintable>";
+    }
+    return text;
+}
 
 namespace PSB {
 bool GetPSBMediaCacheStats(PSBMediaCacheStats &outStats) {
@@ -51,6 +76,123 @@ static bool psbCacheInfoCallback(size_t &usedBytes, size_t &limitBytes) {
     return true;
 }
 
+namespace {
+using ScenarioLabelSet = std::unordered_set<std::string>;
+
+std::string StripLeadingStar(std::string value) {
+    if(!value.empty() && value.front() == '*')
+        value.erase(value.begin());
+    return value;
+}
+
+void AddScenarioLabel(ScenarioLabelSet &labels, std::string value) {
+    value = StripLeadingStar(std::move(value));
+    if(!value.empty())
+        labels.insert(std::move(value));
+}
+
+std::shared_ptr<PSB::PSBDictionary>
+AsDictionary(const std::shared_ptr<PSB::IPSBValue> &value) {
+    return std::dynamic_pointer_cast<PSB::PSBDictionary>(value);
+}
+
+std::shared_ptr<PSB::PSBList>
+AsList(const std::shared_ptr<PSB::IPSBValue> &value) {
+    return std::dynamic_pointer_cast<PSB::PSBList>(value);
+}
+
+std::shared_ptr<PSB::PSBString>
+AsString(const std::shared_ptr<PSB::IPSBValue> &value) {
+    return std::dynamic_pointer_cast<PSB::PSBString>(value);
+}
+
+void CollectJumpLabels(ScenarioLabelSet &labels,
+                       const std::shared_ptr<PSB::IPSBValue> &value) {
+    if(auto dict = AsDictionary(value)) {
+        for(const auto &[key, child] : *dict) {
+            AddScenarioLabel(labels, key);
+            if(auto text = AsString(child))
+                AddScenarioLabel(labels, text->value);
+        }
+        return;
+    }
+
+    if(auto list = AsList(value)) {
+        for(const auto &child : *list) {
+            if(auto text = AsString(child))
+                AddScenarioLabel(labels, text->value);
+        }
+    }
+}
+
+ScenarioLabelSet CollectScenarioLabels(const std::shared_ptr<const PSB::PSBDictionary> &root) {
+    ScenarioLabelSet labels;
+    if(!root)
+        return labels;
+
+    auto scenes = std::dynamic_pointer_cast<PSB::PSBList>((*root)["scenes"]);
+    if(!scenes)
+        return labels;
+
+    for(const auto &sceneValue : *scenes) {
+        auto scene = AsDictionary(sceneValue);
+        if(!scene)
+            continue;
+
+        if(auto label = AsString((*scene)["label"]))
+            AddScenarioLabel(labels, label->value);
+        CollectJumpLabels(labels, (*scene)["jumplabels"]);
+    }
+
+    return labels;
+}
+
+const ScenarioLabelSet *GetCachedScenarioLabels(const ttstr &storage) {
+    static std::unordered_map<std::string, ScenarioLabelSet> cache;
+
+    ttstr path = storage;
+    if(path.IsEmpty())
+        return nullptr;
+    if(TVPExtractStorageExt(path).AsLowerCase() != TJS_W(".scn"))
+        path += TJS_W(".scn");
+
+    const std::string key = path.AsStdString();
+    auto found = cache.find(key);
+    if(found != cache.end())
+        return &found->second;
+
+    PSB::PSBFile psb;
+    if(!psb.loadPSBFile(path)) {
+        if(psbDebugEnabled()) {
+            LOGGER->info("PSB scenario label load failed: {}",
+                         path.AsStdString());
+        }
+        return nullptr;
+    }
+
+    auto inserted = cache.emplace(key, CollectScenarioLabels(psb.getObjects()));
+    if(psbDebugEnabled()) {
+        LOGGER->info("PSB scenario labels: path={} count={}", key,
+                     inserted.first->second.size());
+    }
+    return &inserted.first->second;
+}
+
+bool HasCompiledScenarioLabel(const ttstr &storage, const ttstr &label) {
+    const auto *labels = GetCachedScenarioLabels(storage);
+    if(!labels)
+        return false;
+
+    std::string wanted = StripLeadingStar(label.AsStdString());
+    const bool found = labels->find(wanted) != labels->end();
+    if(psbDebugEnabled()) {
+        LOGGER->info("PSB scenario label query: storage={} label={} found={}",
+                     storage.AsStdString(), wanted, found);
+    }
+    return found;
+}
+} // namespace
+
 namespace PSB {
 void initPSBMedia() {
     if(psbMedia != nullptr)
@@ -73,9 +215,15 @@ void deInitPSBMedia() {
 }
 } // namespace PSB
 
-void initPsbFile() { initPSBMedia(); }
+void initPsbFile() {
+    initPSBMedia();
+    TVPRegisterCompiledScenarioLabelResolver(HasCompiledScenarioLabel);
+}
 
-void deInitPsbFile() { deInitPSBMedia(); }
+void deInitPsbFile() {
+    TVPRegisterCompiledScenarioLabelResolver(nullptr);
+    deInitPSBMedia();
+}
 
 // ---------------------------------------------------------------------------
 // PSB Lazy Proxy: converts PSB tree nodes to TJS on demand, avoiding the
@@ -307,9 +455,20 @@ static tTJSVariant convertPSBLazy(const std::shared_ptr<PSB::IPSBValue> &val) {
 static tjs_error getRoot(tTJSVariant *r, tjs_int n, tTJSVariant **p,
                          iTJSDispatch2 *obj) {
     auto *self = ncbInstanceAdaptor<PSB::PSBFile>::GetNativeInstance(obj);
+    if(self->hasCompatRoot()) {
+        *r = self->getCompatRoot();
+        return TJS_S_OK;
+    }
     const auto &root = self->getRootValue();
     if(root) {
-        *r = convertPSBLazy(root);
+        // Gallery scripts inspect and copy small PIMG roots as real
+        // Array/Dictionary objects. The lazy proxy is kept for large scenario
+        // PSBs where eager conversion is expensive.
+        if(self->getType() == PSB::PSBType::Pimg) {
+            *r = root->toTJSVal();
+        } else {
+            *r = convertPSBLazy(root);
+        }
     } else {
         r->Clear();
     }
@@ -320,32 +479,26 @@ static void registerPsbResources(PSBFile *self, ttstr path) {
     if(!psbMedia)
         return;
     psbMedia->NormalizeDomainName(path);
-    auto objs = self->getObjects();
-    if(!objs)
-        return;
-    // Replace stale entries from previous loads of the same PSB source.
-    psbMedia->removeByPrefix((path + TJS_W("/")).AsStdString());
-
-    for(const auto &[k, v] : *objs) {
-        const auto &res = std::dynamic_pointer_cast<PSBResource>(v);
-        if(res == nullptr)
-            continue;
-        ttstr pathN{ k };
-        psbMedia->NormalizePathName(pathN);
-        psbMedia->add((path + TJS_W("/") + pathN).AsStdString(), res);
-    }
+    // PSB archives are immutable for the lifetime of an engine session.
+    // Re-register in place so PSBMedia::add can retain converted subimages
+    // when scripts repeatedly construct/load the same archive.
+    registerRootResources(path, *self);
 }
 
 static tjs_error load(tTJSVariant *r, tjs_int count, tTJSVariant **p,
                       iTJSDispatch2 *obj) {
     bool loadSuccess = true;
     auto *self = ncbInstanceAdaptor<PSB::PSBFile>::GetNativeInstance(obj);
-    if(count != 1) {
+    if(psbDebugEnabled()) {
+        LOGGER->info("PSBFile.load enter count={} first={}", count,
+                     count > 0 ? describeVariant(p[0]) : std::string("<none>"));
+    }
+    if(count < 1) {
         return TJS_E_BADPARAMCOUNT;
     }
 
-    if((*p)->Type() == tvtString) {
-        ttstr path{ **p };
+    if(p[0]->Type() == tvtString) {
+        ttstr path{ *p[0] };
         try {
             if(!self->loadPSBFile(path)) {
                 LOGGER->info("cannot load psb file : {}", path.AsStdString());
@@ -360,10 +513,25 @@ static tjs_error load(tTJSVariant *r, tjs_int count, tTJSVariant **p,
             LOGGER->warn("PSBFile load unknown error: {}", path.AsStdString());
             loadSuccess = false;
         }
-    } else if((*p)->Type() == tvtOctet) {
-        LOGGER->critical("PSBFile::load stream no implement!");
-        loadSuccess = false;
+    } else if(p[0]->Type() == tvtOctet) {
+        auto *octet = p[0]->AsOctetNoAddRef();
+        try {
+            if(!octet || !self->loadPSBData(
+                              octet->GetData(), octet->GetLength(),
+                              ttstr(TJS_W("<octet>")))) {
+                LOGGER->info("cannot load psb data from octet");
+                loadSuccess = false;
+            }
+        } catch(const std::exception &e) {
+            LOGGER->warn("PSBFile load octet error: {}", e.what());
+            loadSuccess = false;
+        } catch(...) {
+            LOGGER->warn("PSBFile load octet unknown error");
+            loadSuccess = false;
+        }
     } else {
+        LOGGER->warn("PSBFile.load invalid first argument type={} count={}",
+                     static_cast<int>(p[0]->Type()), count);
         return TJS_E_INVALIDPARAM;
     }
 
@@ -412,9 +580,14 @@ NCB_SET_CONVERTOR(const PSBFile *, PSBFileConvertor<const PSBFile>);
 static tjs_error PSBFileFactory(PSBFile **result, tjs_int count,
                                 tTJSVariant **params, iTJSDispatch2 *_) {
     PSBFile *psbFile = nullptr;
+    if(psbDebugEnabled()) {
+        LOGGER->info("PSBFile factory enter count={} first={}", count,
+                     count > 0 ? describeVariant(params[0])
+                               : std::string("<none>"));
+    }
     if(count == 0) {
         psbFile = new PSBFile();
-    } else if(count == 1 && (*params)->Type() == tvtString) {
+    } else if(count >= 1 && params[0]->Type() == tvtString) {
         ttstr path{ *params[0] };
         psbFile = new PSBFile();
         try {
@@ -428,7 +601,25 @@ static tjs_error PSBFileFactory(PSBFile **result, tjs_int count,
         } catch(...) {
             LOGGER->warn("PSBFile load unknown error: {}", path.AsStdString());
         }
+    } else if(count >= 1 && params[0]->Type() == tvtOctet) {
+        auto *octet = params[0]->AsOctetNoAddRef();
+        psbFile = new PSBFile();
+        try {
+            if(!octet || !psbFile->loadPSBData(
+                              octet->GetData(), octet->GetLength(),
+                              ttstr(TJS_W("<octet>")))) {
+                LOGGER->warn("Failed to load PSB data from octet");
+            }
+        } catch(const std::exception &e) {
+            LOGGER->warn("PSBFile load octet error: {}", e.what());
+        } catch(...) {
+            LOGGER->warn("PSBFile load octet unknown error");
+        }
     } else {
+        if(count > 0) {
+            LOGGER->warn("PSBFile factory invalid first argument type={} count={}",
+                         static_cast<int>(params[0]->Type()), count);
+        }
         return TJS_E_INVALIDPARAM;
     }
     *result = psbFile;

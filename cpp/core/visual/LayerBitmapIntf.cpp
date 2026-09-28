@@ -824,16 +824,20 @@ bool tTVPBaseBitmap::CopyRect(tjs_int x, tjs_int y, const iTVPBaseBitmap *ref,
     bmpw = ref->GetWidth();
     bmph = ref->GetHeight();
 
-    if(refrect.left < 0)
-        x -= refrect.left, refrect.left = 0;
+    if(refrect.left < 0) {
+        x -= refrect.left;
+        refrect.left = 0;
+    }
     if(refrect.right > bmpw)
         refrect.right = bmpw;
 
     if(refrect.left >= refrect.right)
         return false;
 
-    if(refrect.top < 0)
-        y -= refrect.top, refrect.top = 0;
+    if(refrect.top < 0) {
+        y -= refrect.top;
+        refrect.top = 0;
+    }
     if(refrect.bottom > bmph)
         refrect.bottom = bmph;
 
@@ -985,16 +989,20 @@ bool iTVPBaseBitmap::CopyRect(tjs_int x, tjs_int y, const iTVPBaseBitmap *ref,
     bmpw = ref->GetWidth();
     bmph = ref->GetHeight();
 
-    if(refrect.left < 0)
-        x -= refrect.left, refrect.left = 0;
+    if(refrect.left < 0) {
+        x -= refrect.left;
+        refrect.left = 0;
+    }
     if(refrect.right > bmpw)
         refrect.right = bmpw;
 
     if(refrect.left >= refrect.right)
         return false;
 
-    if(refrect.top < 0)
-        y -= refrect.top, refrect.top = 0;
+    if(refrect.top < 0) {
+        y -= refrect.top;
+        refrect.top = 0;
+    }
     if(refrect.bottom > bmph)
         refrect.bottom = bmph;
 
@@ -1876,7 +1884,14 @@ bool iTVPBaseBitmap::Blt(tjs_int x, tjs_int y, const iTVPBaseBitmap *ref,
 
         case ltOpaque: // formerly ltCoverRect
                        // copy
-            met = opa == 255 ? bmCopy : bmCopyOnAlpha;
+            // When destination alpha is not held, the draw target is an
+            // alpha-bearing surface (for example DrawDeviceD2D's view).
+            // ltOpaque must ignore the source mask and produce opaque output;
+            // a raw bmCopy would incorrectly copy the often-unused zero mask
+            // from an opaque KAG backing layer and make the whole composed
+            // frame transparent.  This mirrors BltImage's
+            // ltOpaque-on-ltAlpha contract.
+            met = opa == 255 && hda ? bmCopy : bmCopyOnAlpha;
             break;
 
         case ltAlpha: // formerly ltTransparent

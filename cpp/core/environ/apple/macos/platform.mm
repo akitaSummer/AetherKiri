@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
+#include <spdlog/spdlog.h>
 
 #import <CoreServices/CoreServices.h>
 #import <Foundation/Foundation.h>
@@ -68,7 +69,10 @@ static bool _TVPCreateFolders(const ttstr &folder) {
     if(!TVPCreateFolders(parent))
         return false;
 
-    return !std::filesystem::create_directory(folder.AsStdString().c_str());
+    std::error_code error;
+    if(std::filesystem::create_directory(folder.AsStdString(), error))
+        return true;
+    return !error && TVPCheckExistentLocalFolder(folder);
 }
 
 bool TVPCreateFolders(const ttstr &folder) {
@@ -360,6 +364,15 @@ tjs_int TVPGetSystemFreeMemory() {
 
 int TVPShowSimpleMessageBox(const ttstr &text, const ttstr &caption,
                             const std::vector<ttstr> &vecButtons) {
+    std::string utf8Text = text.AsStdString();
+    std::string utf8Caption = caption.AsStdString();
+    spdlog::error("TVPShowSimpleMessageBox: {} - {}", utf8Caption, utf8Text);
+
+    if(TVPShouldAutoAcknowledgeMessageBox(caption, vecButtons.size())) {
+        spdlog::warn("TVPShowSimpleMessageBox: auto-acknowledged native dialog");
+        return 0;
+    }
+
     // 确保在主线程执行UI操作
     if (![NSThread isMainThread]) {
         __block int result = -1;
@@ -369,9 +382,6 @@ int TVPShowSimpleMessageBox(const ttstr &text, const ttstr &caption,
         return result;
     }
 
-    // 转换文本
-    std::string utf8Text = text.AsStdString();
-    std::string utf8Caption = caption.AsStdString();
     NSString *nsText = [NSString stringWithUTF8String:utf8Text.c_str()];
     NSString *nsCaption = [NSString stringWithUTF8String:utf8Caption.c_str()];
 

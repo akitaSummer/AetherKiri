@@ -15,6 +15,256 @@
 #include "tjsDictionary.h"
 #include "DebugIntf.h"
 #include "TextStream.h"
+#include "TextTransform.h"
+#include "StorageIntf.h"
+#include "ncbind.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
+
+namespace {
+bool TVPSaveTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_SAVE_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+bool TVPKagTagTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_KAG_TAG_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+const char *TVPKagTagTraceNames() {
+    static const char *value = std::getenv("AETHERKIRI_KAG_TAG_TRACE_NAMES");
+    return value && *value ? value : nullptr;
+}
+
+const char *TVPKagTagTraceStorageFilter() {
+    static const char *value = std::getenv("AETHERKIRI_KAG_TAG_TRACE_STORAGE");
+    return value && *value ? value : nullptr;
+}
+
+int TVPKagTagTraceMax() {
+    static const int max = [] {
+        const char *value = std::getenv("AETHERKIRI_KAG_TAG_TRACE_MAX");
+        if(!value || !*value) return 2000;
+        return std::atoi(value);
+    }();
+    return max;
+}
+
+bool TVPKagTagTraceValuesEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_KAG_TAG_TRACE_VALUES");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+bool TVPKagQueueTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_KAG_QUEUE_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+const char *TVPKagVariantTypeName(tTJSVariantType type) {
+    switch(type) {
+    case tvtVoid: return "void";
+    case tvtObject: return "object";
+    case tvtString: return "string";
+    case tvtOctet: return "octet";
+    case tvtInteger: return "integer";
+    case tvtReal: return "real";
+    default: return "unknown";
+    }
+}
+
+std::string TVPKagTraceVariantValue(const tTJSVariant &value) {
+    if(value.Type() == tvtVoid)
+        return "<void>";
+    if(value.Type() == tvtObject)
+        return "<object>";
+    try {
+        return ttstr(value).AsStdString();
+    } catch(...) {
+        return "<unprintable>";
+    }
+}
+
+std::string TVPKagTraceDispatchProperty(iTJSDispatch2 *object,
+                                        const tjs_char *name) {
+    if(!object)
+        return "<null>";
+    tTJSVariant value;
+    const tjs_error hr = object->PropGet(0, name, nullptr, &value, object);
+    if(TJS_FAILED(hr) || value.Type() == tvtVoid)
+        return "<missing>";
+    return TVPKagTraceVariantValue(value);
+}
+
+void TVPSetKagTagList(iTJSDispatch2 *tag,
+                      const std::vector<ttstr> &attribute_names) {
+    if(!tag)
+        return;
+
+    static ttstr __taglist_name(TJS_W("taglist"));
+    static ttstr __tag_name(TJS_W("tagname"));
+
+    iTJSDispatch2 *array = TJSCreateArrayObject();
+    if(!array)
+        return;
+
+    try {
+        tjs_int index = 0;
+        tTJSVariant tag_name(__tag_name);
+        array->PropSetByNum(TJS_MEMBERENSURE, index++, &tag_name, array);
+
+        for(const auto &name : attribute_names) {
+            tTJSVariant value(name);
+            array->PropSetByNum(TJS_MEMBERENSURE, index++, &value, array);
+        }
+
+        tTJSVariant taglist(array, array);
+        // taglist is parser metadata. Native queue/copy code still needs to
+        // address it directly, but game-side dictionary enumeration must not
+        // mistake it for a tag parameter.
+        tag->PropSetByVS(TJS_MEMBERENSURE | TJS_HIDDENMEMBER,
+                         __taglist_name.AsVariantStringNoAddRef(), &taglist,
+                         tag);
+    } catch(...) {
+        array->Release();
+        throw;
+    }
+
+    array->Release();
+}
+
+bool TVPHasKagTagList(iTJSDispatch2 *tag) {
+    if(!tag)
+        return false;
+
+    tTJSVariant value;
+    if(TJS_FAILED(tag->PropGet(0, TJS_W("taglist"), nullptr, &value, tag)))
+        return false;
+    return value.Type() != tvtVoid;
+}
+
+bool TVPIsKagRuntimeTagMember(const ttstr &name) {
+    return name == TJS_W("tagname") || name == TJS_W("taglist") ||
+           name == TJS_W("runLine") || name == TJS_W("runLineStr") ||
+           name == TJS_W("runCount");
+}
+
+std::vector<ttstr> TVPGetKagTagListAttributeNames(iTJSDispatch2 *tag) {
+    std::vector<ttstr> names;
+    if(!tag)
+        return names;
+
+    tTJSVariant taglist;
+    if(TJS_FAILED(
+           tag->PropGet(0, TJS_W("taglist"), nullptr, &taglist, tag)) ||
+       taglist.Type() != tvtObject)
+        return names;
+
+    iTJSDispatch2 *array = taglist.AsObjectNoAddRef();
+    if(!array)
+        return names;
+
+    tTJSVariant count_value;
+    if(TJS_FAILED(array->PropGet(0, TJS_W("count"), nullptr, &count_value,
+                                 array)))
+        return names;
+
+    const tjs_int count = static_cast<tjs_int>(count_value);
+    for(tjs_int index = 0; index < count; ++index) {
+        tTJSVariant name_value;
+        if(TJS_FAILED(
+               array->PropGetByNum(0, index, &name_value, array)) ||
+           name_value.Type() == tvtVoid)
+            continue;
+
+        ttstr name(name_value);
+        if(TVPIsKagRuntimeTagMember(name) ||
+           std::find(names.begin(), names.end(), name) != names.end())
+            continue;
+        names.push_back(name);
+    }
+
+    return names;
+}
+
+class TVPKagTagListEnumCaller : public tTJSDispatch {
+public:
+    explicit TVPKagTagListEnumCaller(std::vector<ttstr> &names)
+        : Names(names) {}
+
+    tjs_error FuncCall(tjs_uint32, const tjs_char *, tjs_uint32 *,
+                       tTJSVariant *result, tjs_int numparams,
+                       tTJSVariant **param, iTJSDispatch2 *) override {
+        if(numparams > 1) {
+            const tTVInteger memberflag = param[1]->AsInteger();
+            if(!(memberflag & TJS_HIDDENMEMBER)) {
+                ttstr name(*param[0]);
+                if(!TVPIsKagRuntimeTagMember(name))
+                    Names.push_back(name);
+            }
+        }
+        if(result)
+            *result = true;
+        return TJS_S_OK;
+    }
+
+private:
+    std::vector<ttstr> &Names;
+};
+
+std::vector<ttstr> TVPCollectKagTagMemberNames(iTJSDispatch2 *tag) {
+    std::vector<ttstr> names;
+    if(!tag)
+        return names;
+
+    TVPKagTagListEnumCaller *caller = new TVPKagTagListEnumCaller(names);
+    tTJSVariantClosure closure(caller);
+    tag->EnumMembers(TJS_IGNOREPROP | TJS_ENUM_NO_VALUE, &closure, nullptr);
+    caller->Release();
+
+    std::sort(names.begin(), names.end(),
+              [](const ttstr &lhs, const ttstr &rhs) {
+                  return lhs.AsStdString() < rhs.AsStdString();
+              });
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+bool TVPKagTagTraceNameAllowed(const std::string &name) {
+    const char *filter = TVPKagTagTraceNames();
+    if(!filter) return true;
+    std::string list(filter);
+    size_t start = 0;
+    while(start <= list.size()) {
+        size_t end = list.find(',', start);
+        std::string token = list.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if(token == name) return true;
+        if(end == std::string::npos) break;
+        start = end + 1;
+    }
+    return false;
+}
+
+bool TVPKagTagTraceStorageAllowed(const std::string &storage) {
+    const char *filter = TVPKagTagTraceStorageFilter();
+    return !filter || storage.find(filter) != std::string::npos;
+}
+} // namespace
 
 namespace TJS {
     ttstr TJSMapGlobalStringMap(const ttstr &string);
@@ -66,6 +316,46 @@ const tjs_char *TVPUnknownMacroName = TJS_W("Unknown macro \"%1\"");
 #undef TJS_NATIVE_SET_ClassID
 #define TJS_NATIVE_SET_ClassID ClassID_KAGParser = TJS_NCM_CLASSID;
 static tjs_int32 ClassID_KAGParser = -1;
+
+static tTVPCompiledScenarioLabelResolver
+    TVPCompiledScenarioLabelResolver = nullptr;
+
+void TVPRegisterCompiledScenarioLabelResolver(
+    tTVPCompiledScenarioLabelResolver resolver) {
+    TVPCompiledScenarioLabelResolver = resolver;
+}
+
+static ttstr TVPGetCompiledScenarioStorageName(const ttstr &name) {
+    if(name.IsEmpty())
+        return ttstr();
+
+    ttstr path = name;
+    if(TVPExtractStorageExt(path).AsLowerCase() != TJS_W(".scn"))
+        path += TJS_W(".scn");
+    return path;
+}
+
+static bool TVPHasCompiledScenarioStorage(const ttstr &name) {
+    ttstr path = TVPGetCompiledScenarioStorageName(name);
+    return !path.IsEmpty() && TVPIsExistentStorage(path);
+}
+
+static bool TVPCompiledScenarioHasLabel(const ttstr &storage,
+                                        const ttstr &label) {
+    if(storage.IsEmpty() || label.IsEmpty())
+        return false;
+
+    if(!TVPCompiledScenarioLabelResolver)
+        ncbAutoRegister::LoadModule(TJS_W("psbfile.dll"));
+    if(!TVPCompiledScenarioLabelResolver)
+        return false;
+
+    try {
+        return TVPCompiledScenarioLabelResolver(storage, label);
+    } catch(...) {
+        return false;
+    }
+}
 
 //---------------------------------------------------------------------------
 // tTVPScenarioCacheItem : Scenario Cache Item
@@ -120,7 +410,20 @@ void tTVPScenarioCacheItem::LoadScenario(const ttstr &name, bool isstring) {
         } catch(...) {
             if(stream)
                 stream->Destruct();
-            throw;
+            if(TVPHasCompiledScenarioStorage(name)) {
+                // Loading a compiled scenario normally stays script-driven.
+                // Compatibility probes can request a bounded PSB tree dump;
+                // force the registered resolver to open the sidecar so the
+                // parser instrumentation sees the exact authored structure.
+                if(const char *dump = std::getenv("AETHERKIRI_PSB_DUMP_PATH");
+                   dump && *dump) {
+                    TVPCompiledScenarioHasLabel(
+                        name, TJS_W("__aetherkiri_psb_dump_probe__"));
+                }
+                Buffer = TJS_W("*\n");
+            } else {
+                throw;
+            }
         }
         if(stream)
             stream->Destruct();
@@ -396,6 +699,8 @@ void tTJSNI_KAGParser::Invalidate() {
 
 //---------------------------------------------------------------------------
 void tTJSNI_KAGParser::operator=(const tTJSNI_KAGParser &ref) {
+    ClearTextTagQueue();
+
     // copy Macros
     {
         tTJSVariant src(ref.Macros, ref.Macros);
@@ -478,6 +783,11 @@ void tTJSNI_KAGParser::operator=(const tTJSNI_KAGParser &ref) {
 
 //---------------------------------------------------------------------------
 iTJSDispatch2 *tTJSNI_KAGParser::Store() {
+    if(TVPSaveTraceEnabled()) {
+        spdlog::info("SaveTrace KAGParser::Store storage={} label={} page={} line={} pos={}",
+                     StorageName.AsStdString(), CurLabel.AsStdString(),
+                     CurPage.AsStdString(), CurLine, CurPos);
+    }
     // store current status into newly created dictionary object
     // and return the dictionary object.
     iTJSDispatch2 *dic = TJSCreateDictionaryObject();
@@ -1017,6 +1327,7 @@ void tTJSNI_KAGParser::Clear() {
 //---------------------------------------------------------------------------
 void tTJSNI_KAGParser::ClearBuffer() {
     // clear internal buffer
+    ClearTextTagQueue();
     if(Scenario)
         Scenario->Release(), Scenario = nullptr, Lines = nullptr,
                              CurLineStr = nullptr;
@@ -1078,6 +1389,12 @@ void tTJSNI_KAGParser::GoToLabel(const ttstr &name) {
         else
             CurPage.Clear();
         CurLine = newline->Line;
+        CurPos = 0;
+        LineBufferUsing = false;
+    } else if(TVPCompiledScenarioHasLabel(StorageName, name)) {
+        CurLabel = name;
+        CurPage.Clear();
+        CurLine = 0;
         CurPos = 0;
         LineBufferUsing = false;
     } else {
@@ -1246,6 +1563,12 @@ void tTJSNI_KAGParser::PushMacroArgs(iTJSDispatch2 *args) {
     tTJSVariant src(args, args);
     tTJSVariant *psrc = &src;
     DicAssign->FuncCall(0, nullptr, nullptr, nullptr, 1, &psrc, dsp);
+
+    // Dictionary.assign intentionally skips hidden members. taglist is hidden
+    // parser metadata, so preserve it explicitly for a later "[tag *]"
+    // expansion.
+    if(TVPHasKagTagList(args))
+        TVPSetKagTagList(dsp, TVPGetKagTagListAttributeNames(args));
 }
 
 //---------------------------------------------------------------------------
@@ -1516,6 +1839,7 @@ parse_start:
     static ttstr __exp_name(TJSMapGlobalStringMap(TJS_W("exp")));
     static ttstr __escape_name(TJSMapGlobalStringMap(TJS_W("escape")));
     static ttstr __name_name(TJSMapGlobalStringMap(TJS_W("name")));
+    static ttstr __taglist_name(TJSMapGlobalStringMap(TJS_W("taglist")));
 
     while(true) {
         DicClear->FuncCall(0, nullptr, nullptr, nullptr, 0, nullptr, DicObj);
@@ -1528,6 +1852,7 @@ parse_start:
             DicObj->PropSetByVS(TJS_MEMBERENSURE,
                                 __tag_name.AsVariantStringNoAddRef(), &r_val,
                                 DicObj);
+            TVPSetKagTagList(DicObj, {});
             Interrupted = false;
             DicObj->AddRef();
             return DicObj;
@@ -1568,6 +1893,7 @@ parse_start:
                 DicObj->PropSetByVS(TJS_MEMBERENSURE,
                                     __eol_name.AsVariantStringNoAddRef(),
                                     &true_val, DicObj);
+                TVPSetKagTagList(DicObj, { __eol_name });
                 if(RecordingMacro)
                     RecordingMacroStr += TJS_W("[r eol=true]");
                 CurLine++;
@@ -1591,6 +1917,58 @@ parse_start:
                CurLineStr[CurPos] == TJS_W('[') &&
                    CurLineStr[CurPos + 1] == TJS_W('[')) {
                 // normal character
+                // KAG exposes ordinary scenario text to MessageLayer one
+                // character at a time.  Translate the complete plain-text
+                // run before that split so language detection and the model
+                // both receive useful context while KAG keeps its original
+                // typewriter timing and per-character layout behavior.
+                if(!RecordingMacro && ExcludeLevel == -1 &&
+                   CurLineStr[CurPos] != TJS_W('[')) {
+                    tjs_int run_end = CurPos;
+                    while(CurLineStr[run_end] != 0 &&
+                          CurLineStr[run_end] != TJS_W('\n') &&
+                          CurLineStr[run_end] != TJS_W('['))
+                        ++run_end;
+
+                    if(run_end > CurPos) {
+                        const ttstr original(CurLineStr + CurPos,
+                                             run_end - CurPos);
+                        const std::string original_utf8 =
+                            original.AsStdString();
+                        // Queue the current run first, then raw future runs.
+                        // The synchronous lookup below promotes the current
+                        // key while the model can continue through lookahead
+                        // during the typewriter/read interval.
+                        TVPPrefetchText("kirikiri", original_utf8);
+                        PrefetchTextLookahead(run_end);
+                        const std::string translated_utf8 =
+                            TVPTransformText("kirikiri", original_utf8);
+                        if(translated_utf8 != original_utf8) {
+                            const ttstr translated(translated_utf8);
+                            const tjs_int prefix_length = CurPos;
+                            const tjs_int suffix_length =
+                                TJS_strlen(CurLineStr + run_end);
+                            ttstr new_buffer;
+                            tjs_char *dest = new_buffer.AllocBuffer(
+                                prefix_length + translated.GetLen() +
+                                suffix_length + 1);
+                            TJS_strncpy_s(dest,
+                                          prefix_length +
+                                              translated.GetLen() +
+                                              suffix_length + 1,
+                                          CurLineStr, prefix_length);
+                            dest += prefix_length;
+                            TJS_strcpy(dest, translated.c_str());
+                            dest += translated.GetLen();
+                            TJS_strcpy(dest, CurLineStr + run_end);
+                            new_buffer.FixLen();
+                            LineBuffer = new_buffer;
+                            CurLineStr = LineBuffer.c_str();
+                            LineBufferUsing = true;
+                        }
+                    }
+                }
+
                 tjs_char ch = CurLineStr[CurPos];
                 TagLine = CurLine;
 
@@ -1624,6 +2002,7 @@ parse_start:
                     DicObj->PropSetByVS(TJS_MEMBERENSURE,
                                         text_name.AsVariantStringNoAddRef(),
                                         pCachedVal, DicObj);
+                    TVPSetKagTagList(DicObj, { text_name });
 
                     if(RecordingMacro) {
                         if(ch == TJS_W('['))
@@ -1637,6 +2016,7 @@ parse_start:
                     DicObj->PropSetByVS(TJS_MEMBERENSURE,
                                         __tag_name.AsVariantStringNoAddRef(),
                                         &r_val, DicObj);
+                    TVPSetKagTagList(DicObj, {});
                     if(RecordingMacro)
                         RecordingMacroStr += TJS_W("[r]");
                 }
@@ -1758,6 +2138,49 @@ parse_start:
             tTJSVariant Value;
         };
         std::vector<tAttrEntry> parsed_attributes;
+        auto set_taglist_from_parsed_attributes = [&]() {
+            std::vector<ttstr> names;
+            names.reserve(parsed_attributes.size());
+            for(const auto &entry : parsed_attributes)
+                names.push_back(entry.Name);
+            TVPSetKagTagList(DicObj, names);
+        };
+        auto trace_returned_tag = [&]() {
+            if(!TVPKagTagTraceEnabled())
+                return;
+            const std::string tag = tagname.AsStdString();
+            if(!TVPKagTagTraceNameAllowed(tag))
+                return;
+            const std::string storage = StorageName.AsStdString();
+            if(!TVPKagTagTraceStorageAllowed(storage))
+                return;
+
+            std::string attrs;
+            for(const auto &entry : parsed_attributes) {
+                if(!attrs.empty())
+                    attrs += " ";
+                attrs += entry.Name.AsStdString();
+                if(TVPKagTagTraceValuesEnabled()) {
+                    std::string value = ttstr(entry.Value).AsStdString();
+                    for(char &ch : value) {
+                        if(ch == '\n' || ch == '\r' || ch == '\t')
+                            ch = ' ';
+                    }
+                    if(value.size() > 240)
+                        value = value.substr(0, 240) + "...";
+                    attrs += "=" + value;
+                }
+            }
+
+            static std::atomic<int> trace_count{0};
+            const int index = trace_count.fetch_add(1) + 1;
+            const int max = TVPKagTagTraceMax();
+            if(max > 0 && index > max)
+                return;
+
+            spdlog::info("KAGTrace #{} tag={} storage={} line={} pos={} attr_names={}",
+                         index, tag, storage, TagLine + 1, tagstartpos, attrs);
+        };
 
 #define TVP_KAG_STEP_NEXT                                                      \
     if(ldelim == 0) {                                                          \
@@ -1863,6 +2286,11 @@ parse_start:
                     TVP_KAG_STEP_NEXT;
 
                     if(condition && ExcludeLevel == -1) {
+                        set_taglist_from_parsed_attributes();
+                        TVPNotifyKagTagForEnvironmentWorldReset(tagname);
+                        if(tagname == TJS_W("endtrans"))
+                            TVPArmKagNoTransWaitRepair();
+                        trace_returned_tag();
                         DicObj->AddRef();
                         return DicObj;
                     }
@@ -2197,8 +2625,10 @@ parse_start:
                         LineBufferUsing = true;
 
                         // push macro arguments
-                        if(ismacro)
+                        if(ismacro) {
+                            set_taglist_from_parsed_attributes();
                             PushMacroArgs(DicObj);
+                        }
 
                         break;
                     } else if(tagkind == tag_jump) {
@@ -2378,6 +2808,29 @@ parse_start:
                         tTJSVariant *args[2] = { &src, &clear };
                         DicAssign->FuncCall(0, nullptr, nullptr, nullptr, 2,
                                             args, DicObj);
+
+                        std::vector<ttstr> macro_names =
+                            TVPGetKagTagListAttributeNames(dsp);
+                        if(macro_names.empty() && !TVPHasKagTagList(dsp))
+                            macro_names = TVPCollectKagTagMemberNames(dsp);
+
+                        for(const auto &name : macro_names) {
+                            tTJSVariant value;
+                            if(TJS_FAILED(DicObj->PropGet(
+                                   0, name.c_str(), nullptr, &value, DicObj)))
+                                continue;
+
+                            auto existing = std::find_if(
+                                parsed_attributes.begin(),
+                                parsed_attributes.end(),
+                                [&](const tAttrEntry &entry) {
+                                    return entry.Name == name;
+                                });
+                            if(existing != parsed_attributes.end())
+                                existing->Value = value;
+                            else
+                                parsed_attributes.push_back({ name, value });
+                        }
                     }
                     tTJSVariant tag_val(tagname);
                     DicObj->PropSetByVS(TJS_MEMBERENSURE,
@@ -2512,7 +2965,252 @@ parse_start:
 }
 
 //---------------------------------------------------------------------------
-iTJSDispatch2 *tTJSNI_KAGParser::GetNextTag() { return _GetNextTag(); }
+namespace {
+
+bool TVPReadKagCharacterTag(iTJSDispatch2 *tag, ttstr &text) {
+    if(!tag)
+        return false;
+
+    tTJSVariant tag_name;
+    if(TJS_FAILED(tag->PropGet(0, TJS_W("tagname"), nullptr, &tag_name,
+                               tag)) ||
+       tag_name.Type() == tvtVoid || ttstr(tag_name) != TJS_W("ch"))
+        return false;
+
+    tTJSVariant tag_text;
+    if(TJS_FAILED(tag->PropGet(0, TJS_W("text"), nullptr, &tag_text, tag)) ||
+       tag_text.Type() == tvtVoid)
+        return false;
+
+    text = tag_text;
+    return true;
+}
+
+void TVPSetKagCharacterTagText(iTJSDispatch2 *tag, const ttstr &text) {
+    tTJSVariant value(text);
+    tag->PropSet(TJS_MEMBERENSURE, TJS_W("text"), nullptr, &value, tag);
+}
+
+} // namespace
+
+void tTJSNI_KAGParser::ClearTextTagQueue() {
+    while(!TextTagQueue.empty()) {
+        TextTagQueue.front()->Release();
+        TextTagQueue.pop_front();
+    }
+}
+
+void tTJSNI_KAGParser::PrefetchTextLookahead(tjs_int current_run_end) {
+    if(Lines == nullptr || CurLine >= LineCount || RecordingMacro ||
+       ExcludeLevel != -1)
+        return;
+
+    constexpr size_t kMaximumPrefetchRuns = 12;
+    size_t queued = 0;
+    for(tjs_int line_index = CurLine;
+        line_index < LineCount && queued < kMaximumPrefetchRuns;
+        ++line_index) {
+        const tjs_char *line = line_index == CurLine
+            ? CurLineStr
+            : Lines[line_index].Start;
+        if(line == nullptr)
+            continue;
+        tjs_int position = line_index == CurLine ? current_run_end : 0;
+        // Never speculate through an inline-script or macro definition. Their
+        // bodies are code/template text, and execution may redirect parsing.
+        if(TJS_strstr(line, TJS_W("[iscript]")) != nullptr ||
+           TJS_strstr(line, TJS_W("@iscript")) != nullptr ||
+           TJS_strstr(line, TJS_W("[macro")) != nullptr)
+            break;
+        if(position == 0 && (line[0] == TJS_W(';') ||
+                             line[0] == TJS_W('*') ||
+                             line[0] == TJS_W('@')))
+            continue;
+
+        while(line[position] != 0 && queued < kMaximumPrefetchRuns) {
+            if(line[position] == TJS_W('[')) {
+                const tjs_char *close =
+                    TJS_strchr(const_cast<tjs_char *>(line + position + 1),
+                               TJS_W(']'));
+                if(close == nullptr)
+                    break;
+                position = static_cast<tjs_int>(close - line) + 1;
+                continue;
+            }
+            const tjs_int run_start = position;
+            while(line[position] != 0 && line[position] != TJS_W('[') &&
+                  line[position] != TJS_W('\n'))
+                ++position;
+            if(position > run_start) {
+                const ttstr candidate(line + run_start,
+                                      position - run_start);
+                TVPPrefetchText("kirikiri", candidate.AsStdString());
+                ++queued;
+            }
+        }
+    }
+}
+
+iTJSDispatch2 *tTJSNI_KAGParser::CloneTag(iTJSDispatch2 *source) {
+    if(!source)
+        return nullptr;
+    tTJSVariant source_value(source, source);
+    tTJSVariant *params[] = { &source_value };
+    return CopyTag(1, params);
+}
+
+iTJSDispatch2 *tTJSNI_KAGParser::GetNextTag() {
+    if(Interrupted)
+        ClearTextTagQueue();
+
+    if(!TextTagQueue.empty()) {
+        iTJSDispatch2 *tag = TextTagQueue.front();
+        TextTagQueue.pop_front();
+        return tag;
+    }
+
+    iTJSDispatch2 *parsed = _GetNextTag();
+    ttstr first_text;
+    if(!TVPReadKagCharacterTag(parsed, first_text))
+        return parsed;
+
+    std::vector<iTJSDispatch2 *> source_tags;
+    source_tags.reserve(64);
+    source_tags.push_back(CloneTag(parsed));
+    parsed->Release();
+
+    ttstr source_text(first_text);
+    iTJSDispatch2 *boundary = nullptr;
+    constexpr size_t kMaxTextRunTags = 2048;
+    while(source_tags.size() < kMaxTextRunTags) {
+        parsed = _GetNextTag();
+        ttstr next_text;
+        if(!TVPReadKagCharacterTag(parsed, next_text)) {
+            if(parsed) {
+                boundary = CloneTag(parsed);
+                parsed->Release();
+            }
+            break;
+        }
+
+        source_tags.push_back(CloneTag(parsed));
+        source_text += next_text;
+        parsed->Release();
+    }
+
+    const std::string source_utf8 = source_text.AsStdString();
+    const std::string translated_utf8 =
+        TVPTransformText("kirikiri", source_utf8);
+    const ttstr translated(translated_utf8);
+
+    if(translated.IsEmpty() || translated_utf8 == source_utf8) {
+        for(auto *tag : source_tags)
+            TextTagQueue.push_back(tag);
+    } else {
+        for(tjs_int i = 0; i < translated.GetLen(); ++i) {
+            const size_t template_index = std::min<size_t>(
+                static_cast<size_t>(i), source_tags.size() - 1);
+            iTJSDispatch2 *tag = CloneTag(source_tags[template_index]);
+            const ttstr character(translated.c_str() + i, 1);
+            TVPSetKagCharacterTagText(tag, character);
+            TextTagQueue.push_back(tag);
+        }
+        for(auto *tag : source_tags)
+            tag->Release();
+    }
+
+    if(boundary)
+        TextTagQueue.push_back(boundary);
+
+    iTJSDispatch2 *tag = TextTagQueue.front();
+    TextTagQueue.pop_front();
+    return tag;
+}
+
+//---------------------------------------------------------------------------
+iTJSDispatch2 *tTJSNI_KAGParser::CopyTag(tjs_int numparams,
+                                         tTJSVariant **param) {
+    iTJSDispatch2 *dest = TJSCreateDictionaryObject();
+    if(!dest)
+        return nullptr;
+
+    try {
+        tjs_int source_index = -1;
+        bool has_explicit_tag_name = false;
+        const bool trace = TVPKagQueueTraceEnabled();
+
+        if(numparams >= 2) {
+            has_explicit_tag_name = param[0] && param[0]->Type() != tvtVoid;
+            if(param[1] && param[1]->Type() == tvtObject)
+                source_index = 1;
+        } else if(numparams >= 1 && param[0]) {
+            if(param[0]->Type() == tvtObject)
+                source_index = 0;
+            else if(param[0]->Type() != tvtVoid)
+                has_explicit_tag_name = true;
+        }
+
+        if(trace) {
+            std::string p0 = "<none>";
+            std::string p1 = "<none>";
+            const char *p0_type = "none";
+            const char *p1_type = "none";
+            if(numparams >= 1 && param[0]) {
+                p0_type = TVPKagVariantTypeName(param[0]->Type());
+                p0 = TVPKagTraceVariantValue(*param[0]);
+            }
+            if(numparams >= 2 && param[1]) {
+                p1_type = TVPKagVariantTypeName(param[1]->Type());
+                p1 = TVPKagTraceVariantValue(*param[1]);
+            }
+            spdlog::info("KAGQueue copyTag enter numparams={} source={} "
+                         "explicitName={} p0Type={} p0={} p1Type={} p1={}",
+                         numparams, source_index, has_explicit_tag_name,
+                         p0_type, p0, p1_type, p1);
+        }
+
+        if(source_index >= 0) {
+            tTJSVariant *assign_args[1] = { param[source_index] };
+            tjs_error hr = DicAssign->FuncCall(0, nullptr, nullptr, nullptr, 1,
+                                               assign_args, dest);
+            if(TJS_FAILED(hr))
+                TJSThrowFrom_tjs_error(hr);
+        }
+
+        if(has_explicit_tag_name) {
+            static ttstr __tag_name(TJSMapGlobalStringMap(TJS_W("tagname")));
+            dest->PropSetByVS(TJS_MEMBERENSURE,
+                              __tag_name.AsVariantStringNoAddRef(), param[0],
+                              dest);
+        }
+
+        if(!TVPHasKagTagList(dest)) {
+            const std::vector<ttstr> names = TVPCollectKagTagMemberNames(dest);
+            TVPSetKagTagList(dest, names);
+        }
+
+        if(trace) {
+            spdlog::info("KAGQueue copyTag result tagname={} name={} method={} "
+                         "sync={} fade={} time={} env={} storage={} target={} "
+                         "taglist={}",
+                         TVPKagTraceDispatchProperty(dest, TJS_W("tagname")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("name")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("method")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("sync")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("fade")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("time")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("env")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("storage")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("target")),
+                         TVPKagTraceDispatchProperty(dest, TJS_W("taglist")));
+        }
+    } catch(...) {
+        dest->Release();
+        throw;
+    }
+
+    return dest;
+}
 
 //---------------------------------------------------------------------------
 iTJSDispatch2 *tTJSNI_KAGParser::GetMacroTopNoAddRef() const {
@@ -2596,6 +3294,24 @@ iTJSDispatch2 *TVPCreateNativeClass_KAGParser() {
         return TJS_S_OK;
     }
     TJS_END_NATIVE_METHOD_DECL(/*func. name*/ getNextTag)
+    //----------------------------------------------------------------------
+    TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ copyTag) {
+        TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this,
+                                /*var. type*/ tTJSNI_KAGParser);
+
+        iTJSDispatch2 *dsp = _this->CopyTag(numparams, param);
+        if(result) {
+            if(dsp)
+                *result = tTJSVariant(dsp, dsp);
+            else
+                result->Clear();
+        }
+        if(dsp)
+            dsp->Release();
+
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_METHOD_DECL(/*func. name*/ copyTag)
     //----------------------------------------------------------------------
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ assign) {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this,

@@ -11,6 +11,7 @@
 
 #include "tjsCommHead.h"
 
+#include <atomic>
 #include <map>
 #include <cassert>
 #include <fmt/printf.h>
@@ -35,6 +36,26 @@ extern "C" void TJS_CollectOrphanedICCs(bool force = false);
 #include "tjsRegExp.h"
 
 namespace TJS {
+    namespace {
+        std::atomic<tTJSStructuredDataPackLoader> &
+        TJSStructuredDataPackLoaderSlot() {
+            static std::atomic<tTJSStructuredDataPackLoader> loader{ nullptr };
+            return loader;
+        }
+    }
+
+    void TJSSetStructuredDataPackLoader(tTJSStructuredDataPackLoader loader) {
+        TJSStructuredDataPackLoaderSlot().store(loader,
+                                                std::memory_order_release);
+    }
+
+    bool TJSLoadStructuredDataPack(tTJSBinaryStream *stream,
+                                   tTJSVariant *result) {
+        const auto loader =
+            TJSStructuredDataPackLoaderSlot().load(std::memory_order_acquire);
+        return loader && loader(stream, result);
+    }
+
 #ifndef TJS_NO_REGEXP
 
     extern iTJSDispatch2 *TJSCreateRegExpClass();
@@ -64,11 +85,7 @@ namespace TJS {
     // "this" context since TJS2 version 2.4.1
     bool TJSWarnOnNonGlobalEvalOperator = false;
     // Output warning against non-local post-! operator.
-#ifdef _DEBUG
-    bool TJSEnableDebugMode = true;
-#else
     bool TJSEnableDebugMode = false;
-#endif
     // Enable TJS2 Debugging support. Enabling this may make the
     // program somewhat slower and using more memory.
     // Do not use this mode unless you want to debug the program.

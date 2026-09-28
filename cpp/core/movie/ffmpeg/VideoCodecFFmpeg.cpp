@@ -2,6 +2,8 @@
 
 #include "ThreadIntf.h"
 
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #ifndef TARGET_POSIX
 #define RINT(x) ((x) >= 0 ? ((int)((x) + 0.5)) : ((int)((x) - 0.5)))
 #else
@@ -116,7 +118,7 @@ enum AVPixelFormat CDVDVideoCodecFFmpeg::GetFormat(struct AVCodecContext *avctx,
     // then a 2nd call with a valid one
     if(ctx->m_decoderState != STATE_HW_SINGLE ||
        (avctx->codec_id == AV_CODEC_ID_VC1 &&
-        avctx->profile == FF_PROFILE_UNKNOWN)) {
+        avctx->profile == AV_PROFILE_UNKNOWN)) {
         AVPixelFormat defaultFmt = avcodec_default_get_format(avctx, fmt);
         pixFmtName = av_get_pix_fmt_name(defaultFmt);
         ctx->m_processInfo.SetVideoPixelFormat(pixFmtName ? pixFmtName : "");
@@ -176,7 +178,7 @@ enum AVPixelFormat CDVDVideoCodecFFmpeg::GetFormat(struct AVCodecContext *avctx,
 #endif
 #ifdef HAVE_LIBVA
         // mpeg4 vaapi decoding is disabled
-        if(*cur == AV_PIX_FMT_VAAPI_VLD &&
+        if(*cur == AV_PIX_FMT_VAAPI &&
            CSettings::GetInstance().GetBool(
                CSettings::SETTING_VIDEOPLAYER_USEVAAPI)) {
             VAAPI::CDecoder *dec = new VAAPI::CDecoder(ctx->m_processInfo);
@@ -268,7 +270,7 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints,
     m_hints = hints;
     m_options = options;
 
-    AVCodec *pCodec;
+    const AVCodec *pCodec;
 
     m_iOrientation = hints.orientation;
 
@@ -301,11 +303,11 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints,
         return false;
 
     m_pCodecContext->opaque = (void *)this;
-    m_pCodecContext->debug_mv = 0;
     m_pCodecContext->debug = 0;
     m_pCodecContext->workaround_bugs = FF_BUG_AUTODETECT;
     m_pCodecContext->get_format = GetFormat;
     m_pCodecContext->codec_tag = hints.codec_tag;
+    m_pCodecContext->pkt_timebase = AV_TIME_BASE_Q;
 
     // setup threading model
     if(!hints.software) {
@@ -339,22 +341,12 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints,
             int num_threads = TVPGetProcessorNum() * 3 / 2;
             num_threads = std::max(1, std::min(num_threads, 16));
             m_pCodecContext->thread_count = num_threads;
-            m_pCodecContext->thread_safe_callbacks = 1;
             m_decoderState = STATE_SW_MULTI;
             //      CLog::Log(LOGDEBUG, "CDVDVideoCodecFFmpeg - open
             //      frame threaded with %d threads", num_threads);
         }
     } else
         m_decoderState = STATE_SW_SINGLE;
-
-#if defined(TARGET_DARWIN_IOS)
-    // ffmpeg with enabled neon will crash and burn if this is enabled
-    m_pCodecContext->flags &= CODEC_FLAG_EMU_EDGE;
-#else
-    if(pCodec->id != AV_CODEC_ID_H264 && pCodec->capabilities & CODEC_CAP_DR1 &&
-       pCodec->id != AV_CODEC_ID_VP8)
-        m_pCodecContext->flags |= CODEC_FLAG_EMU_EDGE;
-#endif
 
     // if we don't do this, then some codecs seem to fail.
     m_pCodecContext->coded_height = hints.height;
@@ -364,7 +356,7 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints,
     if(hints.extradata && hints.extrasize > 0) {
         m_pCodecContext->extradata_size = hints.extrasize;
         m_pCodecContext->extradata = (uint8_t *)av_mallocz(
-            hints.extrasize + FF_INPUT_BUFFER_PADDING_SIZE);
+            hints.extrasize + AV_INPUT_BUFFER_PADDING_SIZE);
         memcpy(m_pCodecContext->extradata, hints.extradata, hints.extrasize);
     }
 
@@ -388,19 +380,14 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints,
                        0);
     }
 
-    // If non-zero, the decoded audio and video frames returned from
-    // avcodec_decode_video2() are reference-counted and are valid
-    // indefinitely. Without this frames will get (deep) copied when
-    // deinterlace is set to automatic, but file is not deinterlaced.
-    m_pCodecContext->refcounted_frames = 1;
-
-    while(avcodec_open2(m_pCodecContext, pCodec, nullptr) < 0) {
-        // trying set lowres to 0
-        if(pCodec->max_lowres < m_pCodecContext->lowres) {
-            m_pCodecContext->lowres = pCodec->max_lowres;
-            if(avcodec_open2(m_pCodecContext, pCodec, nullptr) >= 0)
-                break;
-        }
+    // Negotiate lowres before opening the decoder. avcodec_open2() derives
+    // width/height from coded_width/coded_height before it rejects an
+    // unsupported lowres value. Retrying that partially initialized context
+    // with lowres=0 leaves stale half-size dimensions (notably for WMV3), so
+    // later YUV conversion reads the full-size planes with the wrong layout.
+    m_pCodecContext->lowres =
+        std::min<int>(m_pCodecContext->lowres, pCodec->max_lowres);
+    if(avcodec_open2(m_pCodecContext, pCodec, nullptr) < 0) {
         //    CLog::Log(LOGDEBUG,"CDVDVideoCodecFFmpeg::Open() Unable
         //    to open codec");
         avcodec_free_context(&m_pCodecContext);
@@ -541,21 +528,8 @@ void CDVDVideoCodecFFmpeg::UpdateName() {
     // m_name.c_str());
 }
 
-union pts_union {
-    double pts_d;
-    int64_t pts_i;
-};
-
-static int64_t pts_dtoi(double pts) {
-    pts_union u;
-    u.pts_d = pts;
-    return u.pts_i;
-}
-
 int CDVDVideoCodecFFmpeg::Decode(uint8_t *pData, int iSize, double dts,
                                  double pts) {
-    int iGotPicture = 0, len = 0;
-
     if(!m_pCodecContext)
         return VC_ERROR;
 
@@ -585,27 +559,29 @@ int CDVDVideoCodecFFmpeg::Decode(uint8_t *pData, int iSize, double dts,
         if(m_codecControlFlags & DVD_CODEC_CTRL_DRAIN) {
             result &= VC_PICTURE;
         }
-        if(result)
+        if(result && result != VC_BUFFER)
             return result;
     }
 
-    m_dts = dts;
-    m_pCodecContext->reordered_opaque = pts_dtoi(pts);
+    int sendResult = 0;
+    if(pData) {
+        m_dts = dts;
+        AVPacket packet{};
+        packet.data = pData;
+        packet.size = iSize;
+        packet.dts = (dts == DVD_NOPTS_VALUE)
+            ? AV_NOPTS_VALUE
+            : static_cast<int64_t>(dts / DVD_TIME_BASE * AV_TIME_BASE);
+        packet.pts = (pts == DVD_NOPTS_VALUE)
+            ? AV_NOPTS_VALUE
+            : static_cast<int64_t>(pts / DVD_TIME_BASE * AV_TIME_BASE);
 
-    AVPacket avpkt;
-    av_init_packet(&avpkt);
-    avpkt.data = pData;
-    avpkt.size = iSize;
-    avpkt.dts = (dts == DVD_NOPTS_VALUE) ? AV_NOPTS_VALUE
-                                         : dts / DVD_TIME_BASE * AV_TIME_BASE;
-    avpkt.pts = (pts == DVD_NOPTS_VALUE) ? AV_NOPTS_VALUE
-                                         : pts / DVD_TIME_BASE * AV_TIME_BASE;
-
-    /* We lie, but this flag is only used by pngdec.c.
-     * Setting it correctly would allow CorePNG decoding. */
-    avpkt.flags = AV_PKT_FLAG_KEY;
-    len = avcodec_decode_video2(m_pCodecContext, m_pDecodedFrame, &iGotPicture,
-                                &avpkt);
+        /* We lie, but this flag is only used by still-image decoders. */
+        packet.flags = AV_PKT_FLAG_KEY;
+        sendResult = avcodec_send_packet(m_pCodecContext, &packet);
+    } else if(m_codecControlFlags & DVD_CODEC_CTRL_DRAIN) {
+        sendResult = avcodec_send_packet(m_pCodecContext, nullptr);
+    }
 
     if(m_decoderState == STATE_HW_FAILED && !m_pHardware)
         return VC_REOPEN;
@@ -613,7 +589,8 @@ int CDVDVideoCodecFFmpeg::Decode(uint8_t *pData, int iSize, double dts,
     if(m_iLastKeyframe < m_pCodecContext->has_b_frames + 2)
         m_iLastKeyframe = m_pCodecContext->has_b_frames + 2;
 
-    if(len < 0) {
+    if(sendResult < 0 && sendResult != AVERROR(EAGAIN) &&
+       sendResult != AVERROR_EOF) {
         if(m_pHardware) {
             int result = m_pHardware->Check(m_pCodecContext);
             if(result & VC_NOBUFFER) {
@@ -621,22 +598,24 @@ int CDVDVideoCodecFFmpeg::Decode(uint8_t *pData, int iSize, double dts,
                 return result;
             }
         }
-        //    CLog::Log(LOGERROR, "%s - avcodec_decode_video returned
-        //    failure",
-        //    __FUNCTION__);
         return VC_ERROR;
     }
 
-    if(!iGotPicture) {
+    av_frame_unref(m_pDecodedFrame);
+    const int receiveResult =
+        avcodec_receive_frame(m_pCodecContext, m_pDecodedFrame);
+    if(receiveResult == AVERROR(EAGAIN) || receiveResult == AVERROR_EOF) {
         if(m_pHardware && (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)) {
             int result;
             result = m_pHardware->Decode(m_pCodecContext, nullptr);
             return result;
         } else
             return VC_BUFFER;
+    } else if(receiveResult < 0) {
+        return VC_ERROR;
     }
 
-    int64_t framePTS = av_frame_get_best_effort_timestamp(m_pDecodedFrame);
+    int64_t framePTS = m_pDecodedFrame->best_effort_timestamp;
 
     if(m_pCodecContext->skip_frame > AVDISCARD_DEFAULT) {
         if(m_dropCtrl.m_state == CDropControl::VALID &&
@@ -651,17 +630,17 @@ int CDVDVideoCodecFFmpeg::Decode(uint8_t *pData, int iSize, double dts,
     m_dropCtrl.Process(framePTS,
                        m_pCodecContext->skip_frame > AVDISCARD_DEFAULT);
 
-    if(m_pDecodedFrame->key_frame) {
+    if(m_pDecodedFrame->flags & AV_FRAME_FLAG_KEY) {
         m_started = true;
         m_iLastKeyframe = m_pCodecContext->has_b_frames + 2;
     }
 
     if(!m_started) {
         av_frame_unref(m_pDecodedFrame);
-        return VC_BUFFER;
+        return 0;
     }
 
-    if(m_pDecodedFrame->interlaced_frame)
+    if(m_pDecodedFrame->flags & AV_FRAME_FLAG_INTERLACED)
         m_interlaced = true;
     else
         m_interlaced = false;
@@ -713,7 +692,7 @@ int CDVDVideoCodecFFmpeg::Decode(uint8_t *pData, int iSize, double dts,
     } else {
         av_frame_unref(m_pFrame);
         av_frame_move_ref(m_pFrame, m_pDecodedFrame);
-        result = VC_PICTURE | VC_BUFFER;
+        result = VC_PICTURE;
     }
 
     if(m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
@@ -810,9 +789,11 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(DVDVideoPicture *pDvdVideoPicture) {
     pDvdVideoPicture->iRepeatPicture = 0.5 * m_pFrame->repeat_pict;
     pDvdVideoPicture->iFlags = DVP_FLAG_ALLOCATED;
     pDvdVideoPicture->iFlags |=
-        m_pFrame->interlaced_frame ? DVP_FLAG_INTERLACED : 0;
+        m_pFrame->flags & AV_FRAME_FLAG_INTERLACED ? DVP_FLAG_INTERLACED : 0;
     pDvdVideoPicture->iFlags |=
-        m_pFrame->top_field_first ? DVP_FLAG_TOP_FIELD_FIRST : 0;
+        m_pFrame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST
+        ? DVP_FLAG_TOP_FIELD_FIRST
+        : 0;
 
     if(m_codecControlFlags & DVD_CODEC_CTRL_DROP)
         pDvdVideoPicture->iFlags |= DVP_FLAG_DROPPED;
@@ -827,23 +808,9 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(DVDVideoPicture *pDvdVideoPicture) {
     else
         pDvdVideoPicture->color_range = 0;
 
-    int qscale_type;
-    pDvdVideoPicture->qp_table = av_frame_get_qp_table(
-        m_pFrame, &pDvdVideoPicture->qstride, &qscale_type);
-
-    switch(qscale_type) {
-        case FF_QSCALE_TYPE_MPEG1:
-            pDvdVideoPicture->qscale_type = DVP_QSCALE_MPEG1;
-            break;
-        case FF_QSCALE_TYPE_MPEG2:
-            pDvdVideoPicture->qscale_type = DVP_QSCALE_MPEG2;
-            break;
-        case FF_QSCALE_TYPE_H264:
-            pDvdVideoPicture->qscale_type = DVP_QSCALE_H264;
-            break;
-        default:
-            pDvdVideoPicture->qscale_type = DVP_QSCALE_UNKNOWN;
-    }
+    pDvdVideoPicture->qp_table = nullptr;
+    pDvdVideoPicture->qstride = 0;
+    pDvdVideoPicture->qscale_type = DVP_QSCALE_UNKNOWN;
 
     if(pDvdVideoPicture->iRepeatPicture)
         pDvdVideoPicture->dts = DVD_NOPTS_VALUE;
@@ -852,7 +819,7 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(DVDVideoPicture *pDvdVideoPicture) {
 
     m_dts = DVD_NOPTS_VALUE;
 
-    int64_t bpts = av_frame_get_best_effort_timestamp(m_pFrame);
+    int64_t bpts = m_pFrame->best_effort_timestamp;
     if(bpts != AV_NOPTS_VALUE) {
         pDvdVideoPicture->pts = (double)bpts * DVD_TIME_BASE / AV_TIME_BASE;
         if(pDvdVideoPicture->pts == m_decoderPts) {
@@ -886,18 +853,15 @@ bool CDVDVideoCodecFFmpeg::GetPicture(DVDVideoPicture *pDvdVideoPicture) {
     pix_fmt = (AVPixelFormat)m_pFrame->format;
     pDvdVideoPicture->format = CDVDCodecUtils::EFormatFromPixfmt(pix_fmt);
 
-    while(m_pCodecContext->coded_width > 0 &&
-          m_pCodecContext->coded_height > 0) {
-        if(pDvdVideoPicture->format == RENDER_FMT_YUV420P) {
-            int pitch = m_pFrame->linesize[0];
-            if(pitch < m_pCodecContext->coded_width ||
-               pitch > m_pCodecContext->coded_width + 16)
-                break;
-        }
-        m_pFrame->width = m_pCodecContext->coded_width;
-        m_pFrame->height = m_pCodecContext->coded_height;
-        break;
-    }
+    // AVFrame width/height describe the visible frame. coded_width and
+    // coded_height may include codec alignment padding (for example an H.264
+    // 1920x1080 frame can have coded_height == 1088). Passing that padding to
+    // swscale as visible pixels corrupts the conversion. Only use codec
+    // dimensions as a defensive fallback when the decoder omitted a size.
+    if(m_pFrame->width <= 0)
+        m_pFrame->width = m_pCodecContext->width;
+    if(m_pFrame->height <= 0)
+        m_pFrame->height = m_pCodecContext->height;
 
     if(!GetPictureCommon(pDvdVideoPicture))
         return false;
@@ -935,12 +899,12 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string &filters, bool scale) {
         return -1;
     }
 
-    AVFilter *srcFilter = avfilter_get_by_name("buffer");
-    AVFilter *outFilter = avfilter_get_by_name(
+    const AVFilter *srcFilter = avfilter_get_by_name("buffer");
+    const AVFilter *outFilter = avfilter_get_by_name(
         "buffersink"); // should be last filter in the graph for now
 
     char args[128];
-    sprintf(args, "%d:%d:%d:%d:%d:%d:%d", m_pCodecContext->width,
+    snprintf(args, sizeof(args), "%d:%d:%d:%d:%d:%d:%d", m_pCodecContext->width,
             m_pCodecContext->height, m_pCodecContext->pix_fmt,
             m_pCodecContext->time_base.num ? m_pCodecContext->time_base.num : 1,
             m_pCodecContext->time_base.num ? m_pCodecContext->time_base.den : 1,
@@ -959,18 +923,28 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string &filters, bool scale) {
         return result;
     }
 
-    if((result = avfilter_graph_create_filter(&m_pFilterOut, outFilter, "out",
-                                              nullptr, nullptr,
-                                              m_pFilterGraph)) < 0) {
+    // Modern FFmpeg no longer allows the buffersink pixel format list to be
+    // changed after the filter has been initialized. Allocate the sink,
+    // configure its accepted formats, and only then initialize it.
+    m_pFilterOut =
+        avfilter_graph_alloc_filter(m_pFilterGraph, outFilter, "out");
+    if(m_pFilterOut == nullptr) {
         //   CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::FilterOpen -
         //   avfilter_graph_create_filter: out");
-        return result;
+        return AVERROR(ENOMEM);
     }
-    if((result = av_opt_set_int_list(m_pFilterOut, "pix_fmts", &m_formats[0],
-                                     AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN)) <
-       0) {
+    const unsigned int formatCount =
+        static_cast<unsigned int>(m_formats.size() - 1);
+    if((result = av_opt_set_array(
+            m_pFilterOut, "pixel_formats", AV_OPT_SEARCH_CHILDREN, 0,
+            formatCount, AV_OPT_TYPE_PIXEL_FMT, m_formats.data())) < 0) {
         //   CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::FilterOpen -
         //   failed settings pix formats");
+        return result;
+    }
+    if((result = avfilter_init_str(m_pFilterOut, nullptr)) < 0) {
+        //   CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::FilterOpen -
+        //   avfilter_init_str: out");
         return result;
     }
 

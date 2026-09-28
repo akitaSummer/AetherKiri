@@ -19,8 +19,14 @@ namespace motion {
             if(it->first == key || it->second->path == key) {
                 if(_runtime->activeMotion == it->second) {
                     _runtime->activeMotion.reset();
+                    _runtime->clearMotionBitmapCaches();
                     _runtime->timelines.clear();
                     _runtime->playingTimelineLabels.clear();
+                    _runtime->yuzuPresentationCenteredOriginConfirmed = false;
+                    _runtime->yuzuPresentationTranslateX = 0.0f;
+                    _runtime->yuzuPresentationTranslateY = 0.0f;
+                    _allplaying = false;
+                    disableAutoProgress();
                 }
                 it = _runtime->motionsByKey.erase(it);
             } else {
@@ -41,14 +47,21 @@ namespace motion {
     void Player::unloadAll() {
         _runtime->motionsByKey.clear();
         _runtime->sourcesByKey.clear();
+        _runtime->sourceLookupMisses.clear();
         _runtime->activeMotion.reset();
+        _runtime->clearMotionBitmapCaches();
         _runtime->timelines.clear();
         _runtime->playingTimelineLabels.clear();
+        _runtime->yuzuPresentationCenteredOriginConfirmed = false;
+        _runtime->yuzuPresentationTranslateX = 0.0f;
+        _runtime->yuzuPresentationTranslateY = 0.0f;
         _runtime->layerIdsByName.clear();
         _runtime->layerNamesById.clear();
         _runtime->lastCanvas.Clear();
         _runtime->lastViewParam.Clear();
         _runtime->drawAffineMatrix = { 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
+        _allplaying = false;
+        disableAutoProgress();
         _variableKeys.Clear();
         _variableValues.clear();
         _variableAnimators.clear();
@@ -62,8 +75,12 @@ namespace motion {
     }
 
     bool Player::isExistMotion(ttstr name) {
-        return static_cast<bool>(
-            resolveMotion(*_runtime, name, &_resourceManagerNative));
+        try {
+            return static_cast<bool>(
+                resolveMotion(*_runtime, name, &_resourceManagerNative));
+        } catch(...) {
+            return false;
+        }
     }
 
     tTJSVariant Player::findMotion(ttstr name) {

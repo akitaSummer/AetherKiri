@@ -13,6 +13,7 @@
 
 #include "tjsCommHead.h"
 #include "FreeType.h"
+#include "FontBaseline.h"
 // #include "NativeFreeTypeFace.h"
 // #include "uni_cp932.h"
 // #include "cp932_uni.h"
@@ -265,10 +266,13 @@ tFreeTypeFace::tFreeTypeFace(const ttstr &fontname, tjs_uint32 options) :
 
     // フォントを開く
     // if(options & TVP_FACE_OPTIONS_FILE)
-    {
+    try {
         // ファイルを開く
         Face = new tGenericFreeTypeFace(fontname, options);
         // 例外がここで発生する可能性があるので注意
+    } catch(...) {
+        TVPUninitializeFreeFont();
+        throw;
     }
     // else
     {
@@ -324,6 +328,7 @@ tFreeTypeFace::~tFreeTypeFace() {
         delete GlyphIndexToCharcodeVector;
     if(Face)
         delete Face;
+    TVPUninitializeFreeFont();
 }
 //---------------------------------------------------------------------------
 
@@ -404,6 +409,15 @@ void tFreeTypeFace::SetHeight(int height) {
     if(err) {
         // TODO: Error ハンドリング
     }
+}
+//---------------------------------------------------------------------------
+
+tjs_int tFreeTypeFace::GetLineBaseline() const {
+    if(!FTFace || !FTFace->size)
+        return 0;
+    return krkr::font::ComputeLineBaseline(
+        Height, FTFace->ascender, FTFace->descender,
+        FTFace->size->metrics.y_ppem, FTFace->units_per_EM);
 }
 //---------------------------------------------------------------------------
 
@@ -488,12 +502,17 @@ tTVPCharacterData *tFreeTypeFace::GetGlyphFromCharcode(tjs_char code) {
         // tGlyphBitmap を作成して返す
         // int baseline = (int)(FTFace->height + FTFace->descender) *
         // FTFace->size->metrics.y_ppem / FTFace->units_per_EM;
-        int baseline = (int)(FTFace->ascender) * FTFace->size->metrics.y_ppem /
-            FTFace->units_per_EM;
+        // FT_Set_Pixel_Sizes sets the em square, while KAG's font height is
+        // the logical line-box height.  Clamp the face baseline once using
+        // the face descent.  A glyph-specific descent would move the baseline
+        // as punctuation and CJK characters are revealed next to each other.
+        const int baseline = GetLineBaseline();
 
         glyph_bmp = new tTVPCharacterData(ft_bmp->buffer, ft_bmp->pitch,
                                           FTFace->glyph->bitmap_left,
-                                          baseline - FTFace->glyph->bitmap_top,
+                                          krkr::font::ComputeGlyphOriginY(
+                                              baseline,
+                                              FTFace->glyph->bitmap_top),
                                           ft_bmp->width, ft_bmp->rows, metrics);
         glyph_bmp->Gray = 256;
 
@@ -537,8 +556,7 @@ bool tFreeTypeFace::GetGlyphRectFromCharcode(tTVPRect &rt, tjs_char code,
     if(!LoadGlyphSlotFromCharcode(code))
         return false;
 
-    int baseline = (int)(FTFace->ascender) * FTFace->size->metrics.y_ppem /
-        FTFace->units_per_EM;
+    const int baseline = GetLineBaseline();
     /*
     FT_Render_Glyph でレンダリングしないと以下の各値は取得できない
     tjs_int t = baseline - FTFace->glyph->bitmap_top;
@@ -546,7 +564,8 @@ bool tFreeTypeFace::GetGlyphRectFromCharcode(tTVPRect &rt, tjs_char code,
     tjs_int w = FTFace->glyph->bitmap.width;
     tjs_int h = FTFace->glyph->bitmap.rows;
     */
-    tjs_int t = baseline - FT_PosToInt(FTFace->glyph->metrics.horiBearingY);
+    tjs_int t = krkr::font::ComputeGlyphOriginY(
+        baseline, FT_PosToInt(FTFace->glyph->metrics.horiBearingY));
     tjs_int l = FT_PosToInt(FTFace->glyph->metrics.horiBearingX);
     tjs_int w = FT_PosToInt(FTFace->glyph->metrics.width);
     tjs_int h = FT_PosToInt(FTFace->glyph->metrics.height);

@@ -1,0 +1,163 @@
+extends SceneTree
+
+const GameInputMapping = preload("res://scripts/game_input_mapping.gd")
+
+func _initialize() -> void:
+    var mapped := GameInputMapping.map_point(
+        Vector2(850, 330),
+        Rect2(0, 0, 1280, 720),
+        Vector2(1280, 720)
+    )
+    if not mapped.is_equal_approx(Vector2(850, 330)):
+        _fail("native-size frame changed pointer coordinates: %s" % mapped)
+        return
+
+    # Regression: the host may have requested 1920x1080, but Artemis can
+    # restore its 1280x720 game size during Open(). The presented texture,
+    # not that stale request, remains the input coordinate space.
+    var requested_surface := Vector2(1920, 1080)
+    var stale_surface_mapping := mapped * requested_surface / Vector2(1280, 720)
+    if stale_surface_mapping.is_equal_approx(mapped):
+        _fail("fixture did not exercise a mismatched requested surface")
+        return
+    if not mapped.is_equal_approx(Vector2(850, 330)):
+        _fail("frame coordinate was rescaled to the stale surface")
+        return
+
+    # RFVP, ONScripter, Minori, and Siglus consume native content coordinates
+    # rather than the presentation surface. Using the shell surface moves
+    # clicks out of the logical frame and makes controls appear unresponsive.
+    var native_frame := Vector2(1024, 640)
+    for runtime_kind in ["minori", "onscripter", "rfvp", "siglus"]:
+        var input_surface := GameInputMapping.input_surface_size(
+            runtime_kind, native_frame, requested_surface
+        )
+        var menu_point := GameInputMapping.map_point_to_surface(
+            Vector2(490, 744), Rect2(0, 0, 1920, 1080),
+            native_frame, input_surface
+        )
+        if not menu_point.is_equal_approx(Vector2(233.48148, 440.88889)):
+            _fail("%s menu point left native frame coordinates: %s" % [runtime_kind, menu_point])
+            return
+        var drag_delta := GameInputMapping.map_delta_to_surface(
+            Vector2(168.75, 84.375), Vector2(1920, 1080),
+            native_frame, input_surface
+        )
+        if not drag_delta.is_equal_approx(Vector2(100, 50)):
+            _fail("%s drag delta left native frame coordinates: %s" % [runtime_kind, drag_delta])
+            return
+    if GameInputMapping.input_surface_size("kirikiri", native_frame, requested_surface) != requested_surface:
+        _fail("KiriKiri lost its requested surface coordinate space")
+        return
+    if GameInputMapping.input_surface_size("kirikiri", native_frame, Vector2.ZERO) != native_frame:
+        _fail("missing requested surface did not fall back to the frame")
+        return
+
+    var letterboxed := GameInputMapping.map_point(
+        Vector2(1000, 540),
+        Rect2(40, 20, 1920, 1080),
+        Vector2(1280, 720)
+    )
+    if not letterboxed.is_equal_approx(Vector2(640, 346.66666)):
+        _fail("window-to-texture mapping is incorrect: %s" % letterboxed)
+        return
+
+    # Minori publishes a fixed 1280x720 logical frame even when the shell
+    # presents it at 1920x1080. Its hit testing consumes content coordinates,
+    # so a visual title-button click must map back to the original rectangle.
+    var minori_title_click := GameInputMapping.map_point_to_surface(
+        Vector2(1650, 72),
+        Rect2(0, 0, 1920, 1080),
+        Vector2(1280, 720),
+        Vector2(1280, 720)
+    )
+    if not minori_title_click.is_equal_approx(Vector2(1100, 48)):
+        _fail("Minori title click was rescaled to the shell surface: %s" % minori_title_click)
+        return
+
+    # Regression: frame enhancement publishes a raw 4:3 frame and scales it
+    # to 1440x1080, while Artemis still accepts input on a 1920x1080 surface.
+    # Artemis presents the 4:3 logical frame aspect-fit inside that surface,
+    # leaving 240 px side bars; surface input must mirror that viewport.
+    var enhanced_top_left := GameInputMapping.map_point_to_surface(
+        Vector2(240, 0),
+        Rect2(240, 0, 1440, 1080),
+        Vector2(800, 600),
+        Vector2(1920, 1080)
+    )
+    if not enhanced_top_left.is_equal_approx(Vector2(240, 0)):
+        _fail("enhanced 4:3 top-left missed surface viewport: %s" % enhanced_top_left)
+        return
+
+    var enhanced_center := GameInputMapping.map_point_to_surface(
+        Vector2(960, 540),
+        Rect2(240, 0, 1440, 1080),
+        Vector2(800, 600),
+        Vector2(1920, 1080)
+    )
+    if not enhanced_center.is_equal_approx(Vector2(960, 540)):
+        _fail("enhanced 4:3 center was rescaled incorrectly: %s" % enhanced_center)
+        return
+
+    var enhanced_bottom_right := GameInputMapping.map_point_to_surface(
+        Vector2(1680, 1080),
+        Rect2(240, 0, 1440, 1080),
+        Vector2(800, 600),
+        Vector2(1920, 1080)
+    )
+    if not enhanced_bottom_right.is_equal_approx(Vector2(1680, 1080)):
+        _fail("enhanced 4:3 bottom-right missed surface viewport: %s" % enhanced_bottom_right)
+        return
+
+    var enhanced_delta := GameInputMapping.map_delta_to_surface(
+        Vector2(72, 54),
+        Vector2(720, 540),
+        Vector2(800, 600),
+        Vector2(1920, 1080)
+    )
+    if not enhanced_delta.is_equal_approx(Vector2(144, 108)):
+        _fail("enhanced 4:3 drag delta was rescaled incorrectly: %s" % enhanced_delta)
+        return
+
+    var enhanced_outside := GameInputMapping.map_point_to_surface(
+        Vector2(200, 540),
+        Rect2(240, 0, 1440, 1080),
+        Vector2(800, 600),
+        Vector2(1920, 1080)
+    )
+    if enhanced_outside.x >= 0.0 or enhanced_outside.y >= 0.0:
+        _fail("enhanced 4:3 side bar accepted pointer input: %s" % enhanced_outside)
+        return
+
+    var tap_jitter := GameInputMapping.stable_tap_point(
+        Vector2(120, 80), Vector2(127, 88), 18.0
+    )
+    if not tap_jitter.is_equal_approx(Vector2(120, 80)):
+        _fail("tap jitter moved the click point: %s" % tap_jitter)
+        return
+
+    var real_drag := GameInputMapping.stable_tap_point(
+        Vector2(120, 80), Vector2(150, 80), 18.0
+    )
+    if not real_drag.is_equal_approx(Vector2(150, 80)):
+        _fail("real drag lost its release point: %s" % real_drag)
+        return
+
+    if not GameInputMapping.touch_drag_release_is_cancelled(
+        "CatSystem2", true
+    ):
+        _fail("CatSystem2 touch drag did not cancel its trailing click")
+        return
+    if GameInputMapping.touch_drag_release_is_cancelled("catsystem2", false):
+        _fail("CatSystem2 tap was misclassified as a cancelled drag")
+        return
+    if GameInputMapping.touch_drag_release_is_cancelled("artemis", true):
+        _fail("Artemis layer drag unexpectedly lost its release")
+        return
+
+    print("game_input_mapping_test: PASS")
+    quit(0)
+
+func _fail(message: String) -> void:
+    push_error("game_input_mapping_test: %s" % message)
+    quit(1)

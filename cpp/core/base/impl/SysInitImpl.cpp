@@ -41,6 +41,9 @@
 #define uint32_t unsigned int
 
 #include <thread>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #undef uint32_t
 
@@ -147,6 +150,20 @@ static tjs_uint64 TVPTotalPhysMemory = 0;
 
 static void TVPInitProgramArgumentsAndDataPath(bool stop_after_datapath_got);
 
+bool TVPIsProjectStorageFile(const ttstr &normalizedProjectPath,
+                             const ttstr &nativeProjectPath) {
+    if(TVPIsExistentStorageNoSearchNoNormalize(normalizedProjectPath))
+        return true;
+
+    // Normalized storage names intentionally fold ASCII case. On a
+    // case-sensitive filesystem (notably an iOS app container), that can make
+    // the initial existence probe miss a valid archive before file media has
+    // recovered the native component casing. The host-provided path still has
+    // the exact on-disk spelling, so use it as a file-only fallback.
+    return !nativeProjectPath.IsEmpty() &&
+        TVPCheckExistentLocalFile(nativeProjectPath);
+}
+
 void TVPBeforeSystemInit() {
     // RegisterDllLoadHook();
     //  register DLL delayed import hook to support _inmm.dll
@@ -158,8 +175,14 @@ void TVPBeforeSystemInit() {
     if(TVPGetCommandLine(TJS_W("-arcdelim"), &v))
         TVPArchiveDelimiter = ttstr(v)[0];
 
-    if(TVPIsExistentStorageNoSearchNoNormalize(TVPProjectDir)) {
+    if(TVPIsProjectStorageFile(TVPProjectDir, TVPNativeProjectDir)) {
         TVPProjectDir += TVPArchiveDelimiter;
+        // A bound XP3 executable is both the highest-priority project
+        // archive and a launcher living beside the original game's data
+        // archives. Keep the archive as the current directory so its
+        // startup.tjs wins, while exposing its native parent for probes such
+        // as Storages.isExistentStorage("data.xp3").
+        TVPAddAutoPath(TVPGetAppPath());
     } else {
         TVPProjectDir += TJS_W("/");
         // On platforms with case-sensitive filesystems like Linux and Android, 
@@ -242,6 +265,10 @@ void TVPAfterSystemInit() {
     TVPDetectCPU();
 
     TVPAllocGraphicCacheOnHeap = false; // always false since beta 20
+    // Keep the compressed XP3 segment cache on the same unified byte budget.
+    // This is intentionally applied after the legacy low-memory heuristics so
+    // a later governor pass cannot leave this cache disabled on desktop.
+    TVPSegmentCacheLimit = 256 * 1024 * 1024;
 
     // determine maximum graphic cache limit
     tTJSVariant opt;
@@ -279,9 +306,12 @@ void TVPAfterSystemInit() {
     } else {
         TVPGraphicCacheSystemLimit = limitmb * 1024 * 1024;
     }
-    // Cap at 256MB to leave headroom for VRAM, TJS heap, and system on mobile
-    if(TVPGraphicCacheSystemLimit >= 256 * 1024 * 1024)
-        TVPGraphicCacheSystemLimit = 256 * 1024 * 1024;
+    // Keep the historical 256MB cap for legacy renderers. Godot Native keeps
+    // decoded images in GPU resources and benefits from a larger cache on
+    // desktop-class machines; the backend-specific limit is selected after
+    // the renderer option is resolved below.
+    if(TVPGraphicCacheSystemLimit > 1024 * 1024 * 1024)
+        TVPGraphicCacheSystemLimit = 1024 * 1024 * 1024;
 
     if(TVPTotalPhysMemory <= 64 * 1024 * 1024)
         TVPSetFontCacheForLowMem();
@@ -305,6 +335,20 @@ void TVPAfterSystemInit() {
         _val = IndividualConfigManager::GetInstance()->GetValue<std::string>(
             "renderer", "opengl");
     }
+    if(TVPGraphicCacheSystemLimit > 256 * 1024 * 1024) {
+        TVPGraphicCacheSystemLimit = 256 * 1024 * 1024;
+    }
+    // Use one predictable desktop budget across renderers.  The
+    // memory-derived value in the x86_64 macOS test environment is about
+    // 96 MiB; that evicts a just-prefetched character sheet before the next
+    // sentence uses it and forces an identical 70--100 ms decode again.  The
+    // cache retains immutable decoded images only and does not alter pixels.
+    if(TVPGraphicCacheSystemLimit < 256 * 1024 * 1024) {
+        TVPGraphicCacheSystemLimit = 256 * 1024 * 1024;
+    }
+    // Apply the unified budget even when a platform default initialized the
+    // live limit before the renderer option was selected.
+    TVPSetGraphicCacheLimit(256 * 1024 * 1024);
     if(_val != "software") {
         TVPGraphicSplitOperationType = gsotNone;
     } else {
@@ -400,6 +444,10 @@ bool TVPHostSuppressProcessExit = false;
 
 //---------------------------------------------------------------------------
 void TVPTerminateAsync(int code) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "krkr2",
+                        "TVPTerminateAsync called code=%d", code);
+#endif
     // do "A"synchronous temination of application
     TVPTerminated = true;
     TVPTerminateCode = code;
@@ -417,9 +465,14 @@ void TVPTerminateAsync(int code) {
 
 //---------------------------------------------------------------------------
 void TVPTerminateSync(int code) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "krkr2",
+                        "TVPTerminateSync called code=%d suppress=%d",
+                        code, TVPHostSuppressProcessExit ? 1 : 0);
+#endif
     // do synchronous temination of application (never return)
     if(TVPHostSuppressProcessExit) {
-        // In embedded host mode (Flutter), calling TVPSystemUninit() here
+        // In embedded host mode (Application host), calling TVPSystemUninit() here
         // would destroy the TJS engine while still inside a TJS call stack,
         // causing undefined behavior (hang/crash) since exit() is suppressed.
         // Instead, mark as terminated and throw EAbort to safely unwind the
@@ -506,7 +559,20 @@ void TVPEnsureDataPathDirectory() {
 }
 
 //---------------------------------------------------------------------------
-static void PushAllCommandlineArguments() {}
+static void PushAllCommandlineArguments() {
+    // A normal Kirikiri release executable carries player defaults in its
+    // embedded option resource.  AetherKiri hosts external game directories,
+    // so there is no per-title executable resource to supply the usual
+    // "-debugwin=no" value.  Leaving the option absent is observably different
+    // from "no": startup scripts commonly use
+    // `System.getArgument("-debugwin") != "no"` and will otherwise enter their
+    // developer-only stand-view/debug path before the KAG object exists.
+    //
+    // Seed the packaged-player default here.  Explicit engine options are
+    // inserted ahead of this entry below, and TVPSetCommandLine can replace it,
+    // so callers can still opt in deliberately.
+    TVPProgramArguments.push_back(TJS_W("-debugwin=no"));
+}
 
 //---------------------------------------------------------------------------
 static void PushConfigFileOptions(const std::vector<std::string> *options) {
@@ -522,6 +588,50 @@ static void PushConfigFileOptions(const std::vector<std::string> *options) {
 //---------------------------------------------------------------------------
 // Options set via engine_set_option before TVPProgramArguments is initialized
 static std::vector<std::pair<ttstr, ttstr>> TVPEarlySetOptions;
+
+void TVPResetSystemInitStateForHostSession() {
+    // TVPInitProgramArgumentsAndDataPath() was originally process-scoped
+    // because the standalone player only ever opened one title.  Aether keeps
+    // the process alive, so retaining this state makes the next title inherit
+    // the previous title's savedata directory and command-line options.  In
+    // particular, first-run flags can then be read from the wrong game.
+    TVPProgramArguments.clear();
+    TVPEarlySetOptions.clear();
+    TVPProgramArgumentsInit = false;
+    TVPDataPathDirectoryEnsured = false;
+    TVPNativeDataPath = ttstr();
+    TVPDataPath = ttstr();
+    TVPNativeProjectDir = ttstr();
+    TVPProjectDir = ttstr();
+    TVPProjectDirSelected = false;
+    TVPArchiveDelimiter = TJS_W('>');
+
+    // Invalidate any native/script-side command-line cache which survived a
+    // partial shutdown.  Keep the generation monotonic across host sessions.
+    ++TVPCommandLineArgumentGeneration;
+    if(TVPCommandLineArgumentGeneration == 0)
+        TVPCommandLineArgumentGeneration = 1;
+}
+
+static bool TVPFindCommandLineArgument(const tjs_char *name,
+                                       tTJSVariant *value) {
+    const tjs_int namelen = (tjs_int)TJS_strlen(name);
+    for(const auto &argument : TVPProgramArguments) {
+        if(!TJS_strncmp(argument.c_str(), name, namelen)) {
+            if(argument.c_str()[namelen] == TJS_W('=')) {
+                if(value)
+                    *value = argument.c_str() + namelen + 1;
+                return true;
+            }
+            if(argument.c_str()[namelen] == 0) {
+                if(value)
+                    *value = TJS_W("yes");
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 static void TVPInitProgramArgumentsAndDataPath(bool stop_after_datapath_got) {
     if(!TVPProgramArgumentsInit) {
@@ -552,6 +662,8 @@ static void TVPInitProgramArgumentsAndDataPath(bool stop_after_datapath_got) {
             // ((ttstr)val).AsStdString();
             TVPNativeDataPath = ApplicationSpecialPath::GetDataPathDirectory(
                 config_datapath, ExePath());
+            TVPDataPathDirectoryEnsured = false;
+            TVPEnsureDataPathDirectory();
 
             if(stop_after_datapath_got)
                 return;
@@ -618,22 +730,20 @@ static void TVPDumpOptions() {
 bool TVPGetCommandLine(const tjs_char *name, tTJSVariant *value) {
     TVPInitProgramArgumentsAndDataPath(false);
 
-    tjs_int namelen = (tjs_int)TJS_strlen(name);
-    std::vector<ttstr>::const_iterator i;
-    for(i = TVPProgramArguments.begin(); i != TVPProgramArguments.end(); i++) {
-        if(!TJS_strncmp(i->c_str(), name, namelen)) {
-            if(i->c_str()[namelen] == TJS_W('=')) {
-                // value is specified
-                const tjs_char *p = i->c_str() + namelen + 1;
-                if(value)
-                    *value = p;
-                return true;
-            } else if(i->c_str()[namelen] == 0) {
-                // value is not specified
-                if(value)
-                    *value = TJS_W("yes");
-                return true;
-            }
+    return TVPFindCommandLineArgument(name, value);
+}
+
+//---------------------------------------------------------------------------
+bool TVPGetCommandLineNoInit(const tjs_char *name, tTJSVariant *value) {
+    if(TVPProgramArgumentsInit)
+        return TVPFindCommandLineArgument(name, value);
+
+    const ttstr requested(name);
+    for(const auto &option : TVPEarlySetOptions) {
+        if(option.first == requested) {
+            if(value)
+                *value = option.second;
+            return true;
         }
     }
     return false;

@@ -1,6 +1,9 @@
 #include "tjsCommHead.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <assert.h>
@@ -27,10 +30,14 @@
 // #include "MouseCursor.h"
 #include "SystemImpl.h"
 #include "WaveImpl.h"
+#include "WaveMixer.h"
 #include "GraphicsLoadThread.h"
 #include "Platform.h"
 #include "EventIntf.h"
 #include <thread>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include "ConfigManager/LocaleConfigManager.h"
 #include "StorageIntf.h"
 extern "C" {
@@ -44,6 +51,14 @@ std::thread::id TVPMainThreadID;
 static tTJSCriticalSection _NoMemCallBackCS;
 static void *_reservedMem = malloc(1024 * 1024 * 4); // 4M reserved mem
 static bool _project_startup = false;
+
+static bool TVPProcessMessagesProfileEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_PROCESS_MESSAGES_PROFILE");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 static void _do_compact() { TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX); }
 
@@ -60,6 +75,25 @@ static void _no_memory_cb() {
 
 static std::string _title, _msg, _retry, _cancel;
 static tTJSCriticalSection _cs;
+#if defined(__ANDROID__)
+static bool TVPAndroidAppTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_APP_TRACE");
+        return value && value[0] && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void TVPAndroidAppLog(const char *message) {
+    if(!TVPAndroidAppTraceEnabled()) return;
+    __android_log_print(ANDROID_LOG_INFO, "krkr2", "%s", message);
+}
+
+static void TVPAndroidAppLogf(const char *fmt, size_t value) {
+    if(!TVPAndroidAppTraceEnabled()) return;
+    __android_log_print(ANDROID_LOG_INFO, "krkr2", fmt, value);
+}
+#endif
 typedef void *F_alloc_t(void *, size_t);
 static void *__do_alloc_func(F_alloc_t *f, void *p, size_t c) {
     void *ptr = f(p, c);
@@ -105,7 +139,7 @@ void TVPCheckMemory() {
         tjs_int freeMem = TVPGetSystemFreeMemory();
         if(freeMem < 24) {
             char buf[256];
-            sprintf(buf,
+            snprintf(buf, sizeof(buf),
                     "Insufficient memory (%dMB available)\nYou can "
                     "diable this "
                     "notice in global preference.",
@@ -116,6 +150,24 @@ void TVPCheckMemory() {
         }
     }
 #endif
+}
+
+static bool TVPEnvironmentFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "no") != 0;
+}
+
+bool TVPShouldAutoAcknowledgeMessageBox(const ttstr &caption,
+                                        std::size_t buttonCount) {
+    (void)caption;
+    (void)buttonCount;
+    if(TVPEnvironmentFlagEnabled("AETHERKIRI_SUPPRESS_NATIVE_ALERTS"))
+        return true;
+    return false;
 }
 
 int TVPShowSimpleMessageBox(const ttstr &text, const ttstr &caption) {
@@ -301,6 +353,11 @@ tTVPApplication::~tTVPApplication() {
     delete image_load_thread_;
 }
 
+void tTVPApplication::StopImageLoadThread() {
+    delete image_load_thread_;
+    image_load_thread_ = nullptr;
+}
+
 bool tTVPApplication::StartApplication(ttstr path) {
     //	_set_se_translator(se_translator_function);
 
@@ -384,10 +441,28 @@ bool tTVPApplication::StartApplication(ttstr path) {
     } catch(const EAbort &) {
         // nothing to do
     } catch(const Exception &exception) {
+        spdlog::error("StartApplication: Exception: {}", exception.what().AsStdString());
+        spdlog::default_logger()->flush();
         TVPOnError();
         if(!TVPSystemUninitCalled)
             ShowException(exception.what());
     } catch(const TJS::eTJSScriptError &e) {
+        ttstr logMsg;
+        logMsg += e.GetMessage();
+        const tjs_char *pszBlockName = e.GetBlockName();
+        if(pszBlockName && *pszBlockName) {
+            logMsg += TJS_W("\n@line(");
+            tjs_char tmp[34];
+            logMsg += TJS_int_to_str(e.GetSourceLine(), tmp);
+            logMsg += TJS_W(") ");
+            logMsg += pszBlockName;
+        }
+        if(e.GetTrace().GetLen() != 0) {
+            logMsg += TJS_W("\n");
+            logMsg += e.GetTrace();
+        }
+        spdlog::error("StartApplication: TJS script error:\n{}", logMsg.AsStdString());
+        spdlog::default_logger()->flush();
         TVPOnError();
         if(!TVPSystemUninitCalled) {
             ttstr msg;
@@ -409,16 +484,26 @@ bool tTVPApplication::StartApplication(ttstr path) {
             ShowException(msg);
         }
     } catch(const TJS::eTJS &e) {
+        spdlog::error("StartApplication: TJS error: {}", e.GetMessage().AsStdString());
+        spdlog::default_logger()->flush();
         TVPOnError();
         if(!TVPSystemUninitCalled)
             ShowException(e.GetMessage());
     } catch(const std::exception &e) {
+        spdlog::error("StartApplication: std::exception: {}", e.what());
+        spdlog::default_logger()->flush();
         ShowException(e.what());
     } catch(const char *e) {
+        spdlog::error("StartApplication: const char exception: {}", e);
+        spdlog::default_logger()->flush();
         ShowException(e);
     } catch(const tjs_char *e) {
+        spdlog::error("StartApplication: tjs_char exception: {}", ttstr(e).AsStdString());
+        spdlog::default_logger()->flush();
         ShowException(e);
     } catch(...) {
+        spdlog::error("StartApplication: unknown exception");
+        spdlog::default_logger()->flush();
         ShowException((const tjs_char *)TVPUnknownError);
     }
 
@@ -519,8 +604,18 @@ void TVPEngineApi_SetGlobalException(const std::string& msg) { g_EngineApiGlobal
 
 void tTVPApplication::ShowException(const ttstr &e) {
     ttstr msg = e;
-    msg += TJS_W("\n\n--- Recent Engine Logs ---\n");
-    msg += TVPGetLastLog(20);
+
+    tTJSVariant includeLogsOpt;
+    bool includeLogs = false;
+    if(TVPGetCommandLine(TJS_W("error_dialog_logs"), &includeLogsOpt)) {
+        ttstr val = includeLogsOpt.AsStringNoAddRef();
+        includeLogs = (val == TJS_W("1") || val == TJS_W("true"));
+    }
+    if(includeLogs) {
+        msg += TJS_W("\n\n--- Recent Engine Logs ---\n");
+        msg += TVPGetLastLog(20);
+    }
+
     TVPEngineApi_SetGlobalException(msg.AsStdString());
     spdlog::error("FATAL SCRIPT EXCEPTION:\n{}", msg.AsStdString());
 
@@ -531,19 +626,50 @@ void tTVPApplication::ShowException(const ttstr &e) {
     if (result == 1) { // 1 is the 0-indexed position of Copy to Clipboard button
         TVPClipboardSetText(msg);
     }
+    if(TVPHostSuppressProcessExit) {
+        // The host owns the process and can open another title after this
+        // session. Do not run one-shot process shutdown handlers here; mark
+        // this runtime terminated and let engine_destroy perform session
+        // cleanup after the TJS stack has unwound.
+        TVPTerminated = true;
+        TVPTerminateCode = 1;
+        return;
+    }
     TVPSystemUninit();
     TVPExitApplication(0);
 }
 void tTVPApplication::Run() {
     try {
+#if defined(__ANDROID__)
+        TVPAndroidAppLog("Application::Run begin");
+#endif
         if(TVPTerminated) {
+#if defined(__ANDROID__)
+            TVPAndroidAppLog("Application::Run terminated branch");
+#endif
+            if(TVPHostSuppressProcessExit)
+                return;
             TVPSystemUninit();
             TVPExitApplication(TVPTerminateCode);
         }
         //	TVPBreathe();
+#if defined(__ANDROID__)
+        TVPAndroidAppLog("Application::Run before ProcessMessages");
+#endif
         ProcessMessages();
+#if defined(__ANDROID__)
+        TVPAndroidAppLog("Application::Run after ProcessMessages");
+#endif
         if(TVPSystemControl)
+#if defined(__ANDROID__)
+        {
+            TVPAndroidAppLog("Application::Run before SystemWatchTimerTimer");
+#endif
             TVPSystemControl->SystemWatchTimerTimer();
+#if defined(__ANDROID__)
+            TVPAndroidAppLog("Application::Run after SystemWatchTimerTimer");
+        }
+#endif
         //		TVPDeliverWindowUpdateEvents(); // from
         // SystemWatchTimerTimer
     } catch(const EAbort &) {
@@ -591,15 +717,86 @@ void tTVPApplication::Run() {
 }
 
 void tTVPApplication::ProcessMessages() {
-    std::vector<std::tuple<void *, int, tMsg>> lstUserMsg;
+    const bool profileEnabled = TVPProcessMessagesProfileEnabled();
+    const auto profileStarted = profileEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    size_t remaining = 0;
     {
         std::lock_guard<std::mutex> cs(m_msgQueueLock);
-        m_lstUserMsg.swap(lstUserMsg);
+        remaining = m_lstUserMsg.size();
     }
-    for(std::tuple<void *, int, tMsg> &it : lstUserMsg) {
-        std::get<2>(it)();
+    const size_t queued = remaining;
+#if defined(__ANDROID__)
+    TVPAndroidAppLogf("Application::ProcessMessages begin queued=%zu", remaining);
+#endif
+    size_t processed = 0;
+    while(remaining-- > 0) {
+        tMsg msg;
+        int msg_id = 0;
+        void *msg_host = nullptr;
+        {
+            std::lock_guard<std::mutex> cs(m_msgQueueLock);
+            if(m_lstUserMsg.empty())
+                break;
+            msg_host = std::get<0>(m_lstUserMsg.front());
+            msg_id = std::get<1>(m_lstUserMsg.front());
+            msg = std::move(std::get<2>(m_lstUserMsg.front()));
+            m_lstUserMsg.pop_front();
+        }
+        if(msg) {
+            const auto messageStarted = profileEnabled
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+#if defined(__ANDROID__)
+            if(TVPAndroidAppTraceEnabled()) {
+                __android_log_print(ANDROID_LOG_INFO, "krkr2",
+                                    "Application::ProcessMessages before user msg index=%zu id=%d host=%p",
+                                    processed, msg_id, msg_host);
+            }
+#endif
+            msg();
+            if(profileEnabled) {
+                const double elapsedMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - messageStarted).count();
+                if(elapsedMs >= 1.0) {
+                    if(const auto logger = spdlog::get("core")) {
+                        logger->info(
+                            "application user message profile: index={} id={} "
+                            "host={} elapsed_ms={:.3f}",
+                            processed, msg_id, msg_host, elapsedMs);
+                    }
+                }
+            }
+#if defined(__ANDROID__)
+            if(TVPAndroidAppTraceEnabled()) {
+                __android_log_print(ANDROID_LOG_INFO, "krkr2",
+                                    "Application::ProcessMessages after user msg index=%zu id=%d",
+                                    processed, msg_id);
+            }
+#endif
+        }
+        processed += 1;
     }
+#if defined(__ANDROID__)
+    TVPAndroidAppLog("Application::ProcessMessages before ProgressAllTimer");
+#endif
     TVPTimer::ProgressAllTimer();
+    if(profileEnabled) {
+        const double elapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - profileStarted).count();
+        if(elapsedMs >= 5.0 || processed > 0) {
+            if(const auto logger = spdlog::get("core")) {
+                logger->info(
+                    "application process messages profile: queued={} "
+                    "processed={} elapsed_ms={:.3f}",
+                    queued, processed, elapsedMs);
+            }
+        }
+    }
+#if defined(__ANDROID__)
+    TVPAndroidAppLog("Application::ProcessMessages after ProgressAllTimer");
+#endif
 }
 
 #if 0
@@ -656,6 +853,9 @@ void tTVPApplication::SetTitle(const ttstr &caption) {
 
 void tTVPApplication::Terminate() {
     //::PostQuitMessage(0);
+#if defined(__ANDROID__)
+    TVPAndroidAppLog("Application::Terminate called");
+#endif
     tarminate_ = true;
     TVPTerminated = true;
 }
@@ -776,7 +976,7 @@ void tTVPApplication::PostUserMessage(const std::function<void()> &func,
 }
 
 void tTVPApplication::FilterUserMessage(
-    const std::function<void(std::vector<std::tuple<void *, int, tMsg>> &)>
+    const std::function<void(std::deque<std::tuple<void *, int, tMsg>> &)>
         &func) {
     std::lock_guard<std::mutex> cs(m_msgQueueLock);
     func(m_lstUserMsg);
@@ -787,20 +987,51 @@ void tTVPApplication::OnActivate() {
     if(!_project_startup)
         return;
 
+    spdlog::info("Host lifecycle activate begin audio_suspended={}",
+                 TVPIsAudioRendererSuspendedForHost() ? 1 : 0);
+
+    if(!TVPResumeAudioRendererForHost()) {
+        TVPAddImportantLog(
+            TJS_W("(warning) Failed to resume the host audio renderer"));
+    } else {
+        // Restore logical streams only after the platform device is ready.
+        // If the first iOS activation races UIApplication/AVAudioSession,
+        // RetryAudioRendererForHost() will finish this on a later frame.
+        TVPResetVolumeToAllSoundBuffer();
+        TVPUnlockSoundMixer();
+    }
+
     //	TVPRestoreFullScreenWindowAtActivation();
-    TVPResetVolumeToAllSoundBuffer();
-    TVPUnlockSoundMixer();
 
     // trigger System.onActivate event
     TVPPostApplicationActivateEvent();
     for(auto &it : m_activeEvents) {
         it.second(it.first, eTVPActiveEvent::onActive);
     }
+    spdlog::info("Host lifecycle activate complete audio_suspended={}",
+                 TVPIsAudioRendererSuspendedForHost() ? 1 : 0);
 }
+
+bool tTVPApplication::RetryAudioRendererForHost() {
+    if(!TVPIsAudioRendererSuspendedForHost())
+        return true;
+    if(!TVPResumeAudioRendererForHost())
+        return false;
+
+    TVPResetVolumeToAllSoundBuffer();
+    TVPUnlockSoundMixer();
+    TVPAddImportantLog(TJS_W("(info) Host audio renderer resumed"));
+    spdlog::info("Host lifecycle audio retry completed");
+    return true;
+}
+
 void tTVPApplication::OnDeactivate() {
     application_activating_ = false;
     if(!_project_startup)
         return;
+
+    spdlog::info("Host lifecycle deactivate begin audio_suspended={}",
+                 TVPIsAudioRendererSuspendedForHost() ? 1 : 0);
 
     //	TVPMinimizeFullScreenWindowAtInactivation();
 
@@ -809,6 +1040,11 @@ void tTVPApplication::OnDeactivate() {
 
     // set sound volume
     TVPResetVolumeToAllSoundBuffer();
+    // Stop the platform output device before the wave worker converts its
+    // currently playing streams into the engine's temporary host-pause state.
+    // This gives OpenAL Soft a clean chance to stop RemoteIO before iOS tears
+    // down the shared AVAudioSession.
+    TVPSuspendAudioRendererForHost();
     TVPLockSoundMixer();
 
     // trigger System.onDeactivate event
@@ -816,6 +1052,8 @@ void tTVPApplication::OnDeactivate() {
     for(auto &it : m_activeEvents) {
         it.second(it.first, eTVPActiveEvent::onDeactive);
     }
+    spdlog::info("Host lifecycle deactivate complete audio_suspended={}",
+                 TVPIsAudioRendererSuspendedForHost() ? 1 : 0);
 }
 
 void tTVPApplication::OnExit() {
@@ -823,8 +1061,16 @@ void tTVPApplication::OnExit() {
 
     delete TVPSystemControl;
     TVPSystemControl = nullptr;
+    TVPSystemControlAlive = false;
 
     CloseConsole();
+}
+
+void tTVPApplication::ResetForHostSession() {
+    tarminate_ = false;
+    application_activating_ = true;
+    _project_startup = false;
+    m_activeEvents.clear();
 }
 
 void tTVPApplication::OnLowMemory() {

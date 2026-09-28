@@ -12,6 +12,14 @@ void TVPInitDirectSound(int freq = 48000);
 
 void TVPUninitDirectSound();
 
+// The embedded host can suspend the process without destroying the KiriKiri
+// runtime. Keep logical sound buffers intact while releasing/reopening any
+// platform audio device that cannot survive that lifecycle transition.
+void TVPSuspendAudioRendererForHost();
+bool TVPResumeAudioRendererForHost();
+bool TVPIsAudioRendererSuspendedForHost();
+void TVPPollAudioRendererForHost();
+
 class iTVPSoundBuffer {
 public:
     virtual ~iTVPSoundBuffer() = default;
@@ -42,6 +50,8 @@ public:
     virtual bool IsBufferValid() = 0;
 
     virtual tjs_uint GetCurrentPlaySamples() = 0;
+
+    virtual tjs_uint GetPlaybackSampleRate() = 0;
 
     virtual tjs_uint GetLatencySamples() = 0;
 

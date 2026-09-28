@@ -12,12 +12,14 @@
 
 // must before with Platform.h because marco will replece `st_atime` symbol!
 #include <fcntl.h>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <algorithm>
 #include <set>
 #include <sys/stat.h>
 #include <vector>
+#include "ArchiveAutoPathOrder.h"
 #include "MsgIntf.h"
 
 #include "StorageImpl.h"
@@ -26,6 +28,7 @@
 #include "DebugIntf.h"
 #include "Random.h"
 #include "XP3Archive.h"
+#include "XP3ArchiveCxDecoder.h"
 #include "FileSelector.h"
 
 #include "Application.h"
@@ -37,6 +40,13 @@
 #include "combase.h"
 
 #include "spdlog/spdlog.h"
+
+#if defined(_WIN32)
+#undef GetClassName
+#undef GetMessage
+#undef max
+#undef min
+#endif
 
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -101,6 +111,9 @@ public:
 static void _tjs_normalize_nfc(ttstr &name) {
     if(name.IsEmpty())
         return;
+    static constexpr tjs_int MAX_NFC_STORAGE_NAME_LENGTH = 1 << 20;
+    if(name.GetLen() > MAX_NFC_STORAGE_NAME_LENGTH)
+        return;
     CFMutableStringRef str = CFStringCreateMutable(kCFAllocatorDefault, 0);
     if(!str)
         return;
@@ -108,6 +121,10 @@ static void _tjs_normalize_nfc(ttstr &name) {
                              static_cast<CFIndex>(name.GetLen()));
     CFStringNormalize(str, kCFStringNormalizationFormC);
     const CFIndex len = CFStringGetLength(str);
+    if(len > MAX_NFC_STORAGE_NAME_LENGTH) {
+        CFRelease(str);
+        return;
+    }
     std::vector<UniChar> buf(static_cast<size_t>(len));
     if(len > 0) {
         CFStringGetCharacters(str, CFRangeMake(0, len), buf.data());
@@ -327,24 +344,27 @@ static int _utf8_strcasecmp_nfc(const char *a, const char *b) {
 #endif
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-const std::vector<std::string> &TVPGetApplicationHomeDirectory();
-const std::vector<ttstr> &_getPrefixPath() {
-    static std::vector<ttstr> ret;
-    if(ret.empty()) {
-        for(const std::string &path : TVPGetApplicationHomeDirectory()) {
-            ret.emplace_back(path);
+struct tTVPIOSApplicationHomePaths {
+    std::vector<std::string> sourcePaths;
+    std::vector<ttstr> prefixPaths;
+    std::vector<std::string> homeDirectories;
+};
+
+const tTVPIOSApplicationHomePaths &TVPGetIOSApplicationHomePaths() {
+    static tTVPIOSApplicationHomePaths cache;
+    const auto &sourcePaths = TVPGetApplicationHomeDirectory();
+    if(cache.sourcePaths != sourcePaths) {
+        cache.sourcePaths = sourcePaths;
+        cache.prefixPaths.clear();
+        cache.homeDirectories.clear();
+        cache.prefixPaths.reserve(sourcePaths.size());
+        cache.homeDirectories.reserve(sourcePaths.size());
+        for(const std::string &path : sourcePaths) {
+            cache.prefixPaths.emplace_back(path);
+            cache.homeDirectories.emplace_back(path + "/");
         }
     }
-    return ret;
-}
-const std::vector<std::string> &_getHomeDir() {
-    static std::vector<std::string> ret;
-    if(ret.empty()) {
-        for(const std::string &path : TVPGetApplicationHomeDirectory()) {
-            ret.emplace_back(path + "/");
-        }
-    }
-    return ret;
+    return cache;
 }
 #endif // TARGET_OS_IPHONE
 
@@ -416,13 +436,19 @@ void tTVPFileMedia::GetLocallyAccessibleName(ttstr &name) {
     if(!TJS_strncmp(ptr, TJS_W("./"), 2)) {
         ptr += 2; // skip "./"
         newname.Clear();
+        if(!*ptr) {
+            name = TJS_W("/");
+            return;
+        }
     }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     {
         std::string prefix = "/";
         prefix += tTJSNarrowStringHolder(ptr).Buf;
-        static const std::vector<ttstr> &prefixPath = _getPrefixPath();
-        static const std::vector<std::string> &homeDir = _getHomeDir();
+        const auto &applicationHomePaths =
+            TVPGetIOSApplicationHomePaths();
+        const auto &prefixPath = applicationHomePaths.prefixPaths;
+        const auto &homeDir = applicationHomePaths.homeDirectories;
         spdlog::debug("iOS GetLocallyAccessibleName: prefix='{}', homeDir count={}", prefix, homeDir.size());
         for(int i = 0; i < (int)prefixPath.size(); ++i) {
             const std::string &dir = homeDir[i];
@@ -496,6 +522,22 @@ void tTVPFileMedia::GetLocalName(ttstr &name) {
 
 //---------------------------------------------------------------------------
 iTVPStorageMedia *TVPCreateFileMedia() { return new tTVPFileMedia; }
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// tTVPArcMedia
+//---------------------------------------------------------------------------
+// Some KiriKiri-Z games using PackinOne register a CompoundStorageMedia named
+// "arc". The real plugin builds a compound virtual filesystem; for the Godot
+// host we keep the media available and route local accesses through the normal
+// file media so startup scripts can resolve paths without CPU-side packaging
+// assumptions.
+class tTVPArcMedia : public tTVPFileMedia {
+public:
+    void GetName(ttstr &name) override { name = TJS_W("arc"); }
+};
+
+iTVPStorageMedia *TVPCreateArcMedia() { return new tTVPArcMedia; }
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
@@ -583,8 +625,14 @@ bool TVPRemoveFolder(const ttstr &name) {
 // TVPGetAppPath
 //---------------------------------------------------------------------------
 ttstr TVPGetAppPath() {
-    static ttstr apppath(TVPExtractStoragePath(TVPProjectDir));
-    return apppath;
+    ttstr project = TVPProjectDir;
+    const tjs_char *archiveDelimiter =
+        TJS_strchr(project.c_str(), TVPArchiveDelimiter);
+    if(archiveDelimiter) {
+        project = project.SubString(
+            0, static_cast<tjs_int>(archiveDelimiter - project.c_str()));
+    }
+    return TVPExtractStoragePath(project);
 }
 //---------------------------------------------------------------------------
 
@@ -635,6 +683,34 @@ bool TVPCheckExistentLocalFolder(const ttstr &name) {
     }
 
     return s.st_mode & S_IFDIR;
+}
+//---------------------------------------------------------------------------
+
+ttstr TVPGetNativeProjectDirectory(const ttstr &nativeProjectPath) {
+    ttstr path(nativeProjectPath);
+    while(path.GetLen() > 1 &&
+          (path.GetLastChar() == TJS_W('/') ||
+           path.GetLastChar() == TJS_W('\\'))) {
+        path = path.SubString(0, path.GetLen() - 1);
+    }
+    if(!TVPCheckExistentLocalFile(path))
+        return path;
+
+    const tjs_char *text = path.c_str();
+    tjs_int separator = path.GetLen() - 1;
+    while(separator >= 0 && text[separator] != TJS_W('/') &&
+          text[separator] != TJS_W('\\')) {
+        separator--;
+    }
+    if(separator < 0)
+        return TJS_W(".");
+    if(separator == 0)
+        return path.SubString(0, 1);
+#if defined(_WIN32)
+    if(separator == 2 && text[1] == TJS_W(':'))
+        return path.SubString(0, 3);
+#endif
+    return path.SubString(0, separator);
 }
 //---------------------------------------------------------------------------
 
@@ -797,7 +873,7 @@ tTVPLocalFileStream::tTVPLocalFileStream(const ttstr &origname,
     if(Handle < 0) {
         if(access == TJS_BS_APPEND || access == TJS_BS_UPDATE) {
             // use whole file writing
-            Handle = open(holder, O_RDONLY, 0666);
+            Handle = open(holder, O_RDONLY);
             if(Handle >= 0) {
                 tjs_uint64 size = tTVPLocalFileStream::GetSize();
                 if(size < 4 * 1024 * 1024) { // only support file size <= 4M
@@ -1414,7 +1490,16 @@ tTJSNativeClass *TVPCreateNativeClass_Storages() {
             return TJS_E_BADPARAMCOUNT;
 
         if(result) {
-            ttstr str(TVPNormalizeStorageName(*param[0]));
+            ttstr str(*param[0]);
+            if(str.IsEmpty()) {
+                *result = TJS_W("");
+                return TJS_S_OK;
+            }
+            str = TVPNormalizeStorageName(str);
+            if(str.IsEmpty()) {
+                *result = TJS_W("");
+                return TJS_S_OK;
+            }
             TVPGetLocalName(str);
             *result = str;
         }
@@ -1483,23 +1568,145 @@ bool TVPSaveStreamToFile(tTJSBinaryStream *st, tjs_uint64 offset,
 //---------------------------------------------------------------------------
 static std::vector<ttstr> TVPAutoMountedPaths;
 
+static std::string TVPLowerASCII(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return text;
+}
+
+static bool TVPIsPatchArchiveName(const std::string &name,
+                                  int *sequence = nullptr) {
+    std::string lower = TVPLowerASCII(name);
+    if(lower.size() > 4 && lower.substr(lower.size() - 4) == ".xp3")
+        lower.resize(lower.size() - 4);
+
+    if(lower == "patch") {
+        if(sequence) *sequence = 0;
+        return true;
+    }
+
+    constexpr const char *prefix = "patch";
+    constexpr size_t prefixLen = 5;
+    const bool startsWithPatch = lower.rfind(prefix, 0) == 0;
+    const bool endsWithPatch = lower.size() > prefixLen &&
+        lower.compare(lower.size() - prefixLen, prefixLen, prefix) == 0;
+    if(!startsWithPatch) {
+        if(!endsWithPatch)
+            return false;
+        if(sequence) *sequence = 1000001;
+        return true;
+    }
+
+    if(lower.size() == prefixLen)
+        return false;
+
+    int value = 0;
+    for(size_t i = prefixLen; i < lower.size(); i++) {
+        unsigned char ch = static_cast<unsigned char>(lower[i]);
+        if(!std::isdigit(ch)) {
+            // Named patches (patchAI, patch_data1080, etc.) are overlays on
+            // the game's regular patch/patchN archives.
+            if(sequence) *sequence = 1000001;
+            return true;
+        }
+        value = std::min(value * 10 + (lower[i] - '0'), 1000000);
+    }
+
+    if(sequence) *sequence = value;
+    return true;
+}
+
+static bool TVPMountArchiveAutoPaths(const ttstr &archivePath,
+                                     bool priorityArchive,
+                                     const ttstr &description) {
+    tTVPArchive *arc = nullptr;
+    try {
+        arc = TVPOpenArchive(archivePath, true);
+    } catch(...) {
+        TVPAddImportantLog(
+            ttstr(TJS_W("(warn) Failed to open ")) + description +
+            ttstr(TJS_W(" archive: ")) + archivePath);
+        return false;
+    }
+    if(!arc)
+        return false;
+
+    std::set<std::u16string, tTVPArchiveAutoPathDirectoryLess> dirPaths;
+    dirPaths.insert(std::u16string());
+
+    const tjs_uint fileCount = arc->GetCount();
+    for(tjs_uint i = 0; i < fileCount; i++) {
+        ttstr fname = arc->GetName(i);
+        const tjs_char *s = fname.c_str();
+        const tjs_int len = fname.GetLen();
+        for(tjs_int j = 0; j < len; j++) {
+            if(s[j] == TJS_W('/')) {
+                std::u16string d(
+                    reinterpret_cast<const char16_t *>(s),
+                    static_cast<size_t>(j + 1));
+                dirPaths.insert(d);
+            }
+        }
+    }
+    arc->Release();
+
+    tjs_char delimStr[2] = { TVPArchiveDelimiter, 0 };
+    const ttstr archiveBase = archivePath + ttstr(delimStr);
+    for(const auto &d : dirPaths) {
+        const ttstr dirStr(
+            reinterpret_cast<const tjs_char *>(d.c_str()),
+            static_cast<tjs_int>(d.size()));
+        const ttstr autoPath = archiveBase + dirStr;
+        try {
+            TVPAddAutoPath(autoPath);
+            if(priorityArchive)
+                TVPAutoMountedPaths.push_back(
+                    TVPNormalizeStorageName(autoPath));
+        } catch(...) {}
+    }
+
+    TVPAddImportantLog(
+        ttstr(TJS_W("(info) Auto-mounted ")) + description +
+        ttstr(TJS_W(" archive: ")) + archivePath + ttstr(TJS_W(" (")) +
+        ttstr(static_cast<tjs_int>(dirPaths.size())) +
+        ttstr(TJS_W(" dirs, ")) + ttstr(static_cast<tjs_int>(fileCount)) +
+        ttstr(TJS_W(" files)")));
+    return true;
+}
+
 void TVPAutoMountSiblingXP3Archives() {
-    if(TVPProjectDir.GetLastChar() != TJS_W('/'))
+    // A process may launch more than one title over its lifetime. Never let a
+    // package-selected decoder leak into the next project.
+    TVPResetBuiltinXP3CxDecoder();
+    TVPAutoMountedPaths.clear();
+
+    const bool directoryProject =
+        TVPProjectDir.GetLastChar() == TJS_W('/');
+    const bool archiveProject =
+        TVPProjectDir.GetLastChar() == TVPArchiveDelimiter;
+    if(!directoryProject && !archiveProject)
         return;
 
-    // In modern Kirikiri2-Next architecture (e.g., Flutter frontend), games are often launched 
-    // by pointing directly to a directory. When TVPProjectDir ends with '/', it means we are 
-    // looking inside the project folder itself, so we should search for sibling XP3 archives 
-    // *inside* this directory, not its parent.
-    ttstr parentStoragePath = TVPProjectDir;
+    // Directory launches scan inside that directory. Archive launches
+    // (including XP3-bound EXEs) scan beside the selected archive so the
+    // embedded launcher can overlay the original game's data archives.
+    ttstr parentStoragePath =
+        directoryProject ? TVPProjectDir : TVPGetAppPath();
     if(parentStoragePath.IsEmpty())
         return;
 
     // For log identification purposes
-    tjs_int len = TVPProjectDir.GetLen();
-    while(len > 0 && TVPProjectDir[len - 1] == TJS_W('/'))
-        len--;
-    ttstr projDir = TVPProjectDir.SubString(0, len);
+    ttstr projDir;
+    if(directoryProject) {
+        tjs_int len = TVPProjectDir.GetLen();
+        while(len > 0 && TVPProjectDir[len - 1] == TJS_W('/'))
+            len--;
+        projDir = TVPProjectDir.SubString(0, len);
+    } else {
+        projDir = TVPProjectDir.SubString(0, TVPProjectDir.GetLen() - 1);
+    }
     ttstr projBaseName = TVPExtractStorageName(projDir);
 
     spdlog::info("AutoMountXP3: TVPProjectDir={}", TVPProjectDir.AsStdString());
@@ -1540,84 +1747,60 @@ void TVPAutoMountSiblingXP3Archives() {
     }
     closedir(dirp);
 
-    std::sort(xp3Names.begin(), xp3Names.end());
+    std::sort(xp3Names.begin(), xp3Names.end(),
+              [](const std::string &a, const std::string &b) {
+                  int aSequence = 0;
+                  int bSequence = 0;
+                  const bool aPatch =
+                      TVPIsPatchArchiveName(a, &aSequence);
+                  const bool bPatch =
+                      TVPIsPatchArchiveName(b, &bSequence);
+                  if(aPatch != bPatch)
+                      return !aPatch;
+                  if(aPatch && aSequence != bSequence)
+                      return aSequence < bSequence;
+                  return TVPLowerASCII(a) < TVPLowerASCII(b);
+              });
 
     if(xp3Names.empty()) {
         TVPAddImportantLog(TJS_W("(info) No sibling XP3 archives found"));
-        return;
     }
 
     for(const auto &xp3Name : xp3Names) {
-        ttstr archivePath = parentStoragePath + ttstr(xp3Name.c_str());
-        archivePath = TVPNormalizeStorageName(archivePath);
-
-        tTVPArchive *arc = nullptr;
-        try {
-            arc = TVPOpenArchive(archivePath, true);
-        } catch(...) {
-            TVPAddImportantLog(
-                ttstr(TJS_W("(warn) Failed to open sibling archive: ")) +
-                archivePath);
+        if(archiveProject &&
+           TVPLowerASCII(xp3Name) ==
+               TVPLowerASCII(projBaseName.AsStdString())) {
             continue;
         }
-        if(!arc) continue;
+        const bool priorityArchive = TVPIsPatchArchiveName(xp3Name);
+        ttstr archivePath = parentStoragePath + ttstr(xp3Name.c_str());
+        archivePath = TVPNormalizeStorageName(archivePath);
+        TVPMountArchiveAutoPaths(
+            archivePath, priorityArchive, TJS_W("sibling"));
+    }
 
-        std::set<std::u16string> dirPaths;
-        dirPaths.insert(std::u16string());
-
-        tjs_uint fileCount = arc->GetCount();
-        for(tjs_uint i = 0; i < fileCount; i++) {
-            ttstr fname = arc->GetName(i);
-            const tjs_char *s = fname.c_str();
-            tjs_int len = fname.GetLen();
-            for(tjs_int j = 0; j < len; j++) {
-                if(s[j] == TJS_W('/')) {
-                    std::u16string d(
-                        reinterpret_cast<const char16_t *>(s),
-                        static_cast<size_t>(j + 1));
-                    dirPaths.insert(d);
-                }
-            }
-        }
-
-        arc->Release();
-
-        tjs_char delimStr[2] = { TVPArchiveDelimiter, 0 };
-        ttstr archiveBase = archivePath + ttstr(delimStr);
-
-        for(const auto &d : dirPaths) {
-            ttstr dirStr(reinterpret_cast<const tjs_char *>(d.c_str()),
-                         static_cast<tjs_int>(d.size()));
-            ttstr autoPath = archiveBase + dirStr;
-            try {
-                TVPAddAutoPath(autoPath);
-                TVPAutoMountedPaths.push_back(TVPNormalizeStorageName(autoPath));
-            } catch(...) {}
-        }
-
-        TVPAddImportantLog(
-            ttstr(TJS_W("(info) Auto-mounted sibling archive: ")) +
-            archivePath + ttstr(TJS_W(" (")) +
-            ttstr((tjs_int)dirPaths.size()) + ttstr(TJS_W(" dirs, ")) +
-            ttstr((tjs_int)fileCount) + ttstr(TJS_W(" files)")));
+    if(archiveProject) {
+        // Keep a selected patch archive as a priority overlay. A selected
+        // base archive must stay below sibling patch*.xp3 overlays; otherwise
+        // the priority pass would move the base archive after the patches.
+        const bool selectedProjectIsPatch =
+            TVPIsPatchArchiveName(projBaseName.AsStdString());
+        TVPMountArchiveAutoPaths(
+            TVPNormalizeStorageName(projDir), selectedProjectIsPatch,
+            TJS_W("selected project"));
     }
 }
 
 void TVPBoostAutoMountPaths() {
     if(TVPAutoMountedPaths.empty()) return;
 
-    extern std::vector<ttstr> TVPAutoPathList;
-    extern bool AutoPathTableInit;
-
+    size_t moved = 0;
     for(const auto &p : TVPAutoMountedPaths) {
-        auto it = std::find(TVPAutoPathList.begin(), TVPAutoPathList.end(), p);
-        if(it != TVPAutoPathList.end())
-            TVPAutoPathList.erase(it);
-        TVPAutoPathList.push_back(p);
+        TVPAddAutoPath(p);
+        moved++;
     }
     TVPAutoMountedPaths.clear();
 
-    AutoPathTableInit = false;
-    spdlog::info("TVPBoostAutoMountPaths: re-ordered {} patch paths to end of auto path list",
-                 TVPAutoPathList.size());
+    spdlog::info("TVPBoostAutoMountPaths: re-ordered {} priority archive paths to end of auto path list",
+                 moved);
 }

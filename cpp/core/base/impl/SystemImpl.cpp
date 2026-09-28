@@ -888,6 +888,12 @@ static void TVPRegisterStartupCompatGlobals() {
                         global);
     };
 
+    auto set_int = [global](const tjs_char *name, tjs_int value) {
+        tTJSVariant val(value);
+        global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, name, nullptr, &val,
+                        global);
+    };
+
     // Older games often assign these as plain writable globals during
     // initialize.tjs startup. Pre-create them to avoid access-denied failures
     // against native/read-only properties on non-Windows platforms.
@@ -895,21 +901,91 @@ static void TVPRegisterStartupCompatGlobals() {
     set_bool(TJS_W("inXP3archivePacked"), true);
     set_string(TJS_W("convertMode"), TJS_W(""));
 
+    set_int(TJS_W("MB_OK"), 0x00000000);
+    set_int(TJS_W("MB_OKCANCEL"), 0x00000001);
+    set_int(TJS_W("MB_ABORTRETRYIGNORE"), 0x00000002);
+    set_int(TJS_W("MB_YESNOCANCEL"), 0x00000003);
+    set_int(TJS_W("MB_YESNO"), 0x00000004);
+    set_int(TJS_W("MB_RETRYCANCEL"), 0x00000005);
+    set_int(TJS_W("MB_CANCELTRYCONTINUE"), 0x00000006);
+    set_int(TJS_W("MB_ICONHAND"), 0x00000010);
+    set_int(TJS_W("MB_ICONSTOP"), 0x00000010);
+    set_int(TJS_W("MB_ICONERROR"), 0x00000010);
+    set_int(TJS_W("MB_ICONQUESTION"), 0x00000020);
+    set_int(TJS_W("MB_ICONEXCLAMATION"), 0x00000030);
+    set_int(TJS_W("MB_ICONWARNING"), 0x00000030);
+    set_int(TJS_W("MB_ICONASTERISK"), 0x00000040);
+    set_int(TJS_W("MB_ICONINFORMATION"), 0x00000040);
+    set_int(TJS_W("MB_DEFBUTTON1"), 0x00000000);
+    set_int(TJS_W("MB_DEFBUTTON2"), 0x00000100);
+    set_int(TJS_W("MB_DEFBUTTON3"), 0x00000200);
+    set_int(TJS_W("MB_DEFBUTTON4"), 0x00000300);
+    set_int(TJS_W("IDOK"), 1);
+    set_int(TJS_W("IDCANCEL"), 2);
+    set_int(TJS_W("IDABORT"), 3);
+    set_int(TJS_W("IDRETRY"), 4);
+    set_int(TJS_W("IDIGNORE"), 5);
+    set_int(TJS_W("IDYES"), 6);
+    set_int(TJS_W("IDNO"), 7);
+    set_int(TJS_W("IDTRYAGAIN"), 10);
+    set_int(TJS_W("IDCONTINUE"), 11);
+
     TVPRegisterCompatFunction(global, TJS_W("addFont"));
     TVPRegisterCompatFunction(global, TJS_W("AddFont"));
     TVPRegisterCompatFunction(global, TJS_W("AddTrueTypeFont"));
     TVPRegisterCompatFunction(global, TJS_W("AddAlias"), true);
+    TVPRegisterCompatFunction(global, TJS_W("loadResolutionInfo"));
 
-    iTJSDispatch2 *preRenderFontEx = TJSCreateDictionaryObject();
-    if(preRenderFontEx) {
-        TVPRegisterCompatFunction(preRenderFontEx, TJS_W("addFont"));
-        TVPRegisterCompatFunction(preRenderFontEx, TJS_W("AddFont"));
-        TVPRegisterCompatFunction(preRenderFontEx, TJS_W("AddTrueTypeFont"));
-        TVPRegisterCompatFunction(preRenderFontEx, TJS_W("AddAlias"), true);
-        tTJSVariant val(preRenderFontEx);
-        global->PropSet(TJS_MEMBERENSURE, TJS_W("PreRenderFontEx"), nullptr,
-                        &val, global);
-        preRenderFontEx->Release();
+    iTJSDispatch2 *kirikiriz = new GenericMockObjectLocal();
+    tTJSVariant kirikirizVal(kirikiriz, kirikiriz);
+    global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, TJS_W("kirikiriz"),
+                    nullptr, &kirikirizVal, global);
+    kirikiriz->Release();
+
+    iTJSDispatch2 *shortcutMap = TJSCreateArrayObject();
+    if(shortcutMap) {
+        tTJSVariant shortcutMapVal(shortcutMap, shortcutMap);
+        global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
+                        TJS_W("ShortCutInitialPadKeyMap"), nullptr,
+                        &shortcutMapVal, global);
+        global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
+                        TJS_W("ShortCutInitialGamePadKeyMap"), nullptr,
+                        &shortcutMapVal, global);
+        shortcutMap->Release();
+    }
+
+    iTJSDispatch2 *commitSavedata =
+        new StaticGlobalMockFuncLocal(TJS_W("commitSavedata"));
+    tTJSVariant commitSavedataVal(commitSavedata, commitSavedata);
+    global->PropSet(TJS_MEMBERENSURE, TJS_W("commitSavedata"), nullptr,
+                    &commitSavedataVal, global);
+    commitSavedata->Release();
+
+    iTJSDispatch2 *bootStrap =
+        new StaticGlobalMockFuncLocal(TJS_W("bootStrap"));
+    tTJSVariant bootStrapVal(bootStrap, bootStrap);
+    global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, TJS_W("bootStrap"),
+                    nullptr, &bootStrapVal, global);
+    bootStrap->Release();
+
+    try {
+        TVPExecuteScript(TJS_W(
+            "if(typeof CompoundStorageMedia == 'undefined') {\n"
+            "  class CompoundStorageMedia {\n"
+            "    function addArchive() { return true; }\n"
+            "    function addStorage() { return true; }\n"
+            "    function addAutoToolsPath() { return true; }\n"
+            "    function setCurrentDirectory() { return true; }\n"
+            "    function register() { return true; }\n"
+            "    function unregister() { return true; }\n"
+            "    function parseArchiveIndex() { return 0; }\n"
+            "    function getLocallyAccessibleName() { return ''; }\n"
+            "    property archiveUniqueKey { getter() { return 'AetherKiri.CompoundStorageMedia'; } }\n"
+            "  }\n"
+            "}\n"),
+            static_cast<tTJSVariant *>(nullptr));
+    } catch(...) {
+        spdlog::warn("Failed to install CompoundStorageMedia startup compatibility class");
     }
 
     global->Release();
@@ -1061,6 +1137,36 @@ tTJSNativeClass *TVPCreateNativeClass_System() {
         /*object to register*/ cls,
         /*func. name*/ system)
     //----------------------------------------------------------------------
+    TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ setDefaultDllDirectories) {
+        if(result)
+            *result = static_cast<tjs_int>(1);
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(
+        /*object to register*/ cls,
+        /*func. name*/ setDefaultDllDirectories)
+    //----------------------------------------------------------------------
+    TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ addDllDirectory) {
+        if(result)
+            *result = static_cast<tjs_int>(1);
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(
+        /*object to register*/ cls,
+        /*func. name*/ addDllDirectory)
+    //----------------------------------------------------------------------
+    TJS_BEGIN_NATIVE_PROP_DECL(llsDefaultDirs) {
+        TJS_BEGIN_NATIVE_PROP_GETTER {
+            if(result)
+                *result = static_cast<tjs_int>(0x00001000);
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_PROP_GETTER
+
+        TJS_DENY_NATIVE_PROP_SETTER
+    }
+    TJS_END_NATIVE_STATIC_PROP_DECL_OUTER(cls, llsDefaultDirs)
+    //----------------------------------------------------------------------
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ readRegValue) {
         if(numparams < 1)
             return TJS_E_BADPARAMCOUNT;
@@ -1125,6 +1231,8 @@ tTJSNativeClass *TVPCreateNativeClass_System() {
         ttstr value = *param[1];
 
         TVPSetCommandLine(name.c_str(), value);
+        if(name == TJS_W("-deffont"))
+            TVPSetDefaultFontName(value);
 
         return TJS_S_OK;
     }
@@ -1196,6 +1304,16 @@ TJS_END_NATIVE_PROP_GETTER
 TJS_DENY_NATIVE_PROP_SETTER
 }
 TJS_END_NATIVE_STATIC_PROP_DECL_OUTER(cls, exePath)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_PROP_DECL(arcPath){
+    TJS_BEGIN_NATIVE_PROP_GETTER{ *result = TVPGetAppPath();
+return TJS_S_OK;
+}
+TJS_END_NATIVE_PROP_GETTER
+
+TJS_DENY_NATIVE_PROP_SETTER
+}
+TJS_END_NATIVE_STATIC_PROP_DECL_OUTER(cls, arcPath)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(personalPath){
     TJS_BEGIN_NATIVE_PROP_GETTER{ *result = TVPGetPersonalPath();
@@ -1336,6 +1454,17 @@ TJS_DENY_NATIVE_PROP_SETTER
 }
 TJS_END_NATIVE_STATIC_PROP_DECL_OUTER(cls, touchDevice)
 //----------------------------------------------------------------------
+
+    auto set_system_const = [cls](const tjs_char *name, tjs_int value) {
+        tTJSVariant val(value);
+        cls->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, name, nullptr, &val,
+                     cls);
+    };
+    set_system_const(TJS_W("llsDllLoadDir"), 0x00000100);
+    set_system_const(TJS_W("llsApplicationDir"), 0x00000200);
+    set_system_const(TJS_W("llsUserDirs"), 0x00000400);
+    set_system_const(TJS_W("llsSystem32"), 0x00000800);
+    set_system_const(TJS_W("llsDefaultDirs"), 0x00001000);
 
 return cls;
 }

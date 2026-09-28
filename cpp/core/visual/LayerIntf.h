@@ -11,6 +11,8 @@
 #ifndef LayerIntfH
 #define LayerIntfH
 
+#include <memory>
+
 #include "tjsNative.h"
 #include "tvpfontstruc.h"
 #include "ComplexRect.h"
@@ -26,6 +28,15 @@
 extern bool TVPFreeUnusedLayerCache;
 extern tjs_int TVPGetLayerCount();
 extern tjs_uint64 TVPGetLayerTotalBitmapBytes();
+// Drop compatibility-routing state whose keys are native Layer addresses.
+// Embedded hosts can create another TJS world in the same process, where an
+// allocator may reuse an address from the previous title.
+extern void TVPResetLayerStateForHostSession();
+// E-mote may replace a visible GPU texture without contributing the full
+// character bounds to KiriKiri's normal dirty region. Request one complete
+// window composite after such a replacement; cached/static host frames can
+// continue using the smaller dirty region.
+void TVPRequestFullGpuCompletion();
 
 //---------------------------------------------------------------------------
 // initial bitmap holder ( since tTVPBaseBitmap cannot create empty
@@ -290,6 +301,10 @@ public:
     void SetParent(tTJSNI_BaseLayer *parent) { Join(parent); }
 
     tjs_uint GetCount() { return Children.GetActualCount(); }
+    tjs_int DebugGetVisibleChildrenCount() { return GetVisibleChildrenCount(); }
+    bool DebugIsInTransition() const { return InTransition; }
+    bool DebugIsTransWithChildren() const { return TransWithChildren; }
+    tTVPLayerType DebugGetDisplayType() const { return DisplayType; }
 
     tTJSNI_BaseLayer *GetChildren(tjs_int idx) {
         Children.Compact();
@@ -418,9 +433,25 @@ public:
     // management --
     tTVPBaseTexture *MainImage;
 
+    // A large TLG can take hundreds of milliseconds to decode.  Keep the
+    // currently displayed image in place while that decode runs on the image
+    // worker, and use a generation to discard stale results when the scene
+    // advances again before the worker finishes.
+    std::shared_ptr<unsigned char> DeferredImageLoadToken;
+    tjs_uint64 DeferredImageLoadGeneration = 0;
+    ttstr DeferredImageLoadName;
+    tjs_uint32 DeferredImageLoadColorKey = TVP_clNone;
+
 protected:
     ttstr _evictedImageName;
     tjs_uint32 _evictedColorKey = 0;
+    // Main image dimensions captured when _evictedImageName was loaded.
+    // Compatibility code may resize/refill the same layer afterwards (for
+    // example the PackinOne UI loader draws button state art into the shared
+    // temporary layer), so a later reload of the same name must not be
+    // skipped unless the bitmap still has the loaded size.
+    tjs_uint _evictedImageWidth = 0;
+    tjs_uint _evictedImageHeight = 0;
     bool _bitmapEvicted = false;
     void EnsureBitmap();
     bool CanHaveImage; // whether the layer can have image
@@ -442,6 +473,15 @@ protected:
 
 public:
     void AssignImages(tTJSNI_BaseLayer *src); // assign image content
+    // Transfer a fully repainted motion scratch image without sharing it back
+    // to the scratch layer. The destination's previous image becomes the next
+    // reusable scratch buffer.
+    void AssignMotionImages(tTJSNI_BaseLayer *src);
+    // Transfer a completed producer image into this display layer and return
+    // this layer's previous image to the producer for its next update. This
+    // keeps streaming producers from writing into a texture already visible
+    // in the layer tree.
+    bool ExchangeMainImage(tTVPBaseTexture *&bitmap);
 
     void AssignMainImage(iTVPBaseBitmap *bmp);
     // assign single main bitmap image. the image size assigned must
@@ -449,6 +489,13 @@ public:
 
     void AssignMainImageWithUpdate(iTVPBaseBitmap *bmp);
     void CopyFromMainImage(class tTJSNI_Bitmap *bmp);
+
+    // Complete a deferred large-image load started by LoadImages().  The
+    // callback is intentionally owned by the layer so a stale worker result
+    // cannot replace a newer scene image.
+    void CompleteDeferredImageLoad(const ttstr &name, tjs_uint32 colorkey,
+                                   tjs_uint64 generation,
+                                   tTVPBaseBitmap *bitmap, bool success);
 #ifndef TVP_REVRGB
 #define TVP_REVRGB(v)                                                          \
     ((v & 0xFF00FF00) | ((v >> 16) & 0xFF) | ((v & 0xFF) << 16))
@@ -527,7 +574,6 @@ private:
     bool Enabled; // is layer enabled for input?
     bool EnabledWork; // work are for delivering onNodeEnabled or
                       // onNodeDisabled
-    bool SelProcessLock; // compatibility flag used by older UI scripts
     bool Focusable; // is layer focusable ?
     bool JoinFocusChain; // does layer join the focus chain ?
     tTJSNI_BaseLayer *FocusWork;
@@ -617,6 +663,8 @@ public:
 
 private:
     void FireClick(tjs_int x, tjs_int y);
+    void FireButtonClick();
+    bool HasButtonClickTarget();
     void FireDoubleClick(tjs_int x, tjs_int y);
     void FireMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb,
                        tjs_uint32 flags);
@@ -694,9 +742,6 @@ public:
     void SetEnabled(bool b);
     bool ParentEnabled();
     bool GetEnabled() const { return Enabled; }
-    void SetSelProcessLock(bool b) { SelProcessLock = b; }
-    bool GetSelProcessLock() const { return SelProcessLock; }
-
     bool GetNodeEnabled() {
         return GetEnabled() && ParentEnabled() && !IsDisabledByMode();
     }
@@ -790,6 +835,10 @@ public:
                   tjs_int opa, bool aa, tjs_int shadowlevel,
                   tjs_uint32 shadowcolor, tjs_int shadowwidth,
                   tjs_int shadowofsx, tjs_int shadowofsy);
+    void DrawTextVerticalGradient(tjs_int x, tjs_int y, const ttstr &text,
+                                  tjs_uint32 topcolor,
+                                  tjs_uint32 bottomcolor, tjs_int opa,
+                                  bool aa, tjs_int gradientHeight);
 
     void DrawGlyph(tjs_int x, tjs_int y, iTJSDispatch2 *glyph, tjs_uint32 color,
                    tjs_int opa, bool aa, tjs_int shadowlevel,
@@ -1045,7 +1094,8 @@ private:
 
     void InternalComplete2(tTVPComplexRect &updateregion,
                            tTVPDrawable *drawable);
-    void InternalComplete2_GPU(tTVPRect updateregion, tTVPDrawable *drawable);
+    void InternalComplete2_GPU(tTVPRect updateregion, tTVPDrawable *drawable,
+                               bool localDestination);
     void InternalComplete(tTVPComplexRect &updateregion,
                           tTVPDrawable *drawable);
     void CompleteForWindow(tTVPDrawable *drawable);
@@ -1114,6 +1164,8 @@ private:
 
         tTVPBaseTexture *Src1Bmp; // tutDivisible
         tTVPBaseTexture *Src2Bmp; // tutDivisible
+        int SnapshotWarmupFrames;
+        bool SkipSnapshotFrame;
 
         void Init(tTJSNI_BaseLayer *owner, tTVPDrawable *org) {
             Owner = owner;

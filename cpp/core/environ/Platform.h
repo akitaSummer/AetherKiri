@@ -25,12 +25,15 @@ int TVPShowSimpleMessageBox(const ttstr &text, const ttstr &caption,
                             const std::vector<ttstr> &vecButtons);
 int TVPShowSimpleMessageBox(const ttstr &text, const ttstr &caption);
 int TVPShowSimpleMessageBoxYesNo(const ttstr &text, const ttstr &caption);
+bool TVPShouldAutoAcknowledgeMessageBox(const ttstr &caption,
+                                        std::size_t buttonCount);
 
 int TVPShowSimpleInputBox(ttstr &text, const ttstr &caption,
                           const ttstr &prompt,
                           const std::vector<ttstr> &vecButtons);
 
 std::vector<std::string> TVPGetDriverPath();
+std::string TVPGetDefaultFileDir();
 std::vector<std::string> TVPGetAppStoragePath();
 bool TVPCheckStartupPath(const std::string &path);
 std::string TVPGetPackageVersionString();
@@ -46,6 +49,11 @@ void TVPHideIME();
 
 void TVPRelinquishCPU();
 void TVPPrintLog(const char *str);
+
+// Re-activate the platform audio session after the host returns to the
+// foreground. iOS implements this with AVAudioSession; other renderers do not
+// call it.
+bool TVPActivateAudioSessionForHost();
 
 // 宏定义冲突 sys/stat.h
 #ifdef st_atime

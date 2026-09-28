@@ -1,9 +1,13 @@
 #pragma once
 #include "tjs.h"
 #include "tjsNative.h"
+#include "DebugIntf.h"
+#include "ScriptMgnIntf.h"
 #include "DrawDevice.h"
-#include <dlfcn.h>
 #include <unordered_map>
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 namespace DrawDeviceGLES {
 
@@ -11,12 +15,27 @@ using CreateKrkrGLESModuleObjectFn = tjs_error (*)(tTJSVariant *, tjs_int, tjs_i
 using ModuleName = std::basic_string<tjs_char>;
 using ModuleStore = std::unordered_map<uintptr_t, std::unordered_map<ModuleName, tTJSVariant>>;
 
+#if defined(__APPLE__)
+extern "C" tjs_error TVPKrkrGLESCreateModuleObject(tTJSVariant *, tjs_int,
+                                                    tjs_int);
+#endif
+
 inline tjs_error TryCreateModuleViaKrkrGLES(tTJSVariant *result, tjs_int width,
                                             tjs_int height) {
+#if defined(_WIN32)
+    return TJS_E_MEMBERNOTFOUND;
+#elif defined(__APPLE__)
+    // iOS statically links the compatibility plugin into the application.
+    // dlsym(RTLD_DEFAULT, ...) cannot discover symbols that are not exported
+    // from the final executable, so the old code silently selected the no-op
+    // module and skipped the capture callback used by Live2D games.
+    return TVPKrkrGLESCreateModuleObject(result, width, height);
+#else
     void *sym = dlsym(RTLD_DEFAULT, "TVPKrkrGLESCreateModuleObject");
     if(!sym) return TJS_E_MEMBERNOTFOUND;
     auto fn = reinterpret_cast<CreateKrkrGLESModuleObjectFn>(sym);
     return fn(result, width, height);
+#endif
 }
 
 inline tjs_error ReturnTrueCb(tTJSVariant *result, tjs_int, tTJSVariant **,
@@ -36,6 +55,143 @@ inline tjs_error ReturnFirstArgOrTrueCb(tTJSVariant *result, tjs_int numparams,
     return TJS_S_OK;
 }
 
+inline void SetObjectProperty(iTJSDispatch2 *obj, const tjs_char *name,
+                              const tTJSVariant &value) {
+    if(!obj || !name) return;
+    auto copy = value;
+    obj->PropSet(TJS_MEMBERENSURE, name, nullptr, &copy, obj);
+}
+
+inline void IncrementRenderCount(iTJSDispatch2 *obj) {
+    if(!obj) return;
+    tTJSVariant current;
+    tjs_int value = 0;
+    if(TJS_SUCCEEDED(obj->PropGet(TJS_IGNOREPROP, TJS_W("renderCount"),
+                                  nullptr, &current, obj)) &&
+       current.Type() != tvtVoid) {
+        try {
+            value = static_cast<tjs_int>(current);
+        } catch(...) {
+            value = 0;
+        }
+    }
+    SetObjectProperty(obj, TJS_W("renderCount"), tTJSVariant(value + 1));
+}
+
+inline const tjs_char *VariantTypeName(tTJSVariantType type) {
+    switch(type) {
+    case tvtVoid: return TJS_W("void");
+    case tvtObject: return TJS_W("object");
+    case tvtString: return TJS_W("string");
+    case tvtOctet: return TJS_W("octet");
+    case tvtInteger: return TJS_W("integer");
+    case tvtReal: return TJS_W("real");
+    default: return TJS_W("unknown");
+    }
+}
+
+inline void LogCompatArgsOnce(const tjs_char *tag, tjs_int numparams,
+                              tTJSVariant **param) {
+    static tjs_int logCount = 0;
+    if(logCount++ >= 12)
+        return;
+    ttstr msg = ttstr(TJS_W("DrawDeviceGLESModule.")) + tag +
+                TJS_W(": argc=") + ttstr(numparams);
+    for(tjs_int i = 0; i < numparams; ++i) {
+        msg += TJS_W(" [");
+        msg += ttstr(i);
+        msg += TJS_W(":");
+        msg += (param && param[i]) ? VariantTypeName(param[i]->Type())
+                                   : TJS_W("null");
+        msg += TJS_W("]");
+    }
+    TVPAddLog(msg);
+}
+
+inline tjs_error EntryUpdateObjectCb(tTJSVariant *result, tjs_int numparams,
+                                     tTJSVariant **param, iTJSDispatch2 *obj) {
+    LogCompatArgsOnce(TJS_W("entryUpdateObject"), numparams, param);
+    IncrementRenderCount(obj);
+    if(result) *result = true;
+    return TJS_S_OK;
+}
+
+inline tjs_error CopyLayerCb(tTJSVariant *result, tjs_int numparams,
+                             tTJSVariant **param, iTJSDispatch2 *obj) {
+    LogCompatArgsOnce(TJS_W("copyLayer"), numparams, param);
+    IncrementRenderCount(obj);
+    if(result) *result = true;
+    return TJS_S_OK;
+}
+
+inline tjs_error DrawAffineCb(tTJSVariant *result, tjs_int numparams,
+                              tTJSVariant **param, iTJSDispatch2 *obj) {
+    LogCompatArgsOnce(TJS_W("drawAffine"), numparams, param);
+    IncrementRenderCount(obj);
+    if(result) *result = true;
+    return TJS_S_OK;
+}
+
+inline tjs_error DrawLayerCb(tTJSVariant *result, tjs_int numparams,
+                             tTJSVariant **param, iTJSDispatch2 *obj) {
+    LogCompatArgsOnce(TJS_W("drawLayer"), numparams, param);
+    IncrementRenderCount(obj);
+    if(result) *result = true;
+    return TJS_S_OK;
+}
+
+inline tjs_error RenderCb(tTJSVariant *result, tjs_int, tTJSVariant **,
+                          iTJSDispatch2 *obj) {
+    IncrementRenderCount(obj);
+    if(result) *result = true;
+    return TJS_S_OK;
+}
+
+inline tjs_error CreateObjectByExpression(tTJSVariant *result,
+                                          const tjs_char *expression) {
+    if(!result || !expression) return TJS_S_OK;
+    try {
+        TVPExecuteExpression(ttstr(expression), result);
+    } catch(...) {
+        result->Clear();
+        return TJS_E_FAIL;
+    }
+    return TJS_S_OK;
+}
+
+inline void InvokeLoadIfPresent(tTJSVariant &object, tjs_int numparams,
+                                tTJSVariant **param) {
+    if(numparams <= 0 || !param || object.Type() != tvtObject) return;
+    iTJSDispatch2 *dispatch = object.AsObjectNoAddRef();
+    if(!dispatch) return;
+    tjs_uint hint = 0;
+    dispatch->FuncCall(0, TJS_W("load"), &hint, nullptr, numparams, param,
+                       dispatch);
+}
+
+inline tjs_error CreateModelCb(tTJSVariant *result, tjs_int numparams,
+                               tTJSVariant **param, iTJSDispatch2 *) {
+    tTJSVariant model;
+    tjs_error er = CreateObjectByExpression(&model, TJS_W("new Live2DModel()"));
+    if(TJS_FAILED(er)) {
+        if(result) result->Clear();
+        return er;
+    }
+    InvokeLoadIfPresent(model, numparams, param);
+    if(result) *result = model;
+    return TJS_S_OK;
+}
+
+inline tjs_error CreateMatrixCb(tTJSVariant *result, tjs_int, tTJSVariant **,
+                                iTJSDispatch2 *) {
+    return CreateObjectByExpression(result, TJS_W("new Live2DMatrix()"));
+}
+
+inline tjs_error CreateDeviceCb(tTJSVariant *result, tjs_int, tTJSVariant **,
+                                iTJSDispatch2 *) {
+    return CreateObjectByExpression(result, TJS_W("new Live2DDevice()"));
+}
+
 inline void SetObjectMethod(iTJSDispatch2 *obj, const tjs_char *name,
                             tTJSNativeClassMethodCallback cb) {
     if(!obj || !name || !cb) return;
@@ -51,25 +207,33 @@ inline tjs_error CreateFallbackModuleObject(tTJSVariant *result, tjs_int width,
     iTJSDispatch2 *dict = TJSCreateCustomObject();
     if(!dict) return TJS_E_FAIL;
 
-    tTJSVariant wv(width), hv(height);
-    dict->PropSet(TJS_MEMBERENSURE, TJS_W("screenWidth"), nullptr, &wv, dict);
-    dict->PropSet(TJS_MEMBERENSURE, TJS_W("screenHeight"), nullptr, &hv, dict);
+    SetObjectProperty(dict, TJS_W("screenWidth"), tTJSVariant(width));
+    SetObjectProperty(dict, TJS_W("screenHeight"), tTJSVariant(height));
+    SetObjectProperty(dict, TJS_W("renderCount"), tTJSVariant(0));
 
-    SetObjectMethod(dict, TJS_W("entryUpdateObject"), ReturnTrueCb);
+    SetObjectMethod(dict, TJS_W("entryUpdateObject"), EntryUpdateObjectCb);
     SetObjectMethod(dict, TJS_W("setScreenSize"), ReturnTrueCb);
     SetObjectMethod(dict, TJS_W("makeCurrent"), ReturnTrueCb);
+    SetObjectMethod(dict, TJS_W("beginScene"), ReturnTrueCb);
     SetObjectMethod(dict, TJS_W("endScene"), ReturnTrueCb);
     SetObjectMethod(dict, TJS_W("finalize"), ReturnTrueCb);
+    SetObjectMethod(dict, TJS_W("render"), RenderCb);
+    SetObjectMethod(dict, TJS_W("glesEntry"), ReturnTrueCb);
+    SetObjectMethod(dict, TJS_W("glesRemove"), ReturnTrueCb);
     SetObjectMethod(dict, TJS_W("capture"), ReturnFirstArgOrTrueCb);
     SetObjectMethod(dict, TJS_W("captureScreen"), ReturnFirstArgOrTrueCb);
     SetObjectMethod(dict, TJS_W("glesCapture"), ReturnFirstArgOrTrueCb);
     SetObjectMethod(dict, TJS_W("glesCaptureScreen"), ReturnFirstArgOrTrueCb);
-    SetObjectMethod(dict, TJS_W("copyLayer"), ReturnTrueCb);
-    SetObjectMethod(dict, TJS_W("glesCopyLayer"), ReturnTrueCb);
-    SetObjectMethod(dict, TJS_W("drawLayer"), ReturnTrueCb);
-    SetObjectMethod(dict, TJS_W("drawAffine"), ReturnTrueCb);
-    SetObjectMethod(dict, TJS_W("drawAffineGLES"), ReturnTrueCb);
+    SetObjectMethod(dict, TJS_W("copyLayer"), CopyLayerCb);
+    SetObjectMethod(dict, TJS_W("glesCopyLayer"), CopyLayerCb);
+    SetObjectMethod(dict, TJS_W("drawLayer"), DrawLayerCb);
+    SetObjectMethod(dict, TJS_W("glesDrawLayer"), DrawLayerCb);
+    SetObjectMethod(dict, TJS_W("drawAffine"), DrawAffineCb);
+    SetObjectMethod(dict, TJS_W("drawAffineGLES"), DrawAffineCb);
     SetObjectMethod(dict, TJS_W("setMatrix"), ReturnTrueCb);
+    SetObjectMethod(dict, TJS_W("createModel"), CreateModelCb);
+    SetObjectMethod(dict, TJS_W("createMatrix"), CreateMatrixCb);
+    SetObjectMethod(dict, TJS_W("createDevice"), CreateDeviceCb);
 
     if(result) *result = tTJSVariant(dict, dict);
     dict->Release();
@@ -104,12 +268,29 @@ inline void ClearCachedModulesForDevice(void *device) {
 inline void EnsureWindowGLESAdaptor(tTVPDrawDevice *device) {
     if(!device) return;
     iTVPWindow *window = device->GetWindowInterface();
-    if(!window) return;
+    // Legacy KAGWindow keeps its GPU draw device in the script-level
+    // KAGWindowBase class property. That object is a valid draw device but is
+    // not the native Window draw-device slot, so it has no iTVPWindow owner.
+    // The main window is the corresponding presentation target for this
+    // compatibility path; use it only as an owner fallback. Native devices
+    // still take their exact per-window binding above.
+    if(!window) {
+        window = TVPMainWindow;
+        if(!window) return;
+    }
     iTJSDispatch2 *windowObj = window->GetWindowDispatch();
     if(!windowObj) return;
 
     tTJSVariant adaptor;
-    windowObj->PropGet(0, TJS_W("glesAdaptor"), nullptr, &adaptor, windowObj);
+    try {
+        windowObj->PropGet(0, TJS_W("glesAdaptor"), nullptr, &adaptor,
+                           windowObj);
+    } catch(...) {
+        windowObj->Release();
+        throw;
+    }
+    // GetWindowDispatch returns an owned reference.
+    windowObj->Release();
 }
 
 template<typename DeviceT>

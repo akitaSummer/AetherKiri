@@ -1,12 +1,9 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
-    REPO ffmpeg/ffmpeg
+    REPO FFmpeg/FFmpeg
     REF "n${VERSION}"
-    SHA512 c3b49fe521d3eb946c130a6ad2d199130483e7c01545e53acef316e4c923f768540057e2c0ce2655aaaafc55872e02f045fe59f5a477d1c5b8985ef14c6bd3df
-    PATCHES
-        0001-android-ffmpeg.patch
-        0001-operand-shr-error.patch
-        0001-fixed-mac.patch
+    SHA512 c72f4062aecc16d8b2b1e8678d5efe3af4cfaa0cc7c0997052248f9e499e60c2463acf07877cf3b78b246ce3e8078cb043e8d97e90a6b50d06af32ff7369a788
+    HEAD_REF master
 )
 
 if(SOURCE_PATH MATCHES " ")
@@ -19,7 +16,7 @@ if (VCPKG_TARGET_ARCHITECTURE STREQUAL "x86" OR VCPKG_TARGET_ARCHITECTURE STREQU
     vcpkg_add_to_path("${NASM_EXE_PATH}")
 endif()
 
-set(OPTIONS "--enable-pic --disable-doc --enable-debug=3 --enable-runtime-cpudetect")
+set(OPTIONS "--enable-pic --disable-doc --enable-debug=3 --enable-runtime-cpudetect --disable-autodetect --enable-iconv")
 
 if(VCPKG_TARGET_IS_MINGW)
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x86")
@@ -37,6 +34,8 @@ elseif(VCPKG_TARGET_IS_OSX)
     string(APPEND OPTIONS " --target-os=darwin --enable-audiotoolbox --enable-videotoolbox")
 elseif(VCPKG_TARGET_IS_IOS)
     string(APPEND OPTIONS " --target-os=darwin --enable-videotoolbox")
+elseif(VCPKG_CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    string(APPEND OPTIONS " --target-os=none --disable-asm --disable-pthreads --disable-runtime-cpudetect --disable-xlib")
 elseif(VCPKG_CMAKE_SYSTEM_NAME STREQUAL "Android")
     string(APPEND OPTIONS " --target-os=android --enable-jni --enable-mediacodec")
 elseif(VCPKG_CMAKE_SYSTEM_NAME STREQUAL "QNX")
@@ -72,7 +71,26 @@ if(VCPKG_DETECTED_CMAKE_C_COMPILER)
     get_filename_component(CC_filename "${VCPKG_DETECTED_CMAKE_C_COMPILER}" NAME)
     set(ENV{CC} "${CC_filename}")
     string(APPEND OPTIONS " --cc=${CC_filename}")
-    string(APPEND OPTIONS " --host_cc=${CC_filename}")
+    if(VCPKG_CMAKE_SYSTEM_NAME STREQUAL "Android")
+        if(VCPKG_HOST_IS_OSX)
+            set(FFMPEG_HOST_CC "/usr/bin/clang")
+            if(NOT EXISTS "${FFMPEG_HOST_CC}")
+                message(FATAL_ERROR
+                    "Unable to locate the macOS host compiler for FFmpeg")
+            endif()
+        else()
+            find_program(FFMPEG_HOST_CC
+                NAMES cc gcc clang
+                NO_CMAKE_FIND_ROOT_PATH)
+            if(NOT FFMPEG_HOST_CC)
+                message(FATAL_ERROR
+                    "Unable to locate the host C compiler for FFmpeg")
+            endif()
+        endif()
+        string(APPEND OPTIONS " --host_cc=\"${FFMPEG_HOST_CC}\"")
+    else()
+        string(APPEND OPTIONS " --host_cc=${CC_filename}")
+    endif()
     list(APPEND prog_env "${CC_path}")
 endif()
 
@@ -261,6 +279,10 @@ if (VCPKG_TARGET_IS_IOS)
     endif ()
     set(OPTIONS "${OPTIONS} --extra-cflags=-isysroot\"${vcpkg_osx_sysroot}\"")
     set(OPTIONS "${OPTIONS} --extra-ldflags=-isysroot\"${vcpkg_osx_sysroot}\"")
+endif ()
+
+if (VCPKG_TARGET_IS_IOS AND VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
+    set(OPTIONS "${OPTIONS} --disable-x86asm")
 endif ()
 
 set(OPTIONS_DEBUG "--disable-optimizations --disable-stripping")

@@ -11,8 +11,13 @@
 #include "tjsCommHead.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <cctype>
 #include <stdexcept>
 #include <memory>
+#include <mutex>
+#include <string>
 #include "StorageIntf.h"
 #include "tjsUtils.h"
 #include "MsgIntf.h"
@@ -23,10 +28,259 @@
 #include "XP3Archive.h"
 #include "TickCount.h"
 #include "ncbind.hpp"
+#include "UtilStreams.h"
+#include "impl/ArchiveAutoPathOrder.h"
+#include "impl/GpuCompatScript.h"
+#include "spdlog/spdlog.h"
 
 #define TVP_DEFAULT_ARCHIVE_CACHE_NUM 128
 #define TVP_DEFAULT_AUTOPATH_CACHE_NUM 256
+static constexpr tjs_int TVP_MAX_STORAGE_NAME_LENGTH = 1 << 20;
 static const tjs_char *TVP_AUTOPATH_CACHE_MISS_MARKER = TJS_W("\x01");
+static const char TVP_GFX_EFFECT_COMPAT_SCRIPT[] =
+    "// AetherKiri gfxEffect.dll compatibility placeholder.\n"
+    "try { Plugins.link(\"gfxEffect.dll\"); } catch(e) { }\n";
+static const char TVP_D3DEMOTE_COMPAT_PREFIX[] =
+    "// AetherKiri D3DEmote/motion.tjs compatibility bridge.\n"
+    "try { Plugins.link(\"emoteplayer.dll\"); } catch(e) { }\n";
+static const char TVP_LOGWINDOW_COMPAT_SCRIPT[] = R"TJS(
+// AetherKiri KAGEX LogWindow.tjs compatibility bridge.
+class LogWindowPad extends Pad {
+    function LogWindowPad(owner, action, maxline = 300, caption = "KAGEX log") {
+        super.Pad();
+
+        this.owner = owner;
+        this.action = action;
+        this.maxline = maxline;
+
+        borderStyle = bsSizeToolWin;
+        color = 0;
+        fontColor = 0xFFFFFF;
+        fontFace = "monospace";
+        readOnly = false;
+        wordWrap = true;
+        showScrollBars = ssVertical;
+        height = 10;
+        title = caption;
+        clear();
+
+        trigger = new AsyncTrigger(updateText, '');
+        with (trigger) .mode = atmAtIdle, .cached = true;
+    }
+
+    function finalize() {
+        if (!isvalid this) return;
+        invalidate trigger if (trigger);
+        trigger = void;
+        super.finalize(...);
+    }
+
+    function clear() {
+        lines.clear();
+        text = "";
+        clearNext = false;
+        statusText = "latest log first";
+    }
+
+    function setPos(x, y, w, h) {
+        left = x if (x !== void);
+        top = y if (y !== void);
+        setSize(w, h);
+    }
+
+    function setSize(w, h) {
+        width = w if (w !== void);
+        height = h if (h !== void);
+    }
+
+    var owner, action;
+    var trigger;
+    var maxline, lines = [], clearNext;
+
+    function onClose() {
+        if (!isvalid this) return;
+        invokeOwnerAction("closed");
+    }
+
+    function invokeOwnerAction(message, *) {
+        if (!isvalid owner) return;
+        if (typeof owner[action] == "Object") {
+            return owner[action](message, *);
+        }
+    }
+
+    function showResults(blocks*) {
+        var all = [];
+        for (var i = 0; i < blocks.count; i++) {
+            all.add(blocks[i].join("\n")) if (blocks[i] !== void);
+        }
+        text = all.join("\n\n");
+        statusText = "output";
+        clearNext = true;
+    }
+
+    function print(shortmsg, fullmsg = void, tag = void) {
+        clear() if (clearNext);
+        lines.unshift(shortmsg);
+        while (lines.count > maxline) lines.pop();
+        if (trigger) trigger.trigger();
+        else updateText();
+    }
+
+    function updateText() {
+        if (!isvalid this) return;
+        text = lines.join("\n");
+    }
+}
+
+&global.LogWindow = LogWindowPad;
+)TJS";
+extern const unsigned char kAetherKiriD3DEmoteTjs[];
+extern const std::size_t kAetherKiriD3DEmoteTjsSize;
+static tTJSVariant TVPStoragesArchiveUniqueKeyCompat;
+
+namespace {
+bool TVPSaveTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_SAVE_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+bool TVPStorageTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_STORAGE_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+bool TVPStorageTraceName(const ttstr &name) {
+    std::string text = name.AsStdString();
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    if(const char *match = std::getenv("AETHERKIRI_STORAGE_TRACE_MATCH")) {
+        std::string filters(match);
+        std::transform(filters.begin(), filters.end(), filters.begin(),
+                       [](unsigned char ch) {
+                           return static_cast<char>(std::tolower(ch));
+                       });
+        size_t pos = 0;
+        while(pos <= filters.size()) {
+            size_t comma = filters.find(',', pos);
+            std::string token = filters.substr(
+                pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            token.erase(0, token.find_first_not_of(" \t\r\n"));
+            size_t end = token.find_last_not_of(" \t\r\n");
+            if(end != std::string::npos)
+                token.erase(end + 1);
+            else
+                token.clear();
+            if(!token.empty() && text.find(token) != std::string::npos)
+                return true;
+            if(comma == std::string::npos)
+                break;
+            pos = comma + 1;
+        }
+    }
+    return text.find(".pbd") != std::string::npos ||
+        text.find("patch2.xp3") != std::string::npos ||
+        text.find("aaemo") != std::string::npos ||
+        text.find("motion.tjs") != std::string::npos ||
+        text.find("d3demote.tjs") != std::string::npos ||
+        text.find("logwindow.tjs") != std::string::npos;
+}
+
+bool TVPIsSplitEmoteVirtualStorage(const ttstr &name) {
+    std::string storage = TVPExtractStorageName(name).AsStdString();
+    if(storage.empty()) {
+        storage = name.AsStdString();
+        const auto slash = storage.find_last_of("/\\");
+        if(slash != std::string::npos) {
+            storage = storage.substr(slash + 1);
+        }
+    }
+    std::transform(storage.begin(), storage.end(), storage.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    if(storage.rfind("dx_", 0) == 0) {
+        storage = storage.substr(3);
+    }
+
+    const auto stripSuffix = [](std::string &value,
+                                const std::string &suffix) {
+        if(value.size() < suffix.size() ||
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) !=
+               0) {
+            return false;
+        }
+        value.resize(value.size() - suffix.size());
+        return true;
+    };
+    if(!stripSuffix(storage, ".mtn") && !stripSuffix(storage, ".psb")) {
+        stripSuffix(storage, ".mt");
+    }
+    return storage.size() > 3 &&
+        storage.compare(storage.size() - 3, 3, "emo") == 0;
+}
+
+// AffineSourceVector treats solid_<colour>.emf/.wmf as virtual vector images.
+// They deliberately have no archive entry; the layerExDraw backend
+// materialises the solid ARGB source when GdiPlus.Image.load() is called.
+// Advertising only the supported naming protocol here lets KAG's normal
+// getExistImageName() path select the vector source without pretending that
+// arbitrary missing EMF/WMF files exist.
+bool TVPIsVirtualSolidVectorStorageImpl(const ttstr &name) {
+    std::string storage = TVPExtractStorageName(name).AsStdString();
+    if(storage.empty()) {
+        storage = name.AsStdString();
+        const auto slash = storage.find_last_of("/\\");
+        if(slash != std::string::npos) {
+            storage = storage.substr(slash + 1);
+        }
+    }
+    std::transform(storage.begin(), storage.end(), storage.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+
+    const auto dot = storage.find_last_of('.');
+    if(dot == std::string::npos) {
+        return false;
+    }
+    const std::string ext = storage.substr(dot);
+    if(ext != ".emf" && ext != ".wmf") {
+        return false;
+    }
+    storage.resize(dot);
+    constexpr const char prefix[] = "solid_";
+    if(storage.rfind(prefix, 0) != 0 || storage.size() <= sizeof(prefix) - 1) {
+        return false;
+    }
+
+    std::string token = storage.substr(sizeof(prefix) - 1);
+    if(token == "black" || token == "white" || token == "transparent") {
+        return true;
+    }
+    if(!token.empty() && token.front() == '#') {
+        token.erase(token.begin());
+    } else if(token.size() > 2 && token[0] == '0' && token[1] == 'x') {
+        token.erase(0, 2);
+    }
+    return (token.size() == 6 || token.size() == 8) &&
+        std::all_of(token.begin(), token.end(), [](unsigned char ch) {
+            return std::isxdigit(ch) != 0;
+        });
+}
+} // namespace
+
+bool TVPIsVirtualSolidVectorStorage(const ttstr &name) {
+    return TVPIsVirtualSolidVectorStorageImpl(name);
+}
 
 //---------------------------------------------------------------------------
 // global variables
@@ -42,6 +296,230 @@ tjs_char TVPArchiveDelimiter = '>';
 // statics
 //---------------------------------------------------------------------------
 static tTJSStaticCriticalSection TVPCreateStreamCS;
+
+// Private plug-ins can publish a logical-storage resolver without making the
+// public storage layer know any game-specific filenames. Keep the callback
+// list here so placement and stream opening observe the same result. A
+// recursion guard lets a resolver probe a concrete candidate through the
+// normal storage APIs safely.
+static std::mutex TVPStorageResolverMutex;
+static std::vector<tTVPStorageResolver> TVPStorageResolvers;
+static thread_local unsigned int TVPStorageResolverDepth = 0;
+
+static bool TVPResolveStorageName(const ttstr &requested, ttstr &resolved) {
+    if(requested.IsEmpty() || TVPStorageResolverDepth != 0)
+        return false;
+
+    std::vector<tTVPStorageResolver> resolvers;
+    {
+        std::lock_guard<std::mutex> lock(TVPStorageResolverMutex);
+        resolvers = TVPStorageResolvers;
+    }
+
+    if(TVPStorageTraceEnabled() && TVPStorageTraceName(requested) &&
+       requested.AsStdString().find("__pack") != std::string::npos) {
+        spdlog::info("StorageTrace resolver-attempt request={} count={}",
+                     requested.AsStdString(), resolvers.size());
+    }
+
+    ++TVPStorageResolverDepth;
+    for(const auto resolver : resolvers) {
+        if(resolver == nullptr)
+            continue;
+        ttstr candidate;
+        bool handled = false;
+        try {
+            handled = resolver(requested, candidate);
+        } catch(...) {
+            // A compatibility resolver must not make ordinary storage lookup
+            // fail. Its own diagnostic, if any, remains in the plugin log.
+            handled = false;
+        }
+        if(handled && !candidate.IsEmpty() && candidate != requested) {
+            resolved = candidate;
+            --TVPStorageResolverDepth;
+            return true;
+        }
+    }
+    --TVPStorageResolverDepth;
+    return false;
+}
+
+void TVPRegisterStorageResolver(tTVPStorageResolver resolver) {
+    if(resolver == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(TVPStorageResolverMutex);
+    if(std::find(TVPStorageResolvers.begin(), TVPStorageResolvers.end(),
+                 resolver) == TVPStorageResolvers.end())
+        TVPStorageResolvers.push_back(resolver);
+}
+
+void TVPUnregisterStorageResolver(tTVPStorageResolver resolver) {
+    if(resolver == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(TVPStorageResolverMutex);
+    TVPStorageResolvers.erase(
+        std::remove(TVPStorageResolvers.begin(), TVPStorageResolvers.end(),
+                    resolver),
+        TVPStorageResolvers.end());
+}
+//---------------------------------------------------------------------------
+
+static bool TVPIsGfxEffectCompanionScript(const ttstr &name) {
+    ttstr storage = TVPExtractStorageName(name).AsLowerCase();
+    return (storage == TJS_W("gfx_fire.tjs") ||
+            storage == TJS_W("gfx_flash.tjs")) &&
+           (TVPRegisteredPlugins.find(TJS_W("gfxeffect.dll")) !=
+                TVPRegisteredPlugins.end() ||
+            TVPRegisteredPlugins.find(TJS_W("gfxfire.dll")) !=
+                TVPRegisteredPlugins.end() ||
+            ncbAutoRegister::HasModule(TJS_W("gfxeffect.dll")) ||
+            ncbAutoRegister::HasModule(TJS_W("gfxfire.dll")));
+}
+
+static bool TVPIsGpuCompanionScript(const ttstr &name) {
+    ttstr storage = TVPExtractStorageName(name).AsLowerCase();
+    return storage == TJS_W("gpulayer.tjs") ||
+           storage == TJS_W("gpuaffinelayer.tjs") ||
+           storage == TJS_W("d3d.tjs") ||
+           storage == TJS_W("d3daffinesource.tjs") ||
+           storage == TJS_W("d3daffinesourcepicture.tjs") ||
+           storage == TJS_W("d3daffinesourceimage.tjs") ||
+           storage == TJS_W("d3daffinesourcemotion.tjs") ||
+           storage == TJS_W("d3daffinesourcelive2d.tjs") ||
+           storage == TJS_W("d3daffinesourceemote.tjs") ||
+           storage == TJS_W("affinesourcelive2d.tjs") ||
+           storage == TJS_W("live2d.tjs");
+}
+
+static bool TVPIsD3DEmoteCompanionScript(const ttstr &name) {
+    ttstr storage = TVPExtractStorageName(name).AsLowerCase();
+    return storage == TJS_W("motion.tjs") ||
+           storage == TJS_W("d3demote.tjs");
+}
+
+static bool TVPIsLogWindowCompanionScript(const ttstr &name) {
+    ttstr storage = TVPExtractStorageName(name).AsLowerCase();
+    return storage == TJS_W("logwindow.tjs");
+}
+
+static tTJSBinaryStream *TVPOpenGfxEffectCompanionScript() {
+    return new tTVPMemoryStream(
+        TVP_GFX_EFFECT_COMPAT_SCRIPT,
+        static_cast<tjs_uint>(sizeof(TVP_GFX_EFFECT_COMPAT_SCRIPT) - 1));
+}
+
+static tTJSBinaryStream *TVPOpenGpuCompanionScript() {
+    return new tTVPMemoryStream(
+        TVP_GPU_COMPAT_SCRIPT,
+        static_cast<tjs_uint>(sizeof(TVP_GPU_COMPAT_SCRIPT) - 1));
+}
+
+static tTJSBinaryStream *TVPOpenLogWindowCompanionScript() {
+    return new tTVPMemoryStream(
+        TVP_LOGWINDOW_COMPAT_SCRIPT,
+        static_cast<tjs_uint>(sizeof(TVP_LOGWINDOW_COMPAT_SCRIPT) - 1));
+}
+
+static tTJSBinaryStream *TVPOpenD3DEmoteCompanionScript() {
+    auto *stream = new tTVPMemoryStream();
+    try {
+        stream->Write(TVP_D3DEMOTE_COMPAT_PREFIX,
+                      static_cast<tjs_uint>(
+                          sizeof(TVP_D3DEMOTE_COMPAT_PREFIX) - 1));
+        stream->Write(kAetherKiriD3DEmoteTjs,
+                      static_cast<tjs_uint>(kAetherKiriD3DEmoteTjsSize));
+        stream->Seek(0, TJS_BS_SEEK_SET);
+        return stream;
+    } catch(...) {
+        delete stream;
+        throw;
+    }
+}
+
+static bool TVPIsRealStorageNoSearchNoNormalize(const ttstr &name);
+
+static bool TVPGetMotionParameterCompanionInfo(const ttstr &name,
+                                               ttstr *sourceName) {
+    std::string storage = TVPExtractStorageName(name).AsStdString();
+    if(storage.empty()) {
+        storage = name.AsStdString();
+        const auto slash = storage.find_last_of("/\\");
+        if(slash != std::string::npos)
+            storage = storage.substr(slash + 1);
+    }
+
+    std::string lower = storage;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    if(lower.size() <= 11 || lower.rfind("motion_", 0) != 0 ||
+       lower.compare(lower.size() - 4, 4, ".tjs") != 0) {
+        return false;
+    }
+
+    std::string inner = storage.substr(7, storage.size() - 11);
+    std::string innerLower = lower.substr(7, lower.size() - 11);
+    const auto dot = innerLower.rfind('.');
+    if(dot == std::string::npos)
+        return false;
+    const std::string ext = innerLower.substr(dot);
+    if(ext != ".mtn" && ext != ".psb")
+        return false;
+
+    if(sourceName)
+        *sourceName = ttstr(inner.c_str());
+    return true;
+}
+
+static bool TVPIsUnprefixedD3DEmoteStorage(const ttstr &storageName) {
+    const ttstr lower = storageName.AsLowerCase();
+    if(lower.StartsWith(TJS_W("dx_")) ||
+       lower.StartsWith(TJS_W("dxlow_")) ||
+       lower.GetLen() <= 4) {
+        return false;
+    }
+    return lower.SubString(lower.GetLen() - 4, 4) == TJS_W(".psb");
+}
+
+static std::string TVPEscapeTJSStringLiteral(const std::string &value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for(unsigned char ch : value) {
+        switch(ch) {
+            case '\\': escaped += "\\\\"; break;
+            case '"': escaped += "\\\""; break;
+            case '\r': escaped += "\\r"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\t': escaped += "\\t"; break;
+            default: escaped.push_back(static_cast<char>(ch)); break;
+        }
+    }
+    return escaped;
+}
+
+static tTJSBinaryStream *TVPOpenMotionParameterCompanionScript(
+    const ttstr &sourceName) {
+    // KAG's world.tjs treats motion_<asset>.psb.tjs as an expression whose
+    // result describes the image source. Returning an empty dictionary makes
+    // checkAnimImageData() erase the original filename before it reaches
+    // MotionResourceManager. Preserve that filename so .PSB is routed to
+    // MotionAffineSourceLayer and, in turn, Motion.EmotePlayer.
+    const std::string script =
+        "%[\"storage\" => \"" +
+        TVPEscapeTJSStringLiteral(sourceName.AsStdString()) + "\"]";
+    auto *stream = new tTVPMemoryStream();
+    try {
+        stream->Write(script.data(), static_cast<tjs_uint>(script.size()));
+        stream->Seek(0, TJS_BS_SEEK_SET);
+        return stream;
+    } catch(...) {
+        delete stream;
+        throw;
+    }
+}
+
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
@@ -193,6 +671,10 @@ tTVPStorageMediaManager::tTVPStorageMediaManager() {
     iTVPStorageMedia *filemedia = TVPCreateFileMedia();
     Register(filemedia);
     filemedia->Release();
+
+    iTVPStorageMedia *arcmedia = TVPCreateArcMedia();
+    Register(arcmedia);
+    arcmedia->Release();
 }
 
 //---------------------------------------------------------------------------
@@ -253,6 +735,9 @@ ttstr tTVPStorageMediaManager::NormalizeStorageName(const ttstr &name,
     // empty check
     if(name.IsEmpty())
         return name; // empty name is empty name
+    if(name.GetLen() > TVP_MAX_STORAGE_NAME_LENGTH)
+        TVPThrowExceptionMessage(TVPInvalidPathName,
+                                 TJS_W("<storage path too long>"));
 
     // pre-normalize
     const tjs_char *pca; //, *pcb, *pcc;
@@ -495,6 +980,8 @@ ttstr tTVPStorageMediaManager::ExtractMediaName(const ttstr &name) {
 bool tTVPStorageMediaManager::CheckExistentStorage(const ttstr &name) {
     // gateway for CheckExistentStorage
     // name must not be an in-archive storage name
+    if(name.IsEmpty())
+        return false;
     tMediaRecord *rec = GetMediaRecord(name);
     return rec->MediaIntf.GetObjectNoAddRef()->CheckExistentStorage(
         rec->GetDomainAndPath(name));
@@ -779,21 +1266,12 @@ static tTVPAtExit TVPClearArchiveCacheAtExit(TVP_ATEXIT_PRI_SHUTDOWN,
                                              TVPClearArchiveCache);
 //---------------------------------------------------------------------------
 
-//---------------------------------------------------------------------------
-// TVPIsExistentStorageNoSearch
-//---------------------------------------------------------------------------
-bool TVPIsExistentStorageNoSearchNoNormalize(const ttstr &name) {
-    // does name contain > ?
-    tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
-
+static bool TVPIsRealStorageNoSearchNoNormalize(const ttstr &name) {
     const tjs_char *sharp_pos = TJS_strchr(name.c_str(), TVPArchiveDelimiter);
     if(sharp_pos) {
-        // this storagename indicates a file in an archive
-
         ttstr arcname(name, (int)(sharp_pos - name.c_str()));
 
-        tTVPArchive *arc;
-        arc = TVPArchiveCache.Get(arcname);
+        tTVPArchive *arc = TVPArchiveCache.Get(arcname);
         bool ret;
         try {
             ttstr in_arc_name(sharp_pos + 1);
@@ -808,6 +1286,24 @@ bool TVPIsExistentStorageNoSearchNoNormalize(const ttstr &name) {
     }
 
     return TVPStorageMediaManager.CheckExistentStorage(name);
+}
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// TVPIsExistentStorageNoSearch
+//---------------------------------------------------------------------------
+bool TVPIsExistentStorageNoSearchNoNormalize(const ttstr &name) {
+    // does name contain > ?
+    tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
+
+    if(TVPIsRealStorageNoSearchNoNormalize(name))
+        return true;
+
+    if(TVPIsGfxEffectCompanionScript(name))
+        return true;
+    if(TVPIsGpuCompanionScript(name))
+        return true;
+    return false;
 }
 
 //---------------------------------------------------------------------------
@@ -937,7 +1433,13 @@ extern ttstr TVPChopStorageExt(const ttstr &name) {
 //---------------------------------------------------------------------------
 // Auto search path support
 //---------------------------------------------------------------------------
-#define TVP_AUTO_PATH_HASH_SIZE 1024
+// Voice-heavy titles can mount millions of archive entries. With 1024
+// buckets, a first lookup for each new voice name walks a chain containing
+// thousands of entries and shows up as 30-40 ms in getExistVoice(). Keep the
+// existing ordered chained table, but size its bucket array so those lookups
+// remain effectively constant-time. The table nodes already dominate memory
+// at that scale; the larger bucket array adds only a few MiB.
+#define TVP_AUTO_PATH_HASH_SIZE 65536
 std::vector<ttstr> TVPAutoPathList;
 tTJSHashCache<ttstr, ttstr> TVPAutoPathCache(TVP_DEFAULT_AUTOPATH_CACHE_NUM);
 tTJSHashTable<ttstr, ttstr, tTJSHashFunc<ttstr>, TVP_AUTO_PATH_HASH_SIZE>
@@ -971,6 +1473,148 @@ struct tTVPClearAutoPathCacheCallback : public tTVPCompactEventCallbackIntf {
 
 static bool TVPClearAutoPathCacheCallbackInit = false;
 
+static bool TVPGetProjectRelativeAutoPath(const ttstr &path,
+                                          ttstr &relative) {
+    if(TVPProjectDir.IsEmpty() ||
+       TJS_strchr(path.c_str(), TVPArchiveDelimiter))
+        return false;
+
+    ttstr projectRoot = TVPNormalizeStorageName(
+        FixMissingPathDelimiter(TVPProjectDir));
+    if(path.GetLen() <= projectRoot.GetLen() ||
+       !path.StartsWith(projectRoot))
+        return false;
+
+    relative = path.SubString(projectRoot.GetLen(),
+                              path.GetLen() - projectRoot.GetLen());
+    if(relative.IsEmpty() ||
+       TJS_strchr(relative.c_str(), TVPArchiveDelimiter))
+        return false;
+
+    tTVPArchive::NormalizeInArchiveStorageName(relative);
+    return !relative.IsEmpty();
+}
+
+static bool TVPArchiveAutoPathMatches(const ttstr &path,
+                                      const ttstr &relative) {
+    return TVPArchiveAutoPathDirectoryMatches(
+        std::u16string_view(
+            reinterpret_cast<const char16_t *>(path.c_str()),
+            static_cast<size_t>(path.GetLen())),
+        std::u16string_view(
+            reinterpret_cast<const char16_t *>(relative.c_str()),
+            static_cast<size_t>(relative.GetLen())),
+        static_cast<char16_t>(TVPArchiveDelimiter));
+}
+
+static ttstr TVPFindExactArchiveAutoPath(const ttstr &normalized) {
+    ttstr relative;
+    if(!TVPGetProjectRelativeAutoPath(normalized, relative))
+        return {};
+
+    const ttstr relativeDirectory = TVPExtractStoragePath(relative);
+    if(relativeDirectory.IsEmpty())
+        return {};
+
+    const ttstr storageName = TVPExtractStorageName(relative);
+    // Auto paths use Kirikiri's last-added-path-wins ordering.  Preserve it
+    // while restricting candidates to the directory explicitly requested by
+    // the script.
+    for(auto it = TVPAutoPathList.rbegin(); it != TVPAutoPathList.rend();
+        ++it) {
+        if(!TVPArchiveAutoPathMatches(*it, relativeDirectory))
+            continue;
+        const ttstr candidate = *it + storageName;
+        if(TVPIsRealStorageNoSearchNoNormalize(candidate))
+            return candidate;
+    }
+    return {};
+}
+
+// Older KAG save screens stored their continue/quick-save/slot screenshots as
+// BMPs, while newer scripts may probe the same basename with a JPG suffix.
+// Keep this compatibility rule at storage resolution so an existence probe
+// and the subsequent graphic load observe the same legacy file.  The
+// basename and savedata directory checks are deliberately narrow; ordinary
+// game resources must retain the normal explicit-extension semantics.
+static bool TVPStorageNameLooksLegacySaveThumbnail(const ttstr &name) {
+    const ttstr file_name = TVPExtractStorageName(name);
+    std::string file = TVPChopStorageExt(file_name).AsStdString();
+    std::transform(file.begin(), file.end(), file.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+
+    bool known_save_name = file == "data_continue";
+    if(!known_save_name && file.rfind("data_quick_", 0) == 0) {
+        const std::string slot = file.substr(std::strlen("data_quick_"));
+        known_save_name = !slot.empty() &&
+            std::all_of(slot.begin(), slot.end(),
+                        [](unsigned char ch) { return std::isdigit(ch); });
+    }
+    if(!known_save_name && file.rfind("data_", 0) == 0) {
+        const std::size_t separator = file.find('_', 5);
+        if(separator > 5 && separator + 1 < file.size()) {
+            const std::string save = file.substr(5, separator - 5);
+            const std::string slot = file.substr(separator + 1);
+            known_save_name =
+                std::all_of(save.begin(), save.end(),
+                            [](unsigned char ch) { return std::isdigit(ch); }) &&
+                std::all_of(slot.begin(), slot.end(),
+                            [](unsigned char ch) { return std::isdigit(ch); });
+        }
+    }
+    if(!known_save_name)
+        return false;
+
+    std::string path = TVPExtractStoragePath(name).AsStdString();
+    std::transform(path.begin(), path.end(), path.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return path.find("savedata") != std::string::npos;
+}
+
+ttstr TVPFindLegacySaveThumbnail(const ttstr &name) {
+    if(!TVPStorageNameLooksLegacySaveThumbnail(name))
+        return {};
+
+    const ttstr normalized = TVPNormalizeStorageName(name);
+
+    const ttstr ext = TVPExtractStorageExt(normalized);
+    if(ext.IsEmpty())
+        return {}; // extensionless requests already use graphic guessing
+
+    static constexpr const char *raster_extensions[] = {
+        ".bmp",  ".jpg",  ".jpeg", ".png",  ".tlg",  ".tlg5", ".tlg6",
+        ".webp", ".jxr",  ".bpg",  ".pvr",  ".jif",  ".dib",  ".amv",
+    };
+    std::string requested_ext = ext.AsStdString();
+    std::transform(requested_ext.begin(), requested_ext.end(),
+                   requested_ext.begin(), [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    bool known_raster = false;
+    for(const char *candidate : raster_extensions) {
+        if(requested_ext == candidate) {
+            known_raster = true;
+            break;
+        }
+    }
+    if(!known_raster)
+        return {}; // never alias a save-state or metadata file to an image
+
+    const ttstr stem = TVPChopStorageExt(normalized);
+    for(const char *extension : raster_extensions) {
+        const ttstr candidate = stem + ttstr(extension);
+        if(candidate == normalized ||
+           !TVPIsRealStorageNoSearchNoNormalize(candidate))
+            continue;
+        return candidate;
+    }
+    return {};
+}
+
 //---------------------------------------------------------------------------
 void TVPAddAutoPath(const ttstr &name) {
     tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
@@ -978,10 +1622,39 @@ void TVPAddAutoPath(const ttstr &name) {
     ttstr fixedName = FixMissingPathDelimiter(name);
     ttstr normalized = TVPNormalizeStorageName(fixedName);
 
+    // Sibling XP3 archives are mounted before startup.tjs runs. When a game
+    // later adds a project-relative search path such as system/ or main/,
+    // mirror that ordering onto matching directories inside those archives.
+    // This preserves Kirikiri's last-added-path-wins behavior while keeping
+    // loose project files above their archived counterparts.
+    std::vector<ttstr> archivedPeers;
+    ttstr relative;
+    if(TVPGetProjectRelativeAutoPath(normalized, relative)) {
+        for(auto it = TVPAutoPathList.begin(); it != TVPAutoPathList.end();) {
+            if(TVPArchiveAutoPathMatches(*it, relative)) {
+                archivedPeers.push_back(*it);
+                it = TVPAutoPathList.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     auto i =
         std::find(TVPAutoPathList.begin(), TVPAutoPathList.end(), normalized);
-    if(i == TVPAutoPathList.end())
-        TVPAutoPathList.push_back(normalized);
+    const bool moved = i != TVPAutoPathList.end();
+    if(moved)
+        TVPAutoPathList.erase(i);
+    TVPAutoPathList.insert(TVPAutoPathList.end(), archivedPeers.begin(),
+                           archivedPeers.end());
+    TVPAutoPathList.push_back(normalized);
+
+    if(TVPStorageTraceEnabled() && TVPStorageTraceName(normalized)) {
+        spdlog::info(
+            "StorageTrace addAutoPath request={} normalized={} moved={} archive_peers={} count={}",
+            name.AsStdString(), normalized.AsStdString(), moved,
+            archivedPeers.size(), TVPAutoPathList.size());
+    }
 
     TVPClearAutoPathCache();
 }
@@ -1006,6 +1679,18 @@ static tjs_uint TVPRebuildAutoPathTable() {
     // rebuild auto path table
     if(AutoPathTableInit)
         return 0;
+
+    // Storage probes may be triggered by log callbacks while building this
+    // table. Let the nested lookup use entries collected so far rather than
+    // recursively clearing and rebuilding the same table.
+    static thread_local bool rebuilding = false;
+    if(rebuilding)
+        return 0;
+    rebuilding = true;
+    struct tRebuildGuard {
+        bool &active;
+        ~tRebuildGuard() { active = false; }
+    } guard{ rebuilding };
 
     tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
 
@@ -1047,12 +1732,20 @@ static tjs_uint TVPRebuildAutoPathTable() {
                 if(i != -1) {
                     for(; i < (tjs_int)storagecount; i++) {
                         ttstr name = arc->GetName(i);
+                        tTVPArchive::NormalizeInArchiveStorageName(name);
 
                         if(name.StartsWith(in_arc_name)) {
                             if(!TJS_strchr(name.c_str() + in_arc_name_len,
                                            TJS_W('/'))) {
                                 ttstr sname = TVPExtractStorageName(name);
                                 TVPAutoPathTable.Add(sname, path);
+                                if(TVPStorageTraceEnabled() &&
+                                   TVPStorageTraceName(sname)) {
+                                    spdlog::info(
+                                        "StorageTrace table archive short={} path={} full={}",
+                                        sname.AsStdString(), path.AsStdString(),
+                                        name.AsStdString());
+                                }
                                 count++;
                             }
                         } else {
@@ -1077,6 +1770,10 @@ static tjs_uint TVPRebuildAutoPathTable() {
             TVPStorageMediaManager.GetListAt(path, &lister);
             for(auto &i : lister.list) {
                 TVPAutoPathTable.Add(i, path);
+                if(TVPStorageTraceEnabled() && TVPStorageTraceName(i)) {
+                    spdlog::info("StorageTrace table folder short={} path={}",
+                                 i.AsStdString(), path.AsStdString());
+                }
                 count++;
             }
         }
@@ -1130,22 +1827,139 @@ ttstr TVPGetPlacedPath(const ttstr &name) {
         }
     }
 
+    ttstr normalized(TVPNormalizeStorageName(name));
+
+    if(TVPIsSplitEmoteVirtualStorage(name)) {
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info("StorageTrace virtual split-emote request={} normalized={}",
+                         name.AsStdString(), normalized.AsStdString());
+        }
+        return normalized;
+    }
+
+    // Some Yuzusoft scripts probe motion_<asset>.psb.tjs via
+    // Storages.isExistentStorage() before Scripts.evalStorage(). Handle the
+    // virtual companion before consulting the auto path cache, otherwise the
+    // first failed physical lookup can poison the cache with a miss.
+    ttstr motionSourceName;
+    if(TVPGetMotionParameterCompanionInfo(name, &motionSourceName)) {
+        bool motionSourceExists = false;
+        ttstr sourceInSamePath = TVPExtractStoragePath(normalized) +
+            motionSourceName;
+        if(!sourceInSamePath.IsEmpty() &&
+           TVPIsRealStorageNoSearchNoNormalize(sourceInSamePath)) {
+            motionSourceExists = true;
+        } else {
+            TVPRebuildAutoPathTable();
+            motionSourceExists = TVPAutoPathTable.Find(motionSourceName) !=
+                nullptr;
+        }
+        if(motionSourceExists) {
+            TVPAutoPathCache.Add(name, normalized);
+            if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+                spdlog::info(
+                    "StorageTrace virtual motion-parameter request={} source={} normalized={}",
+                    name.AsStdString(), motionSourceName.AsStdString(),
+                    normalized.AsStdString());
+            }
+            return normalized;
+        }
+    }
+
+    // Consult a successful placement before invoking a resolver.  Apart from
+    // avoiding duplicate archive probes, this is required for stream opens:
+    // _TVPCreateStream holds TVPCreateStreamCS while asking for the placed
+    // path, and a resolver's exact-storage probe takes that same lock.
+    // Re-entering the resolver for an already-cached virtual URI would
+    // deadlock the engine at the first CSV read.
     ttstr *incache = TVPAutoPathCache.FindAndTouch(name);
     if(incache) {
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info("StorageTrace cache request={} result={}",
+                         name.AsStdString(), incache->AsStdString());
+        }
         if(*incache == TVP_AUTOPATH_CACHE_MISS_MARKER)
             return {};
         return *incache; // found in cache
     }
 
+    // Give private compatibility plug-ins one chance to translate a logical
+    // storage name (for example a PackinOne virtual UI atlas) to a concrete
+    // archive entry. A successful resolver result is cached above, so later
+    // placement/stream calls remain lock-safe.
+    ttstr resolved;
+    if(TVPResolveStorageName(name, resolved)) {
+        // A resolver may return a fully-qualified virtual URI backed by a
+        // registered storage media.  Do not recursively place that URI: the
+        // media has already provided the concrete target, and asking the
+        // resolver chain to place it again can re-enter the same existence
+        // probe while the caller is opening the stream.
+        const std::string resolvedName = resolved.AsStdString();
+        if(resolvedName.rfind("aetherui://", 0) == 0) {
+            TVPAutoPathCache.Add(name, resolved);
+            if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+                spdlog::info(
+                    "StorageTrace resolver virtual request={} resolved={}",
+                    name.AsStdString(), resolved.AsStdString());
+            }
+            return resolved;
+        }
+        ttstr placed = TVPGetPlacedPath(resolved);
+        if(!placed.IsEmpty()) {
+            TVPAutoPathCache.Add(name, placed);
+            if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+                spdlog::info(
+                    "StorageTrace resolver request={} resolved={} placed={}",
+                    name.AsStdString(), resolved.AsStdString(),
+                    placed.AsStdString());
+            }
+            return placed;
+        }
+    }
+
     tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
 
-    ttstr normalized(TVPNormalizeStorageName(name));
-
-    bool found = TVPIsExistentStorageNoSearchNoNormalize(normalized);
+    bool found = TVPIsRealStorageNoSearchNoNormalize(normalized);
     if(found) {
         // found in current folder
         TVPAutoPathCache.Add(name, normalized);
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info("StorageTrace direct request={} normalized={}",
+                         name.AsStdString(), normalized.AsStdString());
+        }
         return normalized;
+    }
+
+    // Preserve the old save-thumbnail convention when a script explicitly
+    // asks for a missing raster suffix (for example data_quick_01.jpg) but
+    // only the same-stem BMP is present in savedata/. This must happen before
+    // the normal auto-path miss is cached, otherwise the failed JPG probe
+    // would prevent the legacy candidate from being considered later.
+    if(ttstr legacy = TVPFindLegacySaveThumbnail(normalized);
+       !legacy.IsEmpty()) {
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info(
+                "StorageTrace legacy save thumbnail request={} resolved={}",
+                name.AsStdString(), legacy.AsStdString());
+        }
+        return legacy;
+    }
+
+    // A normalized project-relative path cannot be opened directly when the
+    // project is backed by a sibling XP3.  Before falling back to the legacy
+    // short-name auto-path table, try the same directory inside mounted
+    // archives.  This prevents identically named portrait/standing resources
+    // in different directories from shadowing one another.
+    if(ttstr exactArchivePath = TVPFindExactArchiveAutoPath(normalized);
+       !exactArchivePath.IsEmpty()) {
+        TVPAutoPathCache.Add(name, exactArchivePath);
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info(
+                "StorageTrace exact-archive request={} normalized={} found={}",
+                name.AsStdString(), normalized.AsStdString(),
+                exactArchivePath.AsStdString());
+        }
+        return exactArchivePath;
     }
 
     // not found in current folder
@@ -1159,15 +1973,90 @@ ttstr TVPGetPlacedPath(const ttstr &name) {
         // found in table
         ttstr found = *result + storagename;
         TVPAutoPathCache.Add(name, found);
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info(
+                "StorageTrace table-hit request={} short={} base={} found={}",
+                name.AsStdString(), storagename.AsStdString(),
+                result->AsStdString(), found.AsStdString());
+        }
         return found;
+    }
+
+    // Older E-mote scene scripts can route through AffineSourceMotion even
+    // though the package only contains the DirectX-exported PSB. Those
+    // scripts probe the logical, unprefixed name first and, when compiled to
+    // TJS bytecode, cannot be amended by the source-level compatibility
+    // patch. Match libgame's D3D resource lookup by resolving a missing
+    // <name>.psb to dx_<name>.psb (or the low-spec export), while preserving
+    // an actual unprefixed file when one exists.
+    if(TVPIsUnprefixedD3DEmoteStorage(storagename)) {
+        const ttstr storagePath = TVPExtractStoragePath(normalized);
+        const ttstr aliases[] = {
+            ttstr(TJS_W("dx_")) + storagename,
+            ttstr(TJS_W("dxlow_")) + storagename,
+        };
+        for(const auto &alias : aliases) {
+            ttstr found;
+            const ttstr inSamePath = storagePath + alias;
+            if(!inSamePath.IsEmpty() &&
+               TVPIsRealStorageNoSearchNoNormalize(inSamePath)) {
+                found = inSamePath;
+            } else if(ttstr *aliasPath = TVPAutoPathTable.Find(alias)) {
+                found = *aliasPath + alias;
+            }
+            if(found.IsEmpty()) {
+                continue;
+            }
+
+            TVPAutoPathCache.Add(name, found);
+            if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+                spdlog::info(
+                    "StorageTrace d3d-emote-alias request={} short={} "
+                    "alias={} found={}",
+                    name.AsStdString(), storagename.AsStdString(),
+                    alias.AsStdString(), found.AsStdString());
+            }
+            return found;
+        }
+    }
+
+    if(TVPIsD3DEmoteCompanionScript(name) ||
+       TVPIsLogWindowCompanionScript(name) ||
+       TVPIsGfxEffectCompanionScript(name) || TVPIsGpuCompanionScript(name))
+        return normalized;
+
+    motionSourceName.Clear();
+    if(TVPGetMotionParameterCompanionInfo(name, &motionSourceName)) {
+        bool motionSourceExists = false;
+        ttstr sourceInSamePath = TVPExtractStoragePath(normalized) +
+            motionSourceName;
+        if(!sourceInSamePath.IsEmpty() &&
+           TVPIsRealStorageNoSearchNoNormalize(sourceInSamePath)) {
+            motionSourceExists = true;
+        } else {
+            motionSourceExists = TVPAutoPathTable.Find(motionSourceName) !=
+                nullptr;
+        }
+        if(motionSourceExists) {
+            TVPAutoPathCache.Add(name, normalized);
+            if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+                spdlog::info(
+                    "StorageTrace virtual motion-parameter request={} source={} normalized={}",
+                    name.AsStdString(), motionSourceName.AsStdString(),
+                    normalized.AsStdString());
+            }
+            return normalized;
+        }
     }
 
     // not found
     TVPAutoPathCache.Add(name, TVP_AUTOPATH_CACHE_MISS_MARKER);
+    if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+        spdlog::info("StorageTrace miss request={} short={}",
+                     name.AsStdString(), storagename.AsStdString());
+    }
     return {};
 }
-//---------------------------------------------------------------------------
-
 //---------------------------------------------------------------------------
 // TVPSearchPlacedPath
 //---------------------------------------------------------------------------
@@ -1183,7 +2072,16 @@ ttstr TVPSearchPlacedPath(const ttstr &name) {
 // TVPIsExistentStorage
 //---------------------------------------------------------------------------
 bool TVPIsExistentStorage(const ttstr &name) {
+    if(TVPIsVirtualSolidVectorStorage(name)) {
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info("StorageTrace virtual solid-vector exists request={}",
+                         name.AsStdString());
+        }
+        return true;
+    }
     if(!TVPGetPlacedPath(name).IsEmpty())
+        return true;
+    if(TVPIsSplitEmoteVirtualStorage(name))
         return true;
     ttstr pure = TVPExtractStorageName(name);
     if(pure.GetLen() > 4) {
@@ -1228,20 +2126,85 @@ bool TVPIsExistentStorage(const ttstr &name) {
 //---------------------------------------------------------------------------
 static tTJSBinaryStream *_TVPCreateStream(const ttstr &_name,
                                           tjs_uint32 flags) {
-    tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
+    if(std::getenv("AETHERKIRI_STORAGE_TRACE") != nullptr &&
+       TVPStorageTraceName(_name) &&
+       _name.AsStdString().find("afterstory") != std::string::npos)
+        spdlog::info("StorageTrace create-stream afterstory request={} flags={}",
+                     _name.AsStdString(), flags);
+
+    if(std::getenv("AETHERKIRI_STORAGE_TRACE") != nullptr &&
+       _name.AsStdString().find("langselect_auto.func") != std::string::npos)
+        spdlog::info("StorageTrace create-stream request={} flags={}",
+                     _name.AsStdString(), flags);
 
     ttstr name;
 
     tjs_uint32 access = flags & TJS_BS_ACCESS_MASK;
-    if(access == TJS_BS_WRITE)
+    if(access == TJS_BS_WRITE || access == TJS_BS_APPEND ||
+       access == TJS_BS_UPDATE)
         name = TVPNormalizeStorageName(_name);
     else
         name = TVPGetPlacedPath(_name); // file must exist
+
+    // Resolve the placed path before taking the stream lock.  Resolvers may
+    // perform exact-storage probes, and those probes use TVPCreateStreamCS;
+    // holding the lock across TVPGetPlacedPath therefore deadlocks the first
+    // uncached read of an ordinary archive entry (for example
+    // scnchartdata.tjs).  Keep the lock for the actual open/cache mutation
+    // below, after all resolver work has completed.
+    tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
+
+    if(std::getenv("AETHERKIRI_STORAGE_TRACE") != nullptr &&
+       _name.AsStdString().find("langselect_auto.func") != std::string::npos)
+        spdlog::info("StorageTrace create-stream placed={} access={}",
+                     name.AsStdString(), access);
+
+    if(TVPSaveTraceEnabled() && access != TJS_BS_READ) {
+        spdlog::info("SaveTrace TVPCreateStream request={} normalized={} flags={} access={}",
+                     _name.AsStdString(), name.AsStdString(), flags, access);
+    }
 
     if(name.IsEmpty()) {
         if(access >= 1)
             TVPRemoveFromStorageCache(_name);
         TVPThrowExceptionMessage(TVPCannotOpenStorage, _name);
+    }
+
+    if(std::getenv("AETHERKIRI_STORAGE_TRACE") != nullptr &&
+       _name.AsStdString().find("afterstory") != std::string::npos)
+        spdlog::info("StorageTrace create-stream afterstory placed={} access={}",
+                     name.AsStdString(), access);
+
+    if(access == TJS_BS_READ && TVPIsGfxEffectCompanionScript(name) &&
+       !TVPIsRealStorageNoSearchNoNormalize(name))
+        return TVPOpenGfxEffectCompanionScript();
+    if(access == TJS_BS_READ && TVPIsD3DEmoteCompanionScript(name) &&
+       !TVPIsRealStorageNoSearchNoNormalize(name))
+        return TVPOpenD3DEmoteCompanionScript();
+    if(access == TJS_BS_READ && TVPIsLogWindowCompanionScript(name) &&
+       !TVPIsRealStorageNoSearchNoNormalize(name))
+        return TVPOpenLogWindowCompanionScript();
+    if(access == TJS_BS_READ && TVPIsGpuCompanionScript(name) &&
+       !TVPIsRealStorageNoSearchNoNormalize(name))
+        return TVPOpenGpuCompanionScript();
+    if(access == TJS_BS_READ && TVPIsSplitEmoteVirtualStorage(name) &&
+       !TVPIsRealStorageNoSearchNoNormalize(name)) {
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info("StorageTrace open virtual split-emote: {}",
+                         name.AsStdString());
+        }
+        return new tTVPMemoryStream();
+    }
+    ttstr motionSourceName;
+    if(access == TJS_BS_READ &&
+       TVPGetMotionParameterCompanionInfo(name, &motionSourceName) &&
+       !TVPIsRealStorageNoSearchNoNormalize(name)) {
+        if(TVPStorageTraceEnabled() && TVPStorageTraceName(name)) {
+            spdlog::info(
+                "StorageTrace open virtual motion-parameter: {} source={}",
+                name.AsStdString(), motionSourceName.AsStdString());
+        }
+        return TVPOpenMotionParameterCompanionScript(motionSourceName);
     }
 
     // does name contain > ?
@@ -1251,15 +2214,28 @@ static tTJSBinaryStream *_TVPCreateStream(const ttstr &_name,
         if((flags & TJS_BS_ACCESS_MASK) != TJS_BS_READ)
             TVPThrowExceptionMessage(TVPCannotWriteToArchive);
 
+        const bool traceChartArchive =
+            std::getenv("AETHERKIRI_STORAGE_TRACE") != nullptr &&
+            name.AsStdString().find("scnchartdata.tjs") != std::string::npos;
+        if(traceChartArchive)
+            spdlog::info("StorageTrace archive-open begin name={}",
+                         name.AsStdString());
+
         ttstr arcname(name, (int)(sharp_pos - name.c_str()));
 
         tTVPArchive *arc;
         tTJSBinaryStream *stream;
         arc = TVPArchiveCache.Get(arcname);
+        if(traceChartArchive)
+            spdlog::info("StorageTrace archive-open cache-ready archive={}",
+                         arcname.AsStdString());
         try {
             ttstr in_arc_name(sharp_pos + 1);
             tTVPArchive::NormalizeInArchiveStorageName(in_arc_name);
             stream = arc->CreateStream(in_arc_name);
+            if(traceChartArchive)
+                spdlog::info("StorageTrace archive-open stream-ready entry={}",
+                             in_arc_name.AsStdString());
         } catch(...) {
             arc->Release();
             if(access >= 1)
@@ -1326,6 +2302,13 @@ void TVPClearStorageCaches() {
     TVPClearXP3SegmentCache();
     TVPClearAutoPathCache();
 }
+
+void TVPResetAutoPathsForGameSession() {
+    tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS);
+    TVPAutoPathList.clear();
+    TVPClearXP3SegmentCache();
+    TVPClearAutoPathCache();
+}
 //---------------------------------------------------------------------------
 
 void TVPSetAutoPathCacheMaxCount(tjs_uint max_count) {
@@ -1383,6 +2366,49 @@ return TJS_S_OK;
 }
 TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ addAutoPath)
 //----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ addAutoToolsPath) {
+    if(numparams < 1)
+        return TJS_E_BADPARAMCOUNT;
+
+    ttstr path = *param[0];
+    TVPAddAutoPath(path);
+
+    if(result)
+        result->Clear();
+
+    return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ addAutoToolsPath)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ addArchive) {
+    if(numparams < 1)
+        return TJS_E_BADPARAMCOUNT;
+
+    ttstr path = *param[0];
+    TVPAddAutoPath(path);
+
+    if(result)
+        result->Clear();
+
+    return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ addArchive)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ setDefaultPath) {
+    if(numparams < 1)
+        return TJS_E_BADPARAMCOUNT;
+
+    ttstr path = *param[0];
+    TVPAddAutoPath(path);
+    TVPSetCurrentDirectory(path);
+
+    if(result)
+        result->Clear();
+
+    return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ setDefaultPath)
+//----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ removeAutoPath) {
     if(numparams < 1)
         return TJS_E_BADPARAMCOUNT;
@@ -1436,6 +2462,42 @@ TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ isExistentStorage) {
     return TJS_S_OK;
 }
 TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ isExistentStorage)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ isExistentStorageNoSearchNoNormalize) {
+    if(numparams < 1)
+        return TJS_E_BADPARAMCOUNT;
+
+    ttstr path = *param[0];
+
+    if(result)
+        *result =
+            (tjs_int)TVPIsExistentStorageNoSearchNoNormalize(path);
+
+    return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ isExistentStorageNoSearchNoNormalize)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_PROP_DECL(archiveUniqueKey) {
+    TJS_BEGIN_NATIVE_PROP_GETTER {
+        if(TVPStoragesArchiveUniqueKeyCompat.Type() == tvtVoid) {
+            iTJSDispatch2 *array = TJSCreateArrayObject();
+            if(!array)
+                return TJS_E_FAIL;
+            TVPStoragesArchiveUniqueKeyCompat = tTJSVariant(array, array);
+            array->Release();
+        }
+        *result = TVPStoragesArchiveUniqueKeyCompat;
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_PROP_GETTER
+
+    TJS_BEGIN_NATIVE_PROP_SETTER {
+        TVPStoragesArchiveUniqueKeyCompat = *param;
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_PROP_SETTER
+}
+TJS_END_NATIVE_STATIC_PROP_DECL(archiveUniqueKey)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ extractStorageExt) {
     if(numparams < 1)

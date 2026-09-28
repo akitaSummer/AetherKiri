@@ -9,6 +9,7 @@
 #include "ncbind.hpp"
 #include "Application.h"
 #include "LayerBitmapIntf.h"
+#include "DebugIntf.h"
 #include <algorithm>
 #include "movie/ffmpeg/KRMovieLayer.h"
 
@@ -139,6 +140,8 @@ layerExMovie::~layerExMovie() {
 
 void layerExMovie::clearMovie() {
     if(VideoOverlay) {
+        VideoOverlay->ClearVideoBuffer();
+        VideoOverlay->ShutdownPlayer();
         VideoOverlay->Release(), VideoOverlay = nullptr;
     }
     if(in) {
@@ -175,6 +178,15 @@ void layerExMovie::openMovie(const tjs_char *filename, bool alpha) {
                          in->GetSize());
     VideoOverlay = pOverlay;
     VideoOverlay->GetVideoSize(&movieWidth, &movieHeight);
+    TVPAddLog(ttstr(TJS_W("layerExMovie.openMovie: ")) + filename +
+              TJS_W(" size=") + TJSIntegerToString(movieWidth) +
+              TJS_W("x") + TJSIntegerToString(movieHeight));
+    if(movieWidth <= 0 || movieHeight <= 0) {
+        TVPAddLog(ttstr(TJS_W("layerExMovie.openMovie: invalid video size for ")) +
+                  filename);
+        clearMovie();
+        return;
+    }
     if(Bitmap[0])
         delete Bitmap[0];
     if(Bitmap[1])

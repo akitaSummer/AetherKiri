@@ -8,6 +8,7 @@
 #include <deque>
 #include <list>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -15,13 +16,21 @@
 #include "tjs.h"
 #include "ResourceManager.h"
 
+class tTVPBaseBitmap;
+
 namespace PSB {
     class PSBDictionary;
 }
 
 namespace motion {
     class D3DAdaptor;
+    class MotionNativePlayerBackend;
     class SeparateLayerAdaptor;
+    struct MotionBackendValue;
+}
+
+namespace aetherinternal {
+    class EmoteRuntimeExtension;
 }
 
 namespace motion {
@@ -72,6 +81,9 @@ namespace motion {
     };
 
     class Player {
+        friend class ::aetherinternal::EmoteRuntimeExtension;
+        friend struct PlayerTestAccess;
+
     public:
         explicit Player(ResourceManager rm = ResourceManager{});
         ~Player();
@@ -82,6 +94,9 @@ namespace motion {
 
         void setMetadata(tTJSVariant v) { _metadata = v; }
         tTJSVariant getMetadata() const { return _metadata; }
+
+        void setResolution(double v) { _resolution = v; }
+        double getResolution() const { return _resolution; }
 
         void setChara(ttstr v) { _chara = v; }
         ttstr getChara() const { return _chara; }
@@ -118,6 +133,13 @@ namespace motion {
         void setQueuing(bool v) { _queuing = v; }
         bool getQueuing() const { return _queuing; }
 
+        // Motion.EmotePlayer/D3DEmotePlayer's similarly named property maps
+        // to Player+1161, not to the ordinary Motion.Player queuing byte.
+        // libgame's generated setters only ever enable this mode (the input
+        // value is intentionally ignored).
+        void enableEmoteAnimatorQueuing();
+        bool getEmoteAnimatorQueuing() const { return _emoteAnimatorFlag; }
+
         void setDirectEdit(bool v) { _directEdit = v; }
         bool getDirectEdit() const { return _directEdit; }
 
@@ -127,8 +149,15 @@ namespace motion {
         void setVariableKeys(tTJSVariant v) { _variableKeys = v; }
         tTJSVariant getVariableKeys();
 
-        void setAllplaying(bool v) { _allplaying = v; }
+        void setAllplaying(bool v);
+        bool getPlaying() const;
         bool getAllplaying() const { return _allplaying; }
+        // Motion.EmotePlayer.animating is not Player.allplaying.  The native
+        // getter (libgame.so sub_671378) reports direct controller work that
+        // is not owned by an active timeline. Passive timeline tracks (blink,
+        // breathing and physics) keep allplaying true solely so they continue
+        // to receive progress ticks.
+        bool getEmoteAnimating() const;
 
         void setSyncWaiting(bool v) { _syncWaiting = v; }
         bool getSyncWaiting() const { return _syncWaiting; }
@@ -216,6 +245,9 @@ namespace motion {
         void setProject(tTJSVariant v) { _project = v; }
         tTJSVariant getProject() const { return _project; }
 
+        void setTargetLayer(tTJSVariant v) { _targetLayer = v; }
+        tTJSVariant getTargetLayer() const { return _targetLayer; }
+
         void setUseD3D(bool v) { _useD3D = v; }
         bool getUseD3D() const { return _useD3D; }
 
@@ -265,6 +297,7 @@ namespace motion {
         void setHairScale(double s);
         void setPartsScale(double s);
         void setBustScale(double s);
+        void setBodyScale(double s);
         void startWind(double minAngle, double maxAngle, double amplitude,
                        double freqX, double freqY);
         void stopWind();
@@ -281,7 +314,12 @@ namespace motion {
         // Load from a pre-loaded snapshot (used by EmotePlayer.setModule)
         // Aligned to libkrkr2.so: EmoteObject_init (sub_67DBAC) sets Player's
         // activeMotion directly from loaded PSB data without file I/O.
-        void loadFromSnapshot(std::shared_ptr<detail::MotionSnapshot> snapshot);
+        void loadFromSnapshot(
+            std::shared_ptr<detail::MotionSnapshot> snapshot,
+            std::vector<std::shared_ptr<detail::MotionSnapshot>>
+                nativeObjectSnapshots = {});
+        void bindMotionModuleKey(ttstr storageKey);
+        [[nodiscard]] bool hasActiveMotion() const;
 
         // Resource management
         void unload(ttstr name);
@@ -309,7 +347,43 @@ namespace motion {
         void copyRect(tTJSVariant args);
         void adjustGamma(tTJSVariant args);
         void draw();
+        // Headless render entry used by runtime providers such as Artemis.
+        // The caller owns an RGBA8 output buffer and no KAG Window is needed.
+        bool renderToRgba(std::uint8_t *pixels, int width, int height,
+                          int pitch,
+                          std::array<int, 4> *visibleBounds = nullptr,
+                          bool *alphaBoundsKnown = nullptr,
+                          bool *alphaOpaque = nullptr);
+        bool renderToRgbaRegion(
+            std::uint8_t *pixels, int stageWidth, int stageHeight,
+            int regionLeft, int regionTop, int regionWidth, int regionHeight,
+            int pitch, std::array<int, 4> *visibleBounds = nullptr,
+            bool *alphaBoundsKnown = nullptr,
+            bool *alphaOpaque = nullptr);
+        bool beginRenderToRgbaRegion(
+            int stageWidth, int stageHeight,
+            int regionLeft, int regionTop, int regionWidth, int regionHeight);
+        bool finishRenderToRgbaRegion(
+            std::uint8_t *pixels, int pitch,
+            std::array<int, 4> *visibleBounds = nullptr,
+            bool *alphaBoundsKnown = nullptr,
+            bool *alphaOpaque = nullptr);
+        bool requestRenderToRgbaReadback();
+        bool pollRenderToRgbaReadback(
+            std::uint8_t *pixels, int pitch, bool *ready,
+            std::array<int, 4> *visibleBounds = nullptr,
+            bool *alphaBoundsKnown = nullptr,
+            bool *alphaOpaque = nullptr);
+        void discardRenderToRgbaReadback();
         void frameProgress(double dt);
+        void frameProgressManually(double dt) {
+            noteManualProgress();
+            frameProgress(dt);
+        }
+        void autoProgressFromContinuousTick(tjs_uint64 tick);
+        iTJSDispatch2 *getAutoProgressDispatchForCompat() const {
+            return _autoProgressDispatch;
+        }
 
         // Viewport/display
         void setFlip(bool v);
@@ -324,7 +398,14 @@ namespace motion {
         tTJSVariant getLayerGetter(ttstr name);
         tTJSVariant getLayerGetterList();
         void skipToSync();
+        void passTimelinesLike_0x67A100();
         void setStereovisionCameraPosition(double x, double y, double z);
+        void setAutomaticBlinkEnabled(bool enabled) {
+            _automaticBlinkEnabled = enabled;
+        }
+        bool getAutomaticBlinkEnabled() const {
+            return _automaticBlinkEnabled;
+        }
 
         // Timeline/variable queries
         void setVariable(ttstr label, double value, double transition = 0.0,
@@ -366,6 +447,7 @@ namespace motion {
         bool getD3DAvailable();
         void doAlphaMaskOperation();
         void onFindMotion(ttstr name, int flags = 0);
+        bool playMotionLike_0x6B2284(ttstr label, tjs_int flags);
         // Aligned to libkrkr2.so 0x681CAC: motion property as raw callback
         // so we have objthis to call onFindMotion TJS callback.
         static tjs_error setMotionCompat(tTJSVariant *result, tjs_int numparams,
@@ -379,9 +461,21 @@ namespace motion {
                                              tjs_int numparams,
                                              tTJSVariant **param,
                                              Player *nativeInstance);
+        static tjs_error clearCompatMethod(tTJSVariant *result,
+                                           tjs_int numparams,
+                                           tTJSVariant **param,
+                                           iTJSDispatch2 *objthis);
+        static tjs_error clearCompatForNative(tTJSVariant *result,
+                                              tjs_int numparams,
+                                              tTJSVariant **param,
+                                              Player *nativeInstance);
         static tjs_error drawCompat(tTJSVariant *result, tjs_int numparams,
                                     tTJSVariant **param,
                                     iTJSDispatch2 *objthis);
+        static tjs_error drawCompatForNative(tTJSVariant *result,
+                                             tjs_int numparams,
+                                             tTJSVariant **param,
+                                             Player *nativeInstance);
         static tjs_error playCompat(tTJSVariant *result, tjs_int numparams,
                                     tTJSVariant **param, iTJSDispatch2 *objthis);
         static tjs_error progressCompatMethod(tTJSVariant *result,
@@ -392,6 +486,14 @@ namespace motion {
                                                  tjs_int numparams,
                                                  tTJSVariant **param,
                                                  iTJSDispatch2 *objthis);
+        static tjs_error setCoordCompatMethod(tTJSVariant *result,
+                                              tjs_int numparams,
+                                              tTJSVariant **param,
+                                              iTJSDispatch2 *objthis);
+        static tjs_error containsCompatMethod(tTJSVariant *result,
+                                              tjs_int numparams,
+                                              tTJSVariant **param,
+                                              iTJSDispatch2 *objthis);
         static tjs_error isPlayingCompat(tTJSVariant *result, tjs_int numparams,
                                          tTJSVariant **param,
                                          iTJSDispatch2 *objthis);
@@ -400,9 +502,17 @@ namespace motion {
         tTJSVariant motionList();
         void emoteEdit(tTJSVariant args);
 
+        ResourceManager &getResourceManagerNative() {
+            return _resourceManagerNative;
+        }
+        const ResourceManager &getResourceManagerNative() const {
+            return _resourceManagerNative;
+        }
+
         // Public accessor for EmotePlayer delegation
         double getActiveMotionWidth() const;
         double getActiveMotionHeight() const;
+        bool contains(double x, double y);
         bool hitTestLayer(ttstr name, double x, double y);
 
         // Root node position (x/y/left/top)
@@ -417,20 +527,31 @@ namespace motion {
         double getTop() const { return getY(); }
         void setLeft(double v) { setX(v); }
         void setTop(double v) { setY(v); }
+        void presentationHoldFromContinuousTick(tjs_uint64 tick);
+        bool assignNativeBackendState(const Player &source);
 
     private:
         bool ensureMotionLoaded();
+        bool invokeNativeBackend(
+            const std::string &method,
+            const std::vector<MotionBackendValue> &arguments = {},
+            std::vector<MotionBackendValue> *results = nullptr);
+        bool renderNativeBackendToLayer(iTJSDispatch2 *layerObject,
+                                        int canvasWidth, int canvasHeight,
+                                        bool skipUpdate);
         void ensureNodeTreeBuilt();
+        Player *findLayerNodeForQuery(const std::string &key,
+                                      int &nodeIndex);
         void syncVariableKeysFromActiveMotion();
         void syncSelectorControlsLike_0x670D1C();
         const detail::TimelineState *primaryTimelineStateLike_0x66F80C() const;
         void preProgressPlayingTimelinesLike_0x671764(
             double dt, std::unordered_map<std::string, double> *prevTimes);
-        void resetTimelineControlStateLike_0x671A50(
+        void seekTimelineControlStateLike_0x66EE30(
             detail::TimelineState &state,
             const detail::TimelineControlBinding &binding,
             double time);
-        void scheduleTimelineControlAnimatorLike_0x671A50(
+        void scheduleTimelineControlAnimatorLike_0x6646E0(
             detail::TimelineState &state,
             size_t trackIndex,
             float value,
@@ -464,6 +585,9 @@ namespace motion {
         void applyEvalResultPostProcessLike_0x67CC9C();
         void applyClampControlsLike_0x67C8A8();
         bool shouldMirrorEvalLabelLike_0x67C6B0(const std::string &label);
+        void ensureEmoteControlStateInitialized();
+        void stepAutoBlinkControllersLike_0x660FBC(double dt);
+        void stepEmotePhysicsLike_0x678B28(double dt);
         double &ensureEvalResultSlotLike_0x686944(const std::string &label);
         void removeEvalResultSlotLike_Reset(const std::string &label);
         void writeEvalResultValueLike_0x6C4668(const std::string &label,
@@ -489,14 +613,27 @@ namespace motion {
         const std::vector<std::string> &activeSourceCandidates() const;
         void calcBounds();
         void updateLayers();
+        bool applyMotionParentRootStateForRender();
         bool prepareRenderItems();
         void appendPreparedRenderItems();
         void applyPreparedRenderItemTranslateOffsets();
         bool buildRenderCommands(tjs_int canvasWidth, tjs_int canvasHeight);
         bool executeLayerRenderCommands(iTJSDispatch2 *renderLayerObject,
-                                        bool skipUpdate);
+                                         bool skipUpdate);
         bool updateLayerAfterDraw(iTJSDispatch2 *targetLayerObject);
-        bool updateAccurateSLAAfterDraw(iTJSDispatch2 *targetLayerObject);
+        void enableAutoProgress(iTJSDispatch2 *objthis);
+        void disableAutoProgress();
+        void enablePresentationHold(iTJSDispatch2 *targetLayerObject,
+                                    tjs_uint64 durationMs);
+        void disablePresentationHold();
+        void noteManualProgress();
+        std::string beginEndedTimelineRenderHold();
+        void endEndedTimelineRenderHold(const std::string &label);
+        bool deferEndedTimelineRenderHoldUntilDraw(const std::string &label);
+        void releaseDeferredEndedTimelineRenderHoldAfterDraw(bool force = false);
+        bool hasPlayingChildPlayers() const;
+        bool shouldReportPlayingChildPlayers() const;
+        void dispatchPendingEvents(iTJSDispatch2 *objthis);
         // updateLayers sub-phases (aligned to libkrkr2.so sub-functions)
         void updateLayersPhase1_PreLoop(double currentTime);
         void updateLayersPhase2_MainLoop(double currentTime);
@@ -512,9 +649,18 @@ namespace motion {
         void updateLayersPhase3_AnchorNode();                 // sub_6C0528
 
         std::shared_ptr<detail::PlayerRuntime> _runtime;
+        std::unique_ptr<MotionNativePlayerBackend> _nativeBackend;
+        std::string _nativeBackendSourcePath;
+        // A newly-created native E-mote player starts with the SDK's default
+        // pose. Keep the previous presentation until the first timeline
+        // progress has applied the restored/scripted variables, otherwise a
+        // cold expression switch exposes that default pose for one frame.
+        bool _nativeBackendPresentationReady = true;
+        bool _nativeBackendPresentationHoldLogged = false;
         ResourceManager _resourceManagerNative;
         int _completionType = 0;
         tTJSVariant _metadata;
+        double _resolution = 0.0;
         ttstr _chara;
         ttstr _motionKey;
         ttstr _outline;  // Aligned to libkrkr2.so +1032: ttstr
@@ -541,10 +687,17 @@ namespace motion {
         double _cameraTargetX = 0, _cameraTargetY = 0, _cameraTargetZ = 0;
         bool _speed = true;           // Aligned to libkrkr2.so +1093: bool flag
         double _frameTickCount = 0.0;
+        // getCommandList() is polled by AnimKAGLayer after every progress()
+        // call to decide whether its backing Layer needs repainting.  The
+        // compatible list is a one-value ping-pong token, not a list of the
+        // motion's static source paths.
+        bool _commandListPulse = false;
         tjs_int _maskMode = 0;                         // libkrkr2.so +1148
         std::uint32_t _colorWeightPacked = 0xFF808080u; // libkrkr2.so +1156
         bool _independentLayerInherit = false;          // libkrkr2.so +1097
-        double _zFactor = 1.0;
+        // Native Player constructor stores 0.0 at player+0x458. Z remains an
+        // ordering coordinate unless script explicitly enables projection.
+        double _zFactor = 0.0;
         tTJSVariant _cameraTarget;
         tTJSVariant _cameraPosition;
         double _cameraFOV = 60.0;
@@ -560,9 +713,34 @@ namespace motion {
         ttstr _stealthMotion;
         tTJSVariant _tags;
         tTJSVariant _project;
+        tTJSVariant _targetLayer;
         inline static bool _useD3D;
         ttstr _meshline;  // Aligned to libkrkr2.so +1052: ttstr
         bool _busy = false;
+        iTJSDispatch2 *_autoProgressDispatch = nullptr;
+        tjs_uint64 _autoProgressLastTick = 0;
+        tjs_uint64 _manualProgressLastTick = 0;
+        bool _autoProgressHasLastTick = false;
+        bool _autoProgressRegistered = false;
+        bool _autoProgressRendering = false;
+        // A selector hover clears the retained target before repainting it.
+        // Do not let the normal raster throttle drop that repaint, or the
+        // cleared target can be presented as a one-frame black/transparent
+        // flash while the pointer moves between buttons.
+        bool _forceMotionRasterRender = false;
+        tTJSVariant _presentationHoldLayer;
+        tjs_uint64 _presentationHoldUntilTick = 0;
+        tjs_uint64 _presentationHoldLastTick = 0;
+        bool _presentationHoldRegistered = false;
+        bool _presentationHoldRendering = false;
+        std::string _deferredEndedTimelineRenderHoldLabel;
+        std::string _completedEndedTimelineRenderHoldLabel;
+        std::string _endedTimelineRenderHoldRestoreLabel;
+        double _endedTimelineRenderHoldRestoreTime = 0.0;
+        double _endedTimelineRenderHoldRestoreEvalTime = 0.0;
+        bool _endedTimelineRenderHoldHasRestore = false;
+        Player *_motionParentPlayer = nullptr;
+        int _motionParentNodeIndex = -1;
 
         // Aligned to libkrkr2.so Player_updateLayers (0x6BB33C):
         // Camera velocity at player+784/792/800, damping at player+600
@@ -577,6 +755,7 @@ namespace motion {
         // setter may be called before node tree exists).
         double _pendingRootX = 0.0;
         double _pendingRootY = 0.0;
+        double _pendingRootZ = 0.0;
         bool _hasPendingRootPos = false;
         double _rootOffsetZ = 0.0;
         float _cameraOffsetX = 0.0f;    // player+144, set by setCameraOffset (0x6D9A38)
@@ -639,23 +818,19 @@ namespace motion {
         std::unordered_set<std::string> _mirrorPositiveCache;
         std::unordered_set<std::string> _mirrorNegativeCache;
 
-        // Parent color propagated from parent motion node (sub_6BE0C0 at 0x6BEB7C).
-        // Binary: *(_DWORD *)(childPlayer + 1156) = *(_DWORD *)(node + 100)
-        // Stores colorBytes[0..3] packed as RGBA uint32 (default 0xFF808080).
-        uint32_t _parentColorPacked = 0xFF808080u;  // player+1156
-
         // Per-frame flag cleared at end of updateLayers (player+608, 0x6BBDF8).
         // Set to true in constructor; checked by sub_6BE0C0 case 2 (0x6BE664)
         // and sub_6BEDD0 case 2 (0x6BEFF4). When true, case 2 falls through
         // to interpolated derivative path instead of using deltaPos.
         bool _noUpdateYet = true;  // player+608
 
-        // Aligned to libkrkr2.so emote scale/rotate fields:
-        // sub_681F20: player+1184, sub_681F28: player+1192, sub_681F30: player+1200
-        // player+1168/+1176 are the duplicated meshDivisionRatio doubles read by
-        // Player_startWind (0x6709AC).
+        // Aligned to libgame.so emote scale/rotate fields:
+        // meshDivisionRatio at player+1168 is read by startWind; bodyScale at
+        // player+1176 is read by sub_678D50 when resolving physics anchors.
+        // sub_681F20: player+1184, sub_681F28: player+1192,
+        // sub_681F30: player+1200.
         double _emoteMeshDivisionRatio = 1.0;
-        double _emoteMeshDivisionRatioDup = 1.0;
+        double _bodyScale = 1.0;
         double _hairScale = 1.0;    // player+1184
         double _partsScale = 1.0;   // player+1192
         double _bustScale = 1.0;    // player+1200
@@ -663,6 +838,14 @@ namespace motion {
         bool _physicsDisabled = false;   // player+1159
         bool _emoteAnimatorFlag = false; // player+1161
         bool _emoteDirty = false;        // player+1162
+        // CatSystem2's ObjEmote EnableBlink message gates the metadata-driven
+        // automatic eye controller without disabling other E-mote physics.
+        bool _automaticBlinkEnabled = true;
+        // Script-side setters can update many selector variables before the
+        // next draw/query (a gallery page updates every slot this way).  Keep
+        // node evaluation deferred and coalesced instead of rebuilding the
+        // complete composed motion tree for each individual setter.
+        bool _layersDirty = true;
         struct EmoteCoordState {
             double x = 0.0;
             double y = 0.0;
@@ -673,12 +856,14 @@ namespace motion {
             double value = 0.0;
             double transition = 0.0;
             double ease = 0.0;
-        } _emoteScaleState, _emoteRotState;
+        } _emoteRotState;
+        EmoteScalarAnimatorState _emoteScaleState{1.0, 0.0, 0.0};
         struct EmoteColorState {
             tjs_uint32 packed = 0;
             std::array<float, 4> rgbaBytes{0.f, 0.f, 0.f, 0.f};
             double transition = 0.0;
             double ease = 0.0;
+            bool explicitlySet = false;
         } _emoteColorState;
 
         struct WindState {
@@ -706,6 +891,11 @@ namespace motion {
         OuterForceState _hairOuterForce;
         OuterForceState _partsOuterForce;
 
+        // Runtime state owned by an optional motionplayer extension. Keeping
+        // this opaque prevents vendor controller layouts from leaking into
+        // the public Player data model.
+        std::shared_ptr<void> _motionExtensionState;
+
         // Aligned to libkrkr2.so player+992: TJS Math.RandomGenerator object.
         // sub_6BA7B8 calls its "random" method to get [0.0, 1.0) doubles.
         // Created via TJS eval "new Math.RandomGenerator()" during init.
@@ -715,5 +905,7 @@ namespace motion {
         // Propagated to child particle players (sub_6BF0DC at 0x6BF9C0).
         tTJSVariant _emoteEditVariant;    // player+1012
     };
+
+    std::vector<tTJSVariant> SnapshotAutoProgressPlayerDispatchesForCompat();
 
 } // namespace motion

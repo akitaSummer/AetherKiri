@@ -9,7 +9,12 @@
 
 #include "EngineLoop.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <spdlog/spdlog.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "Application.h"
 #include "ConfigManager/IndividualConfigManager.h"
@@ -17,6 +22,7 @@
 #include "Platform.h"
 #include "SysInitIntf.h"
 #include "RenderManager.h"
+#include "ScriptMgnIntf.h"
 #include "TickCount.h"
 #ifdef __APPLE__
 #include <malloc/malloc.h>
@@ -31,12 +37,41 @@
 // Forward declarations for functions used by the engine core
 extern bool TVPCheckStartupPath(const std::string& path);
 extern void TVPForceSwapBuffer();
+extern void TVPHostForceDrawDeviceShow();
 
 // ---------------------------------------------------------------------------
 // Global state — previously in MainScene.cpp, now owned by EngineLoop
 // ---------------------------------------------------------------------------
 
 static void (*s_postUpdate)() = nullptr;
+
+namespace {
+int64_t NowMs() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               clock::now().time_since_epoch())
+        .count();
+}
+
+bool InputTraceEnabled() {
+    const char* value = std::getenv("AETHERKIRI_INPUT_TRACE");
+    return value && value[0] && value[0] != '0';
+}
+} // namespace
+
+#ifdef __ANDROID__
+#define AETHER_INPUT_TRACE_LOG(...)                                             \
+    do {                                                                        \
+        if (InputTraceEnabled()) {                                              \
+            __android_log_print(ANDROID_LOG_INFO, "aether-input", __VA_ARGS__); \
+        }                                                                       \
+    } while (0)
+#else
+#define AETHER_INPUT_TRACE_LOG(...)                                             \
+    do {                                                                        \
+    } while (0)
+#endif
+
 void TVPSetPostUpdateEvent(void (*f)()) { s_postUpdate = f; }
 
 // Async key/mouse state table — indexed by Windows VK code
@@ -66,6 +101,7 @@ int TVPDrawSceneOnce(int interval) {
     if (remain <= 0) {
         if (s_postUpdate)
             s_postUpdate();
+        TVPHostForceDrawDeviceShow();
         TVPForceSwapBuffer();
         lastTick = curTick;
         return 0;
@@ -100,6 +136,7 @@ EngineLoop* EngineLoop::CreateInstance() {
 }
 
 void EngineLoop::Start() {
+    started_ = true;
     update_enabled_ = true;
 }
 
@@ -107,9 +144,45 @@ void EngineLoop::Tick(float delta) {
     if (!started_)
         return;
     ::Application->Run();
+    CompleteInputFrame();
+    TVPRepairKagNoTransWait();
+    TVPRepairKagEnvironmentWorldReset();
+    TVPDeliverContinuousEvent();
+    TVPDeliverWindowCanvasDrawEvents();
     iTVPTexture2D::RecycleProcess();
+    // Legacy VideoOverlay layer playback publishes decoded frames from
+    // continuous callbacks. Present after them so those frames are not left
+    // waiting for an unrelated window update or input event.
+    TVPHostForceDrawDeviceShow();
     if (s_postUpdate)
         s_postUpdate();
+}
+
+void EngineLoop::CompleteInputFrame() {
+    // Mouse-up and click are queued together.  Keep System.getKeyState(...,
+    // true) pressed while Application::Run() invokes those handlers, then
+    // release it before the next host input frame.  engine_api drives
+    // Application::Run() directly, so this cannot live only in Tick().
+    constexpr uint16_t mouse_vks[] = {0x01, 0x02, 0x04};
+    for (const uint16_t vk : mouse_vks) {
+        if ((pending_mouse_release_mask_ & (1u << vk)) != 0)
+            s_scancode[vk] &= ~1;
+    }
+    pending_mouse_release_mask_ = 0;
+}
+
+void EngineLoop::ResetPointerState() {
+    active_mouse_shift_flags_ = 0;
+    pending_mouse_release_mask_ = 0;
+    suppress_next_left_click_ = false;
+    last_mouse_down_x_ = 0;
+    last_mouse_down_y_ = 0;
+    last_click_time_ms_ = 0;
+    last_click_x_ = 0;
+    last_click_y_ = 0;
+    constexpr uint16_t mouse_vks[] = {0x01, 0x02, 0x04};
+    for (const uint16_t vk : mouse_vks)
+        s_scancode[vk] = 0;
 }
 
 bool EngineLoop::StartupFrom(const std::string& path) {
@@ -194,6 +267,10 @@ bool EngineLoop::HandleInputEvent(const EngineInputEvent& event) {
     }
 }
 
+bool EngineLoop::IsTouchPointerEvent(const EngineInputEvent& event) {
+    return event.pointer_id >= 100000;
+}
+
 void EngineLoop::HandlePointerDown(const EngineInputEvent& event) {
     auto* win = TVPMainWindow;
     if (!win) return;
@@ -223,19 +300,43 @@ void EngineLoop::HandlePointerDown(const EngineInputEvent& event) {
     }
     if (vk < sizeof(s_scancode) / sizeof(s_scancode[0])) {
         s_scancode[vk] = 0x11; // pressed + was-pressed
+        pending_mouse_release_mask_ &= ~(1u << vk);
     }
 
     // Combine mouse button state into shift flags
-    uint32_t flags = shift;
+    uint32_t button_flag = 0;
     switch (mb) {
-        case mbLeft:   flags |= TVP_SS_LEFT;   break;
-        case mbRight:  flags |= TVP_SS_RIGHT;  break;
-        case mbMiddle: flags |= TVP_SS_MIDDLE; break;
+        case mbLeft:   button_flag = TVP_SS_LEFT;   break;
+        case mbRight:  button_flag = TVP_SS_RIGHT;  break;
+        case mbMiddle: button_flag = TVP_SS_MIDDLE; break;
         default: break;
     }
+    active_mouse_shift_flags_ |= button_flag;
+    const uint32_t flags = shift | active_mouse_shift_flags_;
 
     last_mouse_down_x_ = x;
     last_mouse_down_y_ = y;
+    AETHER_INPUT_TRACE_LOG("EngineLoop down id=%d x=%d y=%d button=%u flags=%u",
+                           event.pointer_id, x, y, event.button, flags);
+
+    // Windows sends WM_LBUTTONDBLCLK before the second WM_LBUTTONDOWN, and the
+    // following WM_LBUTTONUP suppresses the normal click event.
+    if (mb == mbLeft && !IsTouchPointerEvent(event)) {
+        const int64_t now = NowMs();
+        const int32_t dx = x - last_click_x_;
+        const int32_t dy = y - last_click_y_;
+        const bool is_double_click =
+            last_click_time_ms_ > 0 && now - last_click_time_ms_ <= 500 &&
+            dx * dx + dy * dy <= 64;
+        suppress_next_left_click_ = is_double_click;
+        if (is_double_click) {
+            if (InputTraceEnabled()) {
+                spdlog::info("EngineLoop pointer double-click x={} y={}", x, y);
+            }
+            TVPPostInputEvent(new tTVPOnDoubleClickInputEvent(win, x, y));
+            last_click_time_ms_ = 0;
+        }
+    }
 
     TVPPostInputEvent(
         new tTVPOnMouseDownInputEvent(win, x, y, mb, flags));
@@ -247,14 +348,19 @@ void EngineLoop::HandlePointerMove(const EngineInputEvent& event) {
 
     const tjs_int x = static_cast<tjs_int>(event.x);
     const tjs_int y = static_cast<tjs_int>(event.y);
-    const uint32_t shift = ConvertModifiers(event.modifiers);
+    const uint32_t shift =
+        ConvertModifiers(event.modifiers) | active_mouse_shift_flags_;
 
     // Update cached cursor position for Layer.cursorX/cursorY queries
     if (win->GetForm())
         win->GetForm()->UpdateCursorPos(x, y);
 
+    AETHER_INPUT_TRACE_LOG("EngineLoop move id=%d x=%d y=%d shift=%u",
+                           event.pointer_id, x, y, shift);
+
     TVPPostInputEvent(
-        new tTVPOnMouseMoveInputEvent(win, x, y, shift));
+        new tTVPOnMouseMoveInputEvent(win, x, y, shift),
+        TVP_EPT_REMOVE_POST);
 }
 
 void EngineLoop::HandlePointerUp(const EngineInputEvent& event) {
@@ -263,7 +369,7 @@ void EngineLoop::HandlePointerUp(const EngineInputEvent& event) {
 
     const tjs_int x = static_cast<tjs_int>(event.x);
     const tjs_int y = static_cast<tjs_int>(event.y);
-    const uint32_t shift = ConvertModifiers(event.modifiers);
+    uint32_t button_flag = 0;
 
     // Update cached cursor position for Layer.cursorX/cursorY queries
     if (win->GetForm())
@@ -275,7 +381,19 @@ void EngineLoop::HandlePointerUp(const EngineInputEvent& event) {
     else if (event.button == 2)
         mb = mbMiddle;
 
-    // Update scancode: clear pressed bit
+    switch (mb) {
+        case mbLeft:   button_flag = TVP_SS_LEFT;   break;
+        case mbRight:  button_flag = TVP_SS_RIGHT;  break;
+        case mbMiddle: button_flag = TVP_SS_MIDDLE; break;
+        default: break;
+    }
+    active_mouse_shift_flags_ &= ~button_flag;
+    const uint32_t shift =
+        (ConvertModifiers(event.modifiers) & ~button_flag) |
+        active_mouse_shift_flags_;
+
+    // Defer scancode release until Application::Run has delivered the queued
+    // up/click events. Some KAG widgets query async mouse state in handlers.
     uint16_t vk = 0;
     switch (mb) {
         case mbLeft:   vk = 0x01; break;
@@ -283,21 +401,37 @@ void EngineLoop::HandlePointerUp(const EngineInputEvent& event) {
         case mbMiddle: vk = 0x04; break;
         default: break;
     }
-    if (vk < sizeof(s_scancode) / sizeof(s_scancode[0])) {
-        s_scancode[vk] &= ~1; // clear current-pressed, keep was-pressed
+
+    // Match the existing AetherKiri path: click uses the mouse-down
+    // coordinates before mouse-up releases transient button layers.
+    if (mb == mbLeft) {
+        if (suppress_next_left_click_) {
+            suppress_next_left_click_ = false;
+        } else {
+            if (InputTraceEnabled()) {
+                spdlog::info("EngineLoop pointer click x={} y={}",
+                             last_mouse_down_x_, last_mouse_down_y_);
+            }
+            TVPPostInputEvent(
+                new tTVPOnClickInputEvent(win, last_mouse_down_x_,
+                                          last_mouse_down_y_));
+            AETHER_INPUT_TRACE_LOG(
+                "EngineLoop click id=%d x=%d y=%d up=(%d,%d)",
+                event.pointer_id, last_mouse_down_x_, last_mouse_down_y_, x, y);
+            last_click_time_ms_ = NowMs();
+            last_click_x_ = x;
+            last_click_y_ = y;
+        }
     }
+
+    AETHER_INPUT_TRACE_LOG("EngineLoop up id=%d x=%d y=%d button=%u shift=%u",
+                           event.pointer_id, x, y, event.button, shift);
 
     TVPPostInputEvent(
         new tTVPOnMouseUpInputEvent(win, x, y, mb, shift));
 
-    // Post click event after mouse-up, matching the original Windows engine
-    // which fires OnMouseClick (→ Window.onClick → PrimaryClick) after
-    // OnMouseUp.  Uses the stored down position per original behavior.
-    if (mb == mbLeft) {
-        TVPPostInputEvent(
-            new tTVPOnClickInputEvent(win, last_mouse_down_x_,
-                                      last_mouse_down_y_));
-    }
+    if (vk != 0)
+        pending_mouse_release_mask_ |= (1u << vk);
 }
 
 void EngineLoop::HandlePointerScroll(const EngineInputEvent& event) {
@@ -306,11 +440,16 @@ void EngineLoop::HandlePointerScroll(const EngineInputEvent& event) {
 
     const tjs_int x = static_cast<tjs_int>(event.x);
     const tjs_int y = static_cast<tjs_int>(event.y);
-    const uint32_t shift = ConvertModifiers(event.modifiers);
+    const uint32_t shift =
+        ConvertModifiers(event.modifiers) | active_mouse_shift_flags_;
 
     // delta_y > 0 = scroll up, delta_y < 0 = scroll down
     // TVP expects wheel delta in units (positive = up)
     const tjs_int delta = static_cast<tjs_int>(event.delta_y * 120.0);
+
+    AETHER_INPUT_TRACE_LOG(
+        "EngineLoop scroll id=%d x=%d y=%d delta_y=%.3f delta=%d shift=%u",
+        event.pointer_id, x, y, event.delta_y, delta, shift);
 
     if (delta != 0) {
         TVPPostInputEvent(
@@ -360,9 +499,22 @@ void EngineLoop::HandleTextInput(const EngineInputEvent& event) {
     auto* win = TVPMainWindow;
     if (!win) return;
 
-    if (event.unicode_codepoint > 0 && event.unicode_codepoint <= 0xFFFF) {
-        const tjs_char ch = static_cast<tjs_char>(event.unicode_codepoint);
-        TVPPostInputEvent(
-            new tTVPOnKeyPressInputEvent(win, ch));
+    const uint32_t codepoint = event.unicode_codepoint;
+    if(codepoint == 0 || codepoint > 0x10FFFF)
+        return;
+
+    // Android's Godot text bridge reports a non-BMP character as two UTF-16
+    // code units, while other hosts can report the complete Unicode scalar.
+    // Preserve either representation for KiriKiri's UTF-16 input events.
+    if(codepoint <= 0xFFFF) {
+        TVPPostInputEvent(new tTVPOnKeyPressInputEvent(
+            win, static_cast<tjs_char>(codepoint)));
+        return;
     }
+
+    const uint32_t scalar = codepoint - 0x10000;
+    const tjs_char high = static_cast<tjs_char>(0xD800 + (scalar >> 10));
+    const tjs_char low = static_cast<tjs_char>(0xDC00 + (scalar & 0x3FF));
+    TVPPostInputEvent(new tTVPOnKeyPressInputEvent(win, high));
+    TVPPostInputEvent(new tTVPOnKeyPressInputEvent(win, low));
 }

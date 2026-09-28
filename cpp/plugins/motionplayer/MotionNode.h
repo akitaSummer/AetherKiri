@@ -19,6 +19,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -59,6 +60,8 @@ namespace motion::detail {
         int meshDivision = 0;         // "meshDivision" from PSB (node+2008)
         int meshDivX = 0;             // node+2012: computed grid width
         int meshDivY = 0;             // node+2016: computed grid height
+        // Index into the active clip's motion-local parameter table.
+        int parameterizeIndex = -1;
         // Mesh inverse matrix for sub_69AE74 child deformation (node+2096..2132)
         double meshInvM11 = 0, meshInvM12 = 0;  // node+2096, node+2104
         double meshInvM21 = 0, meshInvM22 = 0;  // node+2112, node+2120
@@ -66,27 +69,67 @@ namespace motion::detail {
         // Computed mesh flags (sub_6BC4F0 at 0x6BC6E4..0x6BC818)
         bool hasMeshData = false;        // node+1962: has active mesh data
         bool stencilCompositeMaskReferenced = false; // node+1961: post-build mask-layer reference
+        // type-12 stencil containers retain the exact nodes named by
+        // stencilCompositeMaskLayerList.  The native renderer keeps this as a
+        // separate mask-item chain; it is not the same thing as the group's
+        // ordinary colour children.
+        std::vector<int> stencilCompositeMaskNodeIndices;
+        bool implicitVisibleStencilGroup = false;
+        bool implicitVisibleStencilBase = false;
+        // Owning type-12 node for an implicit visible stencil base. A plain
+        // boolean is ambiguous once nested motion children are flattened:
+        // an outer group must not borrow an inner group's base as its mask.
+        int implicitVisibleStencilGroupNodeIndex = -1;
         bool meshCombineEnabled = false; // node+1963: mesh combines with children
-        // libkrkr2.so seeds node+52 from PSB "stencilType" in Player_initNodeFields
-        // (0x6B3C78), but later visibility/render-tree stages consume the same slot as
-        // a per-frame non-zero update mask while still preserving deflector bit 4.
-        // Keep both the raw PSB seed and the runtime-composed value explicitly.
+        // libgame.so sub_6B1058 seeds node+52 from the PSB "stencilType".
+        // Render-item construction at 0x6C09F4 copies that value verbatim to
+        // item+244.  Frame-list type is a separate field and must never be ORed
+        // into this operation code (2 would turn a crop into a reverse crop).
         int stencilTypeBase = 0;      // raw PSB "stencilType"
-        int stencilType = 0;          // runtime node+52-compatible mask
+        int stencilType = 0;          // current native node+52 operation code
         int currentFrameType = 0;     // current frameList type (0/2/3), for trace
 
-        // Mesh control points (node+2024..2032 in libkrkr2.so).
-        // For meshType=1: 16 × 2 floats (Bezier patch 4×4 control grid) = 32 floats.
-        // For meshType=2: (divX+1)*(divY+1)*2 floats (grid mesh).
-        // Built by sub_6BC4F0 vertex computation.
-        std::vector<float> meshControlPoints;      // node+2024
-        std::vector<float> meshControlPointsPrev;  // node+2048 (previous frame)
+        // The native node owns three distinct mesh vectors. Keeping them
+        // separate is essential: +2024 is the authored normalized 4x4 patch,
+        // +2048 is the tessellated render grid, and +2072 is the authored
+        // patch transformed into world coordinates.
+        std::vector<float> meshControlPoints;       // node+2024, 16 normalized XY pairs
+        std::vector<float> meshRenderPoints;        // node+2048, tessellated world XY pairs
+        std::vector<float> meshWorldControlPoints;  // node+2072, 16 world XY pairs
+        // E-mote meshCombinator layers do not author `mesh.bp` in their
+        // frameList. Instead, each controller variable supplies a sequence
+        // of raw 4x4 patches which are sampled and added together at runtime.
+        struct MeshCombinatorEntry {
+            std::string variable;
+            double rangeBegin = 0.0;
+            double rangeEnd = 0.0;
+            int meshCount = 0;
+            int neutralIndex = 0;
+            int meshType = 0;
+            std::vector<float> rawMeshes;
+            // MMeshCombinator::UpdateAllMesh retains the last normalized mesh
+            // position and does not call LerpBezierPatch again until that
+            // position changes.  Keep the sampled contribution beside the
+            // immutable raw meshes so idle controllers do not rebuild it on
+            // every frame.
+            float sampledPosition = std::numeric_limits<float>::quiet_NaN();
+            std::array<float, 32> sampledPatch{};
+            bool sampledPatchValid = false;
+        };
+        std::vector<MeshCombinatorEntry> meshCombinators;
+        // node+1968 is a pointer to the inherited mesh chain in libgame.so.
+        // It is unrelated to the shape/stencil clip parent tracked below.
+        int meshAncestorIndex = -1;
 
         // emoteEdit PSB dict reference (node+1980, sub_6B3C78 at 0x6B3D48)
         std::shared_ptr<const PSB::PSBDictionary> emoteEditDict;
 
         // Prior draw flag (node+48, from PSB emoteEdit "priorDraw")
         // Raw int, not bool — binary checks bit flags (v12 & 5) in sub_6BE0C0.
+        // The PSB dictionary is immutable after the node tree is built, so
+        // cache its authored value instead of doing RTTI dictionary lookups
+        // for every E-mote node on every rendered frame.
+        int authoredPriorDraw = 0;
         int priorDraw = 0;
 
         // ========== Dual Clip Slot Architecture ==========
@@ -117,6 +160,7 @@ namespace motion::detail {
 
             // Source (slot+36)
             std::string src;
+            std::string motionIcon;
             std::vector<std::string> srcList;
 
             // Position (slot+96..112)
@@ -240,6 +284,12 @@ namespace motion::detail {
         // Player object, created by sub_6B3C78 case 3 via sub_6F1794 (NCB CreateAdaptor).
         // Use getChildPlayer() helper to extract native Player*.
         tTJSVariant childPlayerVar;
+        // Artemis instantiates E-mote players through the native bridge before
+        // motionplayer.dll has necessarily registered its TJS Player class.
+        // Keep the same nested Player alive directly when NCB cannot create
+        // the optional script adaptor; native MMotionPlayer owns its children
+        // directly as well.
+        std::shared_ptr<Player> nativeChildPlayer;
 
         // Particle children for nodeType=4 (Particle).
         // Aligned to libkrkr2.so node+2296: tTJSVariant holding TJS Array of

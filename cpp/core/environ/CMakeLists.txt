@@ -26,6 +26,8 @@ set(ENVIRON_SOURCE_FILES
 
     $<$<BOOL:${IOS}>:${ENVIRON_PATH}/apple/ios/platform.mm>
 
+    $<$<OR:$<BOOL:${WEB}>,$<BOOL:${EMSCRIPTEN}>>:${ENVIRON_PATH}/web/Platform.cpp>
+
     ${ENVIRON_PATH}/MainScene.cpp
 
     ${ENVIRON_PATH}/ConfigManager/GlobalConfigManager.cpp
@@ -33,7 +35,7 @@ set(ENVIRON_SOURCE_FILES
     ${ENVIRON_PATH}/ConfigManager/LocaleConfigManager.cpp
     ${ENVIRON_PATH}/sdl/tvpsdl.cpp
 
-    # ui/ — all removed (Flutter handles UI now).
+    # ui/ — all removed (Godot handles UI now).
     # Stub implementations are in stubs/ui_stubs.cpp
     ${ENVIRON_PATH}/stubs/ui_stubs.cpp
 
@@ -44,11 +46,15 @@ set(ENVIRON_HEADERS_DIR
     ${ENVIRON_PATH}/
     ${ENVIRON_PATH}/win32
     $<$<BOOL:${ANDROID}>:${ENVIRON_PATH}/android>
+    $<$<OR:$<BOOL:${WEB}>,$<BOOL:${EMSCRIPTEN}>>:${ENVIRON_PATH}/web>
     ${ENVIRON_PATH}/sdl
 )
 
 add_library(${PROJECT_NAME} STATIC ${ENVIRON_SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PUBLIC ${ENVIRON_HEADERS_DIR})
+if(LINUX)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE LINUX)
+endif()
 target_link_libraries(${PROJECT_NAME} PUBLIC tjs2 PRIVATE core_base_module core_visual_module core_sound_module core_plugin_module core_movie_module core_utils_module)
 
 find_package(7zip CONFIG REQUIRED)

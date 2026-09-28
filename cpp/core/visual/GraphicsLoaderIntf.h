@@ -12,12 +12,29 @@
 #ifndef GraphicsLoaderIntfH
 #define GraphicsLoaderIntfH
 
+// Name of the graphic currently being handed to a format handler.  This is
+// primarily useful to format-specific diagnostics (for example TLG virtual
+// storage adapters); callers must treat the returned value as a snapshot.
+extern ttstr TVPGetCurrentGraphicLoadName();
+
 #include "drawable.h"
 
+class iTVPBaseBitmap;
 class tTVPBaseBitmap;
 namespace TJS {
     class tTJSBinaryStream;
 }
+
+// Optional provider for images which are authored as logical resources and
+// materialized by a plug-in at runtime (for example PackinOne/ProxyStorage UI
+// atlases).  The public renderer only owns the registration boundary; the
+// provider remains responsible for recognizing and producing its format.
+using tTVPVirtualGraphicProvider = bool (*)(const ttstr &requested,
+                                             iTVPBaseBitmap *destination);
+void TVPRegisterVirtualGraphicProvider(tTVPVirtualGraphicProvider provider);
+void TVPUnregisterVirtualGraphicProvider(tTVPVirtualGraphicProvider provider);
+bool TVPProvideVirtualGraphic(const ttstr &requested,
+                              iTVPBaseBitmap *destination);
 
 enum tTVPGraphicPixelFormat { gpfLuminance, gpfPalette, gpfRGB, gpfRGBA };
 
@@ -473,6 +490,8 @@ extern bool TVPCheckImageCache(const ttstr &nname, tTVPBaseBitmap *dest,
 extern bool TVPHasImageCache(const ttstr &nname, tTVPGraphicLoadMode mode,
                              tjs_uint dw, tjs_uint dh, tjs_int32 keyidx);
 extern void TVPLoadImageHeader(const ttstr &storagename, iTJSDispatch2 **dic);
+extern void TVPGetImageSize(const ttstr &storagename, tjs_int &width,
+                            tjs_int &height);
 extern void TVPSaveImage(const ttstr &storagename, const ttstr &mode,
                          const iTVPBaseBitmap *image, iTJSDispatch2 *meta);
 extern bool TVPGetSaveOption(const ttstr &type, iTJSDispatch2 **dic);

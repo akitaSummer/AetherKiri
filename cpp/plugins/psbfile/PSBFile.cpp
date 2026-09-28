@@ -1,7 +1,17 @@
 #include "PSBFile.h"
+#include "PSBFileExtension.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+#define AETHERKIRI_HAS_EXECINFO 1
+#include <execinfo.h>
+#endif
 #include <iostream>
 #include <memory>
+#include <vector>
 #include <zlib.h>
 
 #include "EMoteCTX.h"
@@ -14,7 +24,185 @@ static constexpr size_t kPSBMmapThreshold = 256 * 1024;
 
 #define LOGGER spdlog::get("plugin")
 
+#if defined(AETHERKIRI_INTERNAL_PSBFILE)
+extern "C" void AetherInternalRegisterPSBFileRuntime();
+#endif
+
 namespace PSB {
+    namespace {
+        bool IsPSBLoadDebugEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("AETHERKIRI_PSB_DEBUG");
+                return value && *value && std::strcmp(value, "0") != 0;
+            }();
+            return enabled;
+        }
+
+        std::uint32_t ReadU32LE(const std::uint8_t *data) {
+            return static_cast<std::uint32_t>(data[0]) |
+                (static_cast<std::uint32_t>(data[1]) << 8) |
+                (static_cast<std::uint32_t>(data[2]) << 16) |
+                (static_cast<std::uint32_t>(data[3]) << 24);
+        }
+
+        void WriteU16LE(std::uint8_t *data, const std::uint16_t value) {
+            data[0] = static_cast<std::uint8_t>(value);
+            data[1] = static_cast<std::uint8_t>(value >> 8);
+        }
+
+        void WriteU32LE(std::uint8_t *data, const std::uint32_t value) {
+            data[0] = static_cast<std::uint8_t>(value);
+            data[1] = static_cast<std::uint8_t>(value >> 8);
+            data[2] = static_cast<std::uint8_t>(value >> 16);
+            data[3] = static_cast<std::uint8_t>(value >> 24);
+        }
+
+        // Scenario PSBs are compiled data rather than text.  Keep an
+        // opt-in, bounded tree dump beside the parser so compatibility work
+        // can inspect authored layer commands without changing normal game
+        // behaviour.  This is intentionally disabled unless the caller sets
+        // AETHERKIRI_PSB_DUMP_PATH.
+        void DumpPSBValue(const std::shared_ptr<IPSBValue> &value,
+                          std::ostream &out, const std::string &path,
+                          std::size_t &nodes, const std::size_t maxNodes,
+                          const int depth = 0) {
+            if(!value || nodes++ >= maxNodes) {
+                return;
+            }
+            const auto indent = std::string(static_cast<std::size_t>(depth) * 2,
+                                            ' ');
+            if(auto dict = std::dynamic_pointer_cast<PSBDictionary>(value)) {
+                out << indent << path << " {\n";
+                for(const auto &[key, child] : *dict) {
+                    DumpPSBValue(child, out, path + "." + key, nodes,
+                                 maxNodes, depth + 1);
+                    if(nodes >= maxNodes)
+                        break;
+                }
+                out << indent << "}\n";
+                return;
+            }
+            if(auto list = std::dynamic_pointer_cast<PSBList>(value)) {
+                out << indent << path << " [\n";
+                std::size_t index = 0;
+                for(const auto &child : *list) {
+                    DumpPSBValue(child, out,
+                                 path + "[" + std::to_string(index++) + "]",
+                                 nodes, maxNodes, depth + 1);
+                    if(nodes >= maxNodes)
+                        break;
+                }
+                out << indent << "]\n";
+                return;
+            }
+            std::string repr;
+            try {
+                repr = value->toString();
+            } catch(...) {
+                repr = "<toString threw>";
+            }
+            constexpr std::size_t maxString = 320;
+            if(repr.size() > maxString)
+                repr.resize(maxString), repr += "...";
+            out << indent << path << " = " << repr << "\n";
+        }
+
+        void MaybeDumpPSBTree(const ttstr &sourceName,
+                              const std::shared_ptr<IPSBValue> &root) {
+            const char *dumpPath = std::getenv("AETHERKIRI_PSB_DUMP_PATH");
+            if(!dumpPath || !*dumpPath || !root)
+                return;
+            const char *match = std::getenv("AETHERKIRI_PSB_DUMP_MATCH");
+            const std::string source = sourceName.AsStdString();
+            if(match && *match && source.find(match) == std::string::npos)
+                return;
+            std::size_t maxNodes = 200000;
+            if(const char *limit = std::getenv("AETHERKIRI_PSB_DUMP_MAX_NODES")) {
+                try {
+                    maxNodes = std::max<std::size_t>(1, std::stoull(limit));
+                } catch(...) {
+                }
+            }
+            std::ofstream out(dumpPath, std::ios::app);
+            if(!out)
+                return;
+            out << "\n=== PSB " << source << " type="
+                << static_cast<int>(root->getType()) << " ===\n";
+            std::size_t nodes = 0;
+            DumpPSBValue(root, out, "$", nodes, maxNodes);
+            out << "=== END PSB nodes=" << nodes << " ===\n";
+        }
+
+        void NormalizeObjectHeader(std::uint8_t *data, const size_t size,
+                                   const PSBHeader &header) {
+            if(!data || size < header.GetHeaderLength()) {
+                return;
+            }
+            std::memcpy(data, header.signature, sizeof(header.signature));
+            WriteU16LE(data + 4, header.version);
+            // The parser already applied the title's E-mote transform and
+            // seed cipher. Mark the retained object as plain so a native backend
+            // does not try to interpret the normalized bytes as encrypted.
+            WriteU16LE(data + 6, 0);
+            WriteU32LE(data + 8, header.offsetEncrypt);
+            WriteU32LE(data + 12, header.offsetNames);
+            WriteU32LE(data + 16, header.offsetStrings);
+            WriteU32LE(data + 20, header.offsetStringsData);
+            WriteU32LE(data + 24, header.offsetChunkOffsets);
+            WriteU32LE(data + 28, header.offsetChunkLengths);
+            WriteU32LE(data + 32, header.offsetChunkData);
+            WriteU32LE(data + 36, header.offsetEntries);
+            if(header.version > 2) {
+                WriteU32LE(data + 40, header.checksum);
+            }
+            if(header.version > 3) {
+                WriteU32LE(data + 44, header.offsetExtraChunkOffsets);
+                WriteU32LE(data + 48, header.offsetExtraChunkLengths);
+                WriteU32LE(data + 52, header.offsetExtraChunkData);
+            }
+        }
+
+        void LogPSBStage(const ttstr &filePath, const char *stage) {
+            if(IsPSBLoadDebugEnabled()) {
+                LOGGER->info("PSBFile stage: {} ({})", stage,
+                             filePath.AsStdString());
+            }
+        }
+
+        bool ContainsUtf16LeAscii(const std::uint8_t *data,
+                                  const size_t size,
+                                  const char *needle) {
+            if(!data || !needle)
+                return false;
+            const size_t needleLength = std::strlen(needle);
+            if(needleLength == 0 || size < needleLength * 2)
+                return false;
+            for(size_t offset = 0; offset + needleLength * 2 <= size;
+                offset += 2) {
+                bool matched = true;
+                for(size_t index = 0; index < needleLength; ++index) {
+                    if(data[offset + index * 2] !=
+                           static_cast<std::uint8_t>(needle[index]) ||
+                       data[offset + index * 2 + 1] != 0) {
+                        matched = false;
+                        break;
+                    }
+                }
+                if(matched)
+                    return true;
+            }
+            return false;
+        }
+
+        bool IsExternalPimgIndex(const std::uint8_t *data, const size_t size,
+                                 const ttstr &sourceName) {
+            return size >= 4 && data[0] == 0xff && data[1] == 0xfe &&
+                TVPExtractStorageExt(sourceName).AsLowerCase() ==
+                    TJS_W(".pimg") &&
+                ContainsUtf16LeAscii(data + 2, size - 2,
+                                     "_extra_binary_file_");
+        }
+    } // namespace
 
     void PSBFile::resetState() {
         charset = PSBArray();
@@ -34,6 +222,8 @@ namespace PSB {
         extraResources.clear();
 
         _root.reset();
+        _compatRoot.Clear();
+        _objectImage.reset();
         _header = PSBHeader{};
         _type = PSBType::PSB;
     }
@@ -348,58 +538,89 @@ namespace PSB {
         }
     }
 
-    bool PSBFile::loadPSBFile(const ttstr &filePath) {
-        LOGGER->debug("load psb file: {}", filePath.AsStdString());
+    bool PSBFile::loadPSBData(const void *data, size_t readSize,
+                              const ttstr &sourceName, bool loadResources) {
+        const bool traceLoad = IsPSBLoadDebugEnabled();
+        if(traceLoad) {
+            LOGGER->info("PSBFile load begin: path={} seed={}",
+                         sourceName.AsStdString(), _seed);
+        }
         resetState();
-        auto *s = TVPCreateStream(filePath);
-        if(!s)
-            return false;
-
-        const size_t readSize = s->GetSize();
-        if(readSize < 9) {
-            delete s;
-            return false;
-        }
-
-        bool fileDataMmap = false;
-        uint8_t *fileData = nullptr;
-#if defined(__APPLE__) || defined(__linux__) || defined(__ANDROID__)
-        if(readSize >= kPSBMmapThreshold) {
-            fileData = (uint8_t *)TVPMmapAlloc(readSize);
-            fileDataMmap = true;
-        }
-#endif
-        if(!fileData)
-            fileData = new uint8_t[readSize];
-        s->Read(fileData, readSize);
-        delete s;
-
-        auto freeFileData = [&]() {
-            if(fileDataMmap) {
-#if defined(__APPLE__) || defined(__linux__) || defined(__ANDROID__)
-                TVPMmapFree(fileData);
-#endif
-            } else {
-                delete[] fileData;
+        if(!data || readSize < 9) {
+            if(traceLoad) {
+                LOGGER->warn("PSBFile too small: path={} size={}",
+                             sourceName.AsStdString(), readSize);
             }
-            fileData = nullptr;
-        };
-
-        char sign[4];
-        memcpy(sign, fileData, 4);
-
-        bool isMdf = ((sign[0] & ~0x20) == 'M') &&
-                     ((sign[1] & ~0x20) == 'D') &&
-                     ((sign[2] & ~0x20) == 'F') &&
-                     sign[3] == '\0';
-
-        if(!isMdf &&
-           std::strcmp(sign, PsbSignature) != 0 &&
-           std::strcmp(sign, MflSignature) != 0) {
-            LOGGER->warn("Not a PSB/MDF/MFL file: {}", filePath.AsStdString());
-            freeFileData();
             return false;
         }
+
+        const auto *fileData = static_cast<const std::uint8_t *>(data);
+        if(traceLoad) {
+            LOGGER->info("PSBFile raw: path={} size={} first4=0x{:08x}",
+                         sourceName.AsStdString(), readSize,
+                         ReadU32LE(fileData));
+        }
+
+#if defined(AETHERKIRI_INTERNAL_PSBFILE)
+        AetherInternalRegisterPSBFileRuntime();
+#endif
+        std::vector<std::uint8_t> extensionData;
+        const auto *extension = psbFileExtension();
+        if(extension != nullptr &&
+           extension->isCompressedFrame != nullptr &&
+           extension->decompressFrame != nullptr &&
+           extension->isCompressedFrame(fileData, readSize)) {
+            std::string error;
+            if(!extension->decompressFrame(
+                   fileData, readSize, extensionData, error)) {
+                LOGGER->warn("PSB extension decompression failed: {} ({})",
+                             error,
+                             sourceName.AsStdString());
+                return false;
+            }
+            LOGGER->debug("PSB extension decompressed: {} -> {} bytes ({})",
+                          readSize, extensionData.size(),
+                          sourceName.AsStdString());
+            fileData = extensionData.data();
+            readSize = extensionData.size();
+            if(readSize < 9) {
+                LOGGER->warn(
+                    "PSB extension decompressed to invalid size: {} ({})",
+                    readSize, sourceName.AsStdString());
+                return false;
+            }
+        }
+
+        if(IsExternalPimgIndex(fileData, readSize, sourceName)) {
+            if(extension == nullptr || extension->loadExternalPimg == nullptr) {
+                LOGGER->warn("External-resource PIMG is unsupported: {}",
+                             sourceName.AsStdString());
+                return false;
+            }
+            std::string error;
+            tTJSVariant root;
+            if(!extension->loadExternalPimg(fileData, readSize, sourceName,
+                                            root, error) ||
+               root.Type() != tvtObject || root.AsObjectNoAddRef() == nullptr) {
+                LOGGER->warn("External-resource PIMG load failed: {} ({})",
+                             error.empty() ? "invalid root" : error,
+                             sourceName.AsStdString());
+                return false;
+            }
+            _compatRoot = root;
+            _type = PSBType::Pimg;
+            LOGGER->debug("External-resource PIMG loaded: {}",
+                          sourceName.AsStdString());
+            return true;
+        }
+
+        char outerSign[4];
+        memcpy(outerSign, fileData, 4);
+
+        const bool isMdf = ((outerSign[0] & ~0x20) == 'M') &&
+                           ((outerSign[1] & ~0x20) == 'D') &&
+                           ((outerSign[2] & ~0x20) == 'F') &&
+                           outerSign[3] == '\0';
 
         size_t psbSize;
         if(isMdf) {
@@ -410,6 +631,11 @@ namespace PSB {
             psbSize = readSize;
         }
 
+        if(psbSize > std::numeric_limits<tjs_uint>::max()) {
+            LOGGER->warn("PSB stream is too large: {} bytes ({})", psbSize,
+                         sourceName.AsStdString());
+            return false;
+        }
         tTVPMemoryStream stream{ nullptr, static_cast<tjs_uint>(psbSize) };
 
         if(isMdf) {
@@ -417,22 +643,60 @@ namespace PSB {
             int zResult = uncompress(
                 static_cast<Bytef *>(stream.GetInternalBuffer()), &destLen,
                 fileData + 8, static_cast<uLong>(readSize - 8));
-            freeFileData();
 
             if(zResult != Z_OK) {
                 LOGGER->warn("MDF decompression failed: zlib error {} ({})",
-                             zResult, filePath.AsStdString());
+                             zResult, sourceName.AsStdString());
                 return false;
             }
             LOGGER->debug("MDF decompressed: {} -> {} bytes ({})",
-                          readSize, destLen, filePath.AsStdString());
+                          readSize, destLen, sourceName.AsStdString());
         } else {
             memcpy(stream.GetInternalBuffer(), fileData, readSize);
-            freeFileData();
+        }
+
+        if(_preParseCallback &&
+           !_preParseCallback(
+               static_cast<std::uint8_t *>(stream.GetInternalBuffer()),
+               psbSize)) {
+            LOGGER->warn("PSB pre-parse callback failed: {}",
+                         sourceName.AsStdString());
+            return false;
+        }
+
+        // Some E-mote titles encrypt the PSB signature along with the rest of
+        // the payload.  The title-provided pre-parse callback must therefore
+        // run before validating the inner PSB/MFL header.  MDF is still
+        // identified from its unencrypted outer wrapper and decompressed
+        // before the callback, matching the buffer the PSB parser consumes.
+        char sign[4];
+        memcpy(sign, stream.GetInternalBuffer(), 4);
+        if(std::memcmp(sign, PsbSignature, sizeof(sign)) != 0 &&
+           std::memcmp(sign, MflSignature, sizeof(sign)) != 0) {
+            LOGGER->warn("Not a PSB/MDF/MFL file: {}",
+                         sourceName.AsStdString());
+            return false;
         }
 
         stream.SetPosition(0);
+        LogPSBStage(sourceName, "parse header");
         _header = PSB::parsePSBHeader(&stream);
+        if(traceLoad) {
+            LOGGER->info(
+                "PSBFile header: path={} size={} psbSize={} seed={} version={} "
+                "encrypt={} encrypted={} headerLen={} offsets encrypt={} names={} "
+                "strings={} stringsData={} chunkOffsets={} chunkLengths={} "
+                "chunkData={} entries={} extraOffsets={} extraLengths={} "
+                "extraData={}",
+                sourceName.AsStdString(), readSize, psbSize, _seed,
+                _header.version, _header.encrypt, _header.isEncrypted(),
+                _header.GetHeaderLength(), _header.offsetEncrypt,
+                _header.offsetNames, _header.offsetStrings,
+                _header.offsetStringsData, _header.offsetChunkOffsets,
+                _header.offsetChunkLengths, _header.offsetChunkData,
+                _header.offsetEntries, _header.offsetExtraChunkOffsets,
+                _header.offsetExtraChunkLengths, _header.offsetExtraChunkData);
+        }
 
         if(_seed > 0) {
             // decrypt
@@ -514,7 +778,7 @@ namespace PSB {
 
         if(std::strcmp(_header.signature, PSB::PsbSignature) != 0) {
             LOGGER->warn("Not a valid PSB file ({}): signature='{}'",
-                filePath.AsStdString(), _header.signature);
+                         sourceName.AsStdString(), _header.signature);
             return false;
         }
 
@@ -529,14 +793,28 @@ namespace PSB {
             return false;
         }
 
+        auto objectImage = std::make_shared<std::vector<std::uint8_t>>(
+            static_cast<const std::uint8_t *>(stream.GetInternalBuffer()),
+            static_cast<const std::uint8_t *>(stream.GetInternalBuffer()) +
+                stream.GetSize());
+        NormalizeObjectHeader(objectImage->data(), objectImage->size(),
+                              _header);
+        _objectImage = std::move(objectImage);
+
         // Pre Load Strings
+        LogPSBStage(sourceName, "load string offsets");
         stream.SetPosition(_header.offsetStrings);
         stringOffsets = PSB::PSBArray(
             stream.ReadI8LE() -
                 static_cast<std::uint8_t>(PSB::PSBObjType::ArrayN1) + 1,
             &stream);
+        if(traceLoad) {
+            LOGGER->info("PSBFile strings: path={} offsets={}",
+                         sourceName.AsStdString(), stringOffsets.value.size());
+        }
 
         // Load Names
+        LogPSBStage(sourceName, "load names");
         if(_header.version == 1) {
             // don't believe HeaderLength
             if(_header.offsetEncrypt >= stream.GetSize()) {
@@ -564,8 +842,17 @@ namespace PSB {
                 &stream);
             loadNames();
         }
+        if(traceLoad) {
+            LOGGER->info(
+                "PSBFile names: path={} charset={} namesData={} indexes={} "
+                "names={}",
+                sourceName.AsStdString(), charset.value.size(),
+                namesData.value.size(), nameIndexes.value.size(),
+                names.size());
+        }
 
         // Pre Load Resources (Chunks)
+        LogPSBStage(sourceName, "load chunk offsets");
         stream.SetPosition(_header.offsetChunkOffsets);
         chunkOffsets = PSB::PSBArray(
             stream.ReadI8LE() -
@@ -576,11 +863,17 @@ namespace PSB {
             stream.ReadI8LE() -
                 static_cast<std::uint8_t>(PSB::PSBObjType::ArrayN1) + 1,
             &stream);
+        if(traceLoad) {
+            LOGGER->info("PSBFile chunks: path={} offsets={} lengths={}",
+                         sourceName.AsStdString(), chunkOffsets.value.size(),
+                         chunkLengths.value.size());
+        }
 
         resources.reserve(chunkLengths.value.size());
 
         if(_header.version >= 4) {
             // Pre Load Extra Resources (Chunks)
+            LogPSBStage(sourceName, "load extra chunk offsets");
             stream.SetPosition(_header.offsetExtraChunkOffsets);
             extraChunkOffsets = PSB::PSBArray(
                 stream.ReadI8LE() -
@@ -594,6 +887,7 @@ namespace PSB {
             extraResources.reserve(extraChunkLengths.value.size());
         }
         // Load Entries
+        LogPSBStage(sourceName, "load root entries");
         stream.SetPosition(_header.offsetEntries);
         auto obj = unpack(&stream);
         if(!obj) {
@@ -601,19 +895,98 @@ namespace PSB {
         }
 
         _root = std::move(obj);
-        // Load Resource
-        for(auto &res : resources) {
-            loadResource(*res, &stream);
-        }
+        // Load resource payloads only when the caller will consume them.  The
+        // object graph keeps resource indices intact, so metadata-only users
+        // can still inspect labels and file names without paying the cost of
+        // copying every embedded image/audio chunk.
+        if(loadResources) {
+            LogPSBStage(sourceName, "load resources");
+            for(auto &res : resources) {
+                loadResource(*res, &stream);
+            }
 
-        if(_header.version >= 4) {
-            for(auto &res : extraResources) {
-                loadExtraResource(*res, &stream);
+            if(_header.version >= 4) {
+                LogPSBStage(sourceName, "load extra resources");
+                for(auto &res : extraResources) {
+                    loadExtraResource(*res, &stream);
+                }
             }
         }
 
         afterLoad();
+        MaybeDumpPSBTree(sourceName, _root);
+        if(traceLoad) {
+            LOGGER->info(
+                "PSBFile load ok: path={} type={} strings={} resources={} "
+                "extraResources={}",
+                sourceName.AsStdString(), static_cast<int>(_type),
+                strings.size(), resources.size(), extraResources.size());
+        }
         return true;
+    }
+
+    bool PSBFile::loadPSBFile(const ttstr &filePath) {
+        LOGGER->debug("load psb file: {}", filePath.AsStdString());
+        const bool traceLoad = IsPSBLoadDebugEnabled();
+#if defined(AETHERKIRI_HAS_EXECINFO)
+        const std::string tracePath = filePath.AsStdString();
+        if(traceLoad && tracePath.size() >= 4 &&
+           tracePath.compare(tracePath.size() - 4, 4, ".pbd") == 0) {
+            void *frames[20]{};
+            const int frameCount = backtrace(frames, 20);
+            char **symbols = backtrace_symbols(frames, frameCount);
+            for(int index = 0; symbols && index < frameCount; ++index)
+                LOGGER->info("PSBFile pbd caller[{}]: {}", index,
+                             symbols[index]);
+            std::free(symbols);
+        }
+#endif
+        resetState();
+        auto *s = TVPCreateStream(filePath);
+        if(!s) {
+            if(traceLoad) {
+                LOGGER->warn("PSBFile open failed: {}", filePath.AsStdString());
+            }
+            return false;
+        }
+
+        const size_t readSize = s->GetSize();
+        if(readSize < 9) {
+            if(traceLoad) {
+                LOGGER->warn("PSBFile too small: path={} size={}",
+                             filePath.AsStdString(), readSize);
+            }
+            delete s;
+            return false;
+        }
+
+        bool fileDataMmap = false;
+        uint8_t *fileData = nullptr;
+#if defined(__APPLE__) || defined(__linux__) || defined(__ANDROID__)
+        if(readSize >= kPSBMmapThreshold) {
+            fileData = (uint8_t *)TVPMmapAlloc(readSize);
+            fileDataMmap = true;
+        }
+#endif
+        if(!fileData)
+            fileData = new uint8_t[readSize];
+        s->Read(fileData, readSize);
+        delete s;
+
+        auto freeFileData = [&]() {
+            if(fileDataMmap) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__ANDROID__)
+                TVPMmapFree(fileData);
+#endif
+            } else {
+                delete[] fileData;
+            }
+            fileData = nullptr;
+        };
+
+        bool result = loadPSBData(fileData, readSize, filePath);
+        freeFileData();
+        return result;
     }
 
     void PSBFile::loadResource(PSBResource &res,

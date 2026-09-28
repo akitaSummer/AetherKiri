@@ -10,14 +10,25 @@
 
 /* ── Option Keys ────────────────────────────────────────────────── */
 
-/** ANGLE EGL backend selection (Android only; other platforms ignore). */
-#define ENGINE_OPTION_ANGLE_BACKEND       "angle_backend"
-
 /** Frame rate limit (0 = unlimited / follow vsync). */
 #define ENGINE_OPTION_FPS_LIMIT           "fps_limit"
 
-/** Render pipeline selection ("opengl" or "software"). */
+/** Render pipeline selection. */
 #define ENGINE_OPTION_RENDERER            "renderer"
+
+/** Host-facing render backend selection. */
+#define ENGINE_OPTION_RENDER_BACKEND      "render_backend"
+
+/** Select whether the host receives the logical surface or the unscaled
+ *  game frame. Raw source output is intended for a single downstream GPU
+ *  enhancement/upscale pipeline; it does not change engine input geometry. */
+#define ENGINE_OPTION_FRAME_OUTPUT        "frame_output"
+
+/** Maximum elapsed time, in milliseconds, applied to one Artemis visual
+ *  update. Zero disables host-side hitch smoothing. Script clocks, audio and
+ *  video continue to use the caller-provided elapsed time. */
+#define ENGINE_OPTION_ARTEMIS_MAX_VISUAL_DELTA_MS \
+  "artemis.max_visual_delta_ms"
 
 /** Memory profile ("balanced" / "aggressive").
  *  Consumed by the C++ memory governor via TVPGetCommandLine(). */
@@ -63,20 +74,44 @@
  *  When enabled, disassembles bytecode and exports scripts during game load. */
 #define ENGINE_OPTION_EXPORT_SCRIPTS "export_scripts"
 
-/* ── ANGLE Backend Values ───────────────────────────────────────── */
+/** Enable/disable appending recent engine logs to fatal error dialogs
+ *  ("0"/"1", default "0"). */
+#define ENGINE_OPTION_ERROR_DIALOG_LOGS "error_dialog_logs"
 
-/** Use ANGLE's OpenGL ES backend (default). */
-#define ENGINE_ANGLE_BACKEND_GLES         "gles"
+/** Internal plugin startup policy ("krkrsdl3" / "aether_all"). */
+#define ENGINE_OPTION_PLUGIN_LOAD_MODE "plugin_load_mode"
 
-/** Use ANGLE's Vulkan backend. */
-#define ENGINE_ANGLE_BACKEND_VULKAN       "vulkan"
+/** External GGUF-backed text translation.  These generic options are handled
+ *  only when the private translation provider is linked. */
+#define ENGINE_OPTION_TEXT_TRANSLATION_ENABLED \
+  "text_translation.enabled"
+#define ENGINE_OPTION_TEXT_TRANSLATION_MODEL_PATH \
+  "text_translation.model_path"
+#define ENGINE_OPTION_TEXT_TRANSLATION_TARGET_LANGUAGE \
+  "text_translation.target_language"
+
+/** Enable/disable appending recent engine logs to fatal error dialogs
+ *  ("0"/"1", default "0"). */
+#define ENGINE_OPTION_ERROR_DIALOG_LOGS "error_dialog_logs"
 
 /* ── Renderer Values ────────────────────────────────────────────── */
 
-#define ENGINE_RENDERER_OPENGL            "opengl"
+#define ENGINE_RENDERER_GODOT_NATIVE      "godot_native"
+#define ENGINE_RENDERER_GPU_BRIDGE        "gpu_bridge"
+#define ENGINE_RENDERER_DEBUG_CPU         "debug_cpu"
 #define ENGINE_RENDERER_SOFTWARE          "software"
+
+#define ENGINE_RENDER_BACKEND_GODOT_NATIVE "GodotNative"
+#define ENGINE_RENDER_BACKEND_GPU_BRIDGE   "GpuBridge"
+#define ENGINE_RENDER_BACKEND_DEBUG_CPU    "DebugCpu"
+
+#define ENGINE_FRAME_OUTPUT_SURFACE        "surface"
+#define ENGINE_FRAME_OUTPUT_RAW_SOURCE     "raw_source"
 
 #define ENGINE_MEMORY_PROFILE_BALANCED    "balanced"
 #define ENGINE_MEMORY_PROFILE_AGGRESSIVE  "aggressive"
+
+#define ENGINE_PLUGIN_LOAD_MODE_KRKRSDL3  "krkrsdl3"
+#define ENGINE_PLUGIN_LOAD_MODE_AETHER_ALL "aether_all"
 
 #endif  /* KRKR2_ENGINE_OPTIONS_H_ */

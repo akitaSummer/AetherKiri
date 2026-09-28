@@ -217,7 +217,7 @@ namespace TJS {
                 tmp[1] = v & 0xff;
                 tmp[2] = (v >> 8) & 0xff;
                 stream->Write(tmp, sizeof(tmp));
-            } else if(len <= ULONG_MAX) {
+            } else if(len <= UINT32_MAX) {
                 tjs_uint32 v = len;
                 tjs_uint8 tmp[5];
                 tmp[0] = TYPE_STRING32;
@@ -278,7 +278,7 @@ namespace TJS {
                 tmp[1] = v & 0xff;
                 tmp[2] = (v >> 8) & 0xff;
                 stream->Write(tmp, sizeof(tmp));
-            } else if(len <= ULONG_MAX) {
+            } else if(len <= UINT32_MAX) {
                 tjs_uint32 v = len;
                 tjs_uint8 tmp[5];
                 tmp[0] = TYPE_RAW32;
@@ -338,7 +338,7 @@ namespace TJS {
                 tmp[1] = v & 0xff;
                 tmp[2] = (v >> 8) & 0xff;
                 stream->Write(tmp, sizeof(tmp));
-            } else if(count <= ULONG_MAX) {
+            } else if(count <= UINT32_MAX) {
                 tjs_uint32 v = count;
                 tjs_uint8 tmp[5];
                 tmp[0] = TYPE_MAP32;
@@ -365,7 +365,7 @@ namespace TJS {
                 tmp[1] = v & 0xff;
                 tmp[2] = (v >> 8) & 0xff;
                 stream->Write(tmp, sizeof(tmp));
-            } else if(count <= ULONG_MAX) {
+            } else if(count <= UINT32_MAX) {
                 tjs_uint32 v = count;
                 tjs_uint8 tmp[5];
                 tmp[0] = TYPE_ARRAY32;
@@ -434,13 +434,14 @@ namespace TJS {
         ReadString(const tjs_uint8 *buff, tjs_uint len, tjs_uint &index) {
             tTJSVariantString *ret = nullptr;
             if(len > 0) {
-                auto *str = new tjs_char[len];
+                auto *str = new tjs_char[len + 1];
                 for(tjs_uint i = 0; i < len; i++) {
                     str[i] = buff[index];
                     index++;
                     str[i] |= buff[index] << 8;
                     index++;
                 }
+                str[len] = 0;
                 ret = TJSAllocVariantString(str, len);
                 delete[] str;
             }

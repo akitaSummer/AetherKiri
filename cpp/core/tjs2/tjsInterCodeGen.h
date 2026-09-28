@@ -125,6 +125,7 @@ namespace TJS {
         VM_ADDCI,
         VM_REGMEMBER,
         VM_DEBUGGER,
+        VM_CHKIN,
 
         __VM_LAST /* = last mark ; this is not a real operation code
                    */
@@ -209,8 +210,9 @@ namespace TJS {
         tjs_int GetPosition() const { return Position; }
 
         tTJSVariant &GetValue() {
+            static tTJSVariant dummy;
             if(!Val)
-                return *(tTJSVariant *)nullptr;
+                return dummy;
             return *Val;
         }
 
@@ -451,6 +453,8 @@ namespace TJS {
         tTJSInterCodeContext *PropSetter;
         tTJSInterCodeContext *PropGetter;
         tTJSInterCodeContext *SuperClassGetter;
+        tjs_int ExecutingCount;
+        bool DeferredFinalize;
 
 #ifdef _DEBUG
         ScopeKey DebuggerScopeKey; //!< for exec
@@ -469,6 +473,9 @@ namespace TJS {
         tTJSScriptBlock *GetBlock() const { return Block; }
         tTJS *GetTJS() const { return CachedTJSEngine; }
         void ClearBlockPointer();
+
+        void EnterExecution();
+        void LeaveExecution();
 
 #ifdef _DEBUG
         ttstr GetClassName() const;
@@ -765,6 +772,8 @@ namespace TJS {
         static void CharacterCodeFrom(tTJSVariant &val);
 
         static void InstanceOf(const tTJSVariant &name, tTJSVariant &targ);
+
+        static void InMember(tTJSVariant &name, tTJSVariant &obj);
 
         void RegisterObjectMember(iTJSDispatch2 *dest);
 

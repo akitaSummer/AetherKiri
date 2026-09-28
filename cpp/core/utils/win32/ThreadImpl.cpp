@@ -14,11 +14,15 @@
 
 // #include <process.h>
 #include <algorithm>
+#include <cstdlib>
+#include <exception>
+#include <system_error>
 
 #include "ThreadIntf.h"
 #include "ThreadImpl.h"
 #include "MsgIntf.h"
 #include "DebugIntf.h"
+#include "SysInitIntf.h"
 
 #if defined(CC_TARGET_OS_IPHONE) || defined(__aarch64__)
 #else
@@ -30,6 +34,37 @@
 #endif
 
 #include <thread>
+
+namespace {
+
+#if defined(__EMSCRIPTEN__)
+tjs_int TVPGetWebThreadLimit() {
+    const char *value = std::getenv("AETHERKIRI_WEB_CORE_THREADS");
+    if(value && *value) {
+        char *end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        if(end != value && parsed > 0)
+            return std::min<tjs_int>(static_cast<tjs_int>(parsed),
+                                     TVPMaxThreadNum);
+    }
+    return 4;
+}
+#endif
+
+bool TVPThreadShouldLog() noexcept {
+    return !TVPSystemUninitCalled;
+}
+
+void TVPThreadAddLog(const ttstr &line) noexcept {
+    if(!TVPThreadShouldLog())
+        return;
+    try {
+        TVPAddLog(line);
+    } catch(...) {
+    }
+}
+
+} // namespace
 
 //---------------------------------------------------------------------------
 // tTVPThread : a wrapper class for thread
@@ -58,18 +93,41 @@ tTVPThread::~tTVPThread() {
     if(Handle.joinable()) {
         Terminated = true;
         _cond.notify_one(); // wake up if suspended
-        Handle.join();
+        if(Handle.get_id() == std::this_thread::get_id()) {
+            TVPThreadAddLog(
+                TJS_W("Warning: tTVPThread detached itself during destruction"));
+            Handle.detach();
+        } else {
+            try {
+                Handle.join();
+            } catch(const std::system_error &e) {
+                if(TVPThreadShouldLog()) {
+                    TVPThreadAddLog(
+                        ttstr(TJS_W("Warning: failed to join tTVPThread: ")) +
+                        ttstr(e.what()));
+                }
+                if(Handle.joinable())
+                    Handle.detach();
+            }
+        }
     }
 }
 
 //---------------------------------------------------------------------------
 void *tTVPThread::StartProc(void *arg) {
     auto *_this = (tTVPThread *)arg;
-    if(_this->Suspended) {
-        std::unique_lock lk(_this->_mutex);
-        _this->_cond.wait(lk);
+    try {
+        if(_this->Suspended) {
+            std::unique_lock lk(_this->_mutex);
+            _this->_cond.wait(lk);
+        }
+        _this->Execute();
+    } catch(const std::exception &e) {
+        if(TVPThreadShouldLog())
+            TVPThreadAddLog(ttstr(TJS_W("Thread exception: ")) + ttstr(e.what()));
+    } catch(...) {
+        TVPThreadAddLog(TJS_W("Thread exception: unknown exception"));
     }
-    _this->Execute();
     _this->Finished.store(true, std::memory_order_release);
     TVPOnThreadExited();
     return nullptr;
@@ -78,7 +136,22 @@ void *tTVPThread::StartProc(void *arg) {
 //---------------------------------------------------------------------------
 void tTVPThread::WaitFor() {
     if(Handle.joinable()) {
-        Handle.join();
+        if(Handle.get_id() == std::this_thread::get_id()) {
+            TVPThreadAddLog(TJS_W("Warning: tTVPThread tried to wait for itself"));
+            return;
+        }
+        try {
+            Handle.join();
+        } catch(const std::system_error &e) {
+            if(TVPThreadShouldLog()) {
+                TVPThreadAddLog(
+                    ttstr(TJS_W("Warning: failed to wait for tTVPThread: ")) +
+                    ttstr(e.what()));
+            }
+            if(Handle.joinable())
+                Handle.detach();
+            return;
+        }
     }
     // If the thread was somehow detached before (shouldn't happen with
     // the current code), spin-wait on the Finished flag as a safety net.
@@ -141,10 +214,15 @@ tjs_int TVPDrawThreadNum = 1;
 static tjs_int GetProcesserNum() {
     static tjs_int processor_num = 0;
     if(!processor_num) {
-        processor_num = std::thread::hardware_concurrency();
+        processor_num = static_cast<tjs_int>(std::thread::hardware_concurrency());
+        if(processor_num <= 0)
+            processor_num = 1;
+#if defined(__EMSCRIPTEN__)
+        processor_num = std::min<tjs_int>(processor_num, TVPGetWebThreadLimit());
+#endif
         tjs_char tmp[34];
-        TVPAddLog(ttstr(TJS_W("Detected CPU core(s): ")) +
-                  TJS_tTVInt_to_str(processor_num, tmp));
+        TVPThreadAddLog(ttstr(TJS_W("Detected CPU core(s): ")) +
+                        TJS_tTVInt_to_str(processor_num, tmp));
     }
     return processor_num;
 }
@@ -155,12 +233,19 @@ tjs_int TVPGetProcessorNum() { return GetProcesserNum(); }
 tjs_int TVPGetThreadNum() {
     tjs_int threadNum = TVPDrawThreadNum ? TVPDrawThreadNum : GetProcesserNum();
     threadNum = std::min(threadNum, TVPMaxThreadNum);
+#if defined(__EMSCRIPTEN__)
+    threadNum = std::min<tjs_int>(threadNum, TVPGetWebThreadLimit());
+#endif
+    threadNum = std::max<tjs_int>(threadNum, 1);
     return threadNum;
 }
 
 //---------------------------------------------------------------------------
 void TVPExecThreadTask(int numThreads, TVP_THREAD_TASK_FUNC func) {
-    if(numThreads == 1) {
+#if defined(__EMSCRIPTEN__)
+    numThreads = std::min(numThreads, TVPGetThreadNum());
+#endif
+    if(numThreads <= 1) {
         func(0);
         return;
     }
@@ -171,11 +256,20 @@ void TVPExecThreadTask(int numThreads, TVP_THREAD_TASK_FUNC func) {
 #else
     static threadpool11::Pool pool;
     std::vector<std::future<void>> futures;
-    for(int i = 0; i < numThreads; ++i) {
-        futures.emplace_back(pool.postWork<void>(std::bind(func, i)));
+    try {
+        for(int i = 0; i < numThreads; ++i) {
+            futures.emplace_back(pool.postWork<void>(std::bind(func, i)));
+        }
+        for(auto &it : futures)
+            it.get();
+    } catch(const std::exception &e) {
+        if(TVPThreadShouldLog())
+            TVPThreadAddLog(ttstr(TJS_W("Thread task fallback: ")) +
+                            ttstr(e.what()));
+        for(int i = 0; i < numThreads; ++i)
+            func(i);
+        return;
     }
-    for(auto &it : futures)
-        it.get();
 #endif
 #if 0
     ThreadInfo *threadInfo;

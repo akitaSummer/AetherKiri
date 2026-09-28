@@ -14,14 +14,136 @@
 #include <algorithm>
 #include <functional>
 #include <atomic>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <string>
+#include <vector>
+#include <spdlog/spdlog.h>
 #include "tjsArray.h"
 #include "tjsDictionary.h"
 #include "tjsUtils.h"
 #include "tjsBinarySerializer.h"
 #include "tjsOctPack.h"
+#include "../base/ScriptMgnIntf.h"
+#include "../base/TextStream.h"
 
 static std::atomic<int64_t> sTJSArrayCreateCount{0};
 static std::atomic<int64_t> sTJSArrayDestroyCount{0};
+
+static bool TJSArrayStructTraceEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("AETHERKIRI_STRUCT_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+static std::string TJSArrayHexHeader(const tjs_uint8 *bytes, tjs_uint count) {
+    std::string out;
+    static const char *hex = "0123456789abcdef";
+    for(tjs_uint i = 0; i < count; ++i) {
+        if(!out.empty())
+            out += ' ';
+        out += hex[(bytes[i] >> 4) & 0x0f];
+        out += hex[bytes[i] & 0x0f];
+    }
+    return out;
+}
+
+static void TJSArrayDumpStructStream(tTJSBinaryStream *stream,
+                                     tjs_uint64 streamlen,
+                                     const ttstr &name) {
+    const char *dumpDir = std::getenv("AETHERKIRI_STRUCT_DUMP_DIR");
+    if(!dumpDir || !*dumpDir || !stream || streamlen == 0 ||
+       streamlen > static_cast<tjs_uint64>(std::numeric_limits<size_t>::max())) {
+        return;
+    }
+
+    std::vector<tjs_uint8> bytes(static_cast<size_t>(streamlen));
+    const tjs_uint64 oldPos = stream->GetPosition();
+    stream->SetPosition(0);
+    size_t offset = 0;
+    while(offset < bytes.size()) {
+        const tjs_uint chunk = static_cast<tjs_uint>(
+            std::min<size_t>(bytes.size() - offset, 128 * 1024));
+        const tjs_uint read = stream->Read(bytes.data() + offset, chunk);
+        if(read == 0)
+            break;
+        offset += read;
+    }
+    stream->SetPosition(oldPos);
+    if(offset == 0)
+        return;
+
+    std::string filename = TVPExtractStorageName(name).AsStdString();
+    for(char &ch : filename) {
+        if(ch == '/' || ch == '\\' || ch == ':' || static_cast<unsigned char>(ch) < 0x20)
+            ch = '_';
+    }
+    if(filename.empty())
+        filename = "struct";
+
+    std::string path(dumpDir);
+    if(!path.empty() && path.back() != '/')
+        path += '/';
+    path += filename;
+    path += ".bin";
+
+    std::ofstream out(path, std::ios::binary);
+    if(!out)
+        return;
+    out.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(offset));
+    if(TJSArrayStructTraceEnabled()) {
+        spdlog::info("Array.loadStruct dump file={} bytes={} path={}",
+                     name.AsStdString(), offset, path);
+    }
+}
+
+static tjs_error TJSLoadStructuredText(tTJSVariant *result,
+                                       const ttstr &name,
+                                       const ttstr &mode,
+                                       iTJSDispatch2 *context) {
+    ttstr shortname(TVPExtractStorageName(name));
+
+    iTJSTextReadStream *stream = TVPCreateTextStreamForRead(name, mode);
+    if(!stream)
+        return TJS_E_INVALIDPARAM;
+
+    ttstr buffer;
+    try {
+        stream->Read(buffer, 0);
+    } catch(...) {
+        stream->Destruct();
+        throw;
+    }
+    stream->Destruct();
+
+    if(TJSArrayStructTraceEnabled()) {
+        spdlog::info("Array.loadStruct text-fallback file={} chars={}",
+                     name.AsStdString(), static_cast<long long>(buffer.length()));
+    }
+
+    const tjs_int length = buffer.length();
+    tjs_char *top = buffer.AppendBuffer(8 + 1);
+    memmove(top + 8, top, sizeof(tjs_char) * length);
+    memcpy(top, TJS_W("(const)["), sizeof(tjs_char) * 8);
+    memcpy(top + 8 + length, TJS_W("]"), sizeof(tjs_char) * 1);
+    buffer.FixLen();
+
+    tTJSVariant temp;
+    TVPExecuteExpression(buffer, shortname, 0, context, &temp);
+
+    if(result) {
+        tTJSVariantClosure clo = temp.AsObjectClosureNoAddRef();
+        if(clo.Object) {
+            clo.PropGetByNum(TJS_IGNOREPROP, 0, result, nullptr);
+        }
+    }
+
+    return TJS_S_OK;
+}
 
 extern "C" void TJS_GetArrayStats(int64_t *created, int64_t *destroyed) {
     if(created) *created = sTJSArrayCreateCount.load(std::memory_order_relaxed);
@@ -358,20 +480,51 @@ namespace TJS {
             ttstr mode;
             if(numparams >= 2 && param[1]->Type() != tvtVoid)
                 mode = *param[1];
+            iTJSDispatch2 *context = numparams >= 3 &&
+                    param[2]->Type() != tvtVoid
+                ? param[2]->AsObjectNoAddRef()
+                : nullptr;
 
             ni->Items.clear();
 
             tTJSBinaryStream *stream = TJSCreateBinaryStreamForRead(name, mode);
-            if(!stream)
+            if(!stream) {
+                if(TJSArrayStructTraceEnabled()) {
+                    spdlog::info("Array.loadStruct file={} mode={} stream=<null>",
+                                 name.AsStdString(), mode.AsStdString());
+                }
                 return TJS_E_INVALIDPARAM;
+            }
 
             bool isbin = false;
             try {
                 tjs_uint64 streamlen = stream->GetSize();
                 if(streamlen >= tTJSBinarySerializer::HEADER_LENGTH) {
                     tjs_uint8 header[tTJSBinarySerializer::HEADER_LENGTH];
-                    stream->Read(header, tTJSBinarySerializer::HEADER_LENGTH);
-                    if(tTJSBinarySerializer::IsBinary(header)) {
+                    tjs_uint read =
+                        stream->Read(header, tTJSBinarySerializer::HEADER_LENGTH);
+                    const bool binary = read == tTJSBinarySerializer::HEADER_LENGTH &&
+                                        tTJSBinarySerializer::IsBinary(header);
+                    if(TJSArrayStructTraceEnabled()) {
+                        spdlog::info("Array.loadStruct file={} mode={} size={} header={} binary={}",
+                                     name.AsStdString(), mode.AsStdString(),
+                                     static_cast<unsigned long long>(streamlen),
+                                     TJSArrayHexHeader(header, read), binary);
+                        const tjs_uint probeSize =
+                            static_cast<tjs_uint>(std::min<tjs_uint64>(
+                                streamlen, 128));
+                        std::vector<tjs_uint8> probe(probeSize);
+                        stream->SetPosition(0);
+                        const tjs_uint probeRead =
+                            stream->Read(probe.data(), probeSize);
+                        stream->SetPosition(
+                            tTJSBinarySerializer::HEADER_LENGTH);
+                        spdlog::info("Array.loadStruct probe file={} bytes={}",
+                                     name.AsStdString(),
+                                     TJSArrayHexHeader(probe.data(), probeRead));
+                    }
+                    TJSArrayDumpStructStream(stream, streamlen, name);
+                    if(binary) {
                         tTJSBinarySerializer binload(
                             (tTJSArrayObject *)objthis);
                         tTJSVariant *var = binload.Read(stream);
@@ -383,6 +536,15 @@ namespace TJS {
                         }
                     }
                 }
+                if(!isbin) {
+                    stream->SetPosition(0);
+                    isbin = TJSLoadStructuredDataPack(stream, result);
+                    if(TJSArrayStructTraceEnabled()) {
+                        spdlog::info(
+                            "Array.loadStruct data-pack file={} loaded={}",
+                            name.AsStdString(), isbin);
+                    }
+                }
             } catch(...) {
                 delete stream;
                 throw;
@@ -390,7 +552,7 @@ namespace TJS {
             delete stream;
             if(isbin)
                 return TJS_S_OK;
-            return TJS_E_INVALIDPARAM;
+            return TJSLoadStructuredText(result, name, mode, context);
         }
         TJS_END_NATIVE_METHOD_DECL(/*func. name*/ loadStruct)
         //----------------------------------------------------------------------
@@ -736,6 +898,114 @@ namespace TJS {
             return TJS_S_OK;
         }
         TJS_END_NATIVE_METHOD_DECL(/* func.name */ reverse)
+        //----------------------------------------------------------------------
+        TJS_BEGIN_NATIVE_METHOD_DECL(/* func.name */ forEach) {
+            TJS_GET_NATIVE_INSTANCE(/* var. name */ ni,
+                                    /* var. type */ tTJSArrayNI);
+
+            if(numparams < 1)
+                return TJS_E_BADPARAMCOUNT;
+
+            // Artemis' Array.forEach accepts either a callback closure or a
+            // member name.  The callback form receives (item, index, ...),
+            // while the member-name form invokes that member with the
+            // remaining arguments.  A non-void callback result is a request
+            // to stop and is also the method result.
+            const bool callMember = param[0]->Type() == tvtString;
+            ttstr memberName;
+            tTJSVariantClosure callback(nullptr, nullptr);
+            if(callMember) {
+                memberName = *param[0];
+            } else if(param[0]->Type() == tvtObject) {
+                callback = param[0]->AsObjectClosureNoAddRef();
+                if(!callback.Object)
+                    return TJS_E_INVALIDOBJECT;
+            } else {
+                return TJS_E_INVALIDTYPE;
+            }
+
+            // Take a snapshot so a callback may add/remove elements without
+            // invalidating the iteration or changing the current sequence.
+            const std::vector<tTJSVariant> items(ni->Items.begin(),
+                                                 ni->Items.end());
+            for(size_t i = 0; i < items.size(); ++i) {
+                tTJSVariant callbackResult;
+                tjs_error hr;
+
+                if(callMember) {
+                    if(items[i].Type() != tvtObject)
+                        continue;
+
+                    const tTJSVariantClosure item =
+                        items[i].AsObjectClosureNoAddRef();
+                    if(!item.Object)
+                        continue;
+
+                    hr = item.FuncCall(
+                        0, memberName.c_str(), memberName.GetHint(),
+                        &callbackResult, numparams - 1,
+                        numparams > 1 ? param + 1 : nullptr, nullptr);
+                } else {
+                    tTJSVariant index(static_cast<tjs_int>(i));
+                    std::vector<tTJSVariant *> callbackParams;
+                    callbackParams.reserve(static_cast<size_t>(numparams) + 1);
+                    callbackParams.push_back(
+                        const_cast<tTJSVariant *>(&items[i]));
+                    callbackParams.push_back(&index);
+                    for(tjs_int p = 1; p < numparams; ++p)
+                        callbackParams.push_back(param[p]);
+
+                    hr = callback.FuncCall(
+                        0, nullptr, nullptr, &callbackResult,
+                        static_cast<tjs_int>(callbackParams.size()),
+                        callbackParams.data(), nullptr);
+                }
+
+                if(TJS_FAILED(hr))
+                    return hr;
+                if(callbackResult.Type() != tvtVoid) {
+                    if(result)
+                        *result = callbackResult;
+                    return TJS_S_OK;
+                }
+            }
+
+            if(result)
+                result->Clear();
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_METHOD_DECL(/* func.name */ forEach)
+        //----------------------------------------------------------------------
+        TJS_BEGIN_NATIVE_METHOD_DECL(/* func.name */ includes) {
+            TJS_GET_NATIVE_INSTANCE(/* var. name */ ni,
+                                    /* var. type */ tTJSArrayNI);
+
+            if(numparams < 1)
+                return TJS_E_BADPARAMCOUNT;
+            if(result) {
+                tTJSVariant &value = *param[0];
+                tjs_int start = 0;
+                if(numparams >= 2)
+                    start = *param[1];
+                if(start < 0)
+                    start += static_cast<tjs_int>(ni->Items.size());
+                if(start < 0)
+                    start = 0;
+                if(start >= static_cast<tjs_int>(ni->Items.size())) {
+                    *result = 0;
+                    return TJS_S_OK;
+                }
+
+                auto item = ni->Items.begin() + start;
+                for(; item != ni->Items.end(); ++item) {
+                    if(value.DiscernCompare(*item))
+                        break;
+                }
+                *result = item == ni->Items.end() ? 0 : 1;
+            }
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_METHOD_DECL(/* func.name */ includes)
         //----------------------------------------------------------------------
         TJS_BEGIN_NATIVE_METHOD_DECL(/* func.name */ assign) {
             TJS_GET_NATIVE_INSTANCE(/* var. name */ ni,
@@ -1290,6 +1560,11 @@ void tTJSArrayNI::AssignStructure(iTJSDispatch2 *dsp,
         try {
             Items.clear();
 
+            // Deep snapshots know their final element count. Reserve once so
+            // growing the destination does not repeatedly copy the closures
+            // that have already been cloned.
+            Items.reserve(arrayni->Items.size());
+
             tArrayItemIterator i;
             for(i = arrayni->Items.begin(); i != arrayni->Items.end(); i++) {
                 tTJSVariantType type = i->Type();
@@ -1598,6 +1873,14 @@ tjs_error tTJSArrayObject::FuncCallByNum(tjs_uint32 flag, tjs_int num,
 tjs_error tTJSArrayObject::PropGet(tjs_uint32 flag, const tjs_char *membername,
                                    tjs_uint32 *hint, tTJSVariant *result,
                                    iTJSDispatch2 *objthis) {
+    if(membername && !TJS_strcmp(membername, TJS_W("Exception"))) {
+        tTJS *engine = TVPGetScriptEngine();
+        iTJSDispatch2 *global =
+            engine ? engine->GetGlobalNoAddRef() : nullptr;
+        if(global)
+            return global->PropGet(flag, membername, hint, result, global);
+    }
+
     tjs_int idx;
     if(membername && IsNumber(membername, idx))
         return PropGetByNum(flag, idx, result, objthis);

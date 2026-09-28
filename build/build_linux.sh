@@ -1,213 +1,203 @@
 #!/usr/bin/env bash
-#
-# build_linux.sh — One-step build script for krkr2 Linux x64 (Flutter)
-#
-# Usage:
-#   ./build_linux.sh [debug|release]
-#
-# Output: Flutter Linux desktop bundle with bundled native engine
-#
-# This script will:
-#   1. Build the C++ engine shared library (libengine_api.so) via CMake/Ninja
-#   2. Build the Flutter Linux application
-#   3. Bundle the engine .so into the Flutter bundle
-#
-
 set -euo pipefail
 
-# ============================================================
-# Configuration
-# ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=tools/linux_env.sh
+source "$PROJECT_ROOT/tools/linux_env.sh"
 
 BUILD_TYPE="${1:-debug}"
 BUILD_TYPE_LOWER="$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
-
+BUILD_TYPE_CAP="$(tr '[:lower:]' '[:upper:]' <<< "${BUILD_TYPE_LOWER:0:1}")${BUILD_TYPE_LOWER:1}"
 if [[ "$BUILD_TYPE_LOWER" != "debug" && "$BUILD_TYPE_LOWER" != "release" ]]; then
-    echo "Error: Invalid build type '$BUILD_TYPE'. Use 'debug' or 'release'."
+    echo "Error: invalid build type '$BUILD_TYPE'. Use 'debug' or 'release'." >&2
     exit 1
 fi
 
-# Capitalize for CMake preset names
-BUILD_TYPE_CAP="$(echo "${BUILD_TYPE_LOWER:0:1}" | tr '[:lower:]' '[:upper:]')${BUILD_TYPE_LOWER:1}"
-
+GODOT_APP_DIR="$PROJECT_ROOT/apps/godot_app"
+GODOT_TEMPLATE_VERSION="${GODOT_TEMPLATE_VERSION:-4.7.stable}"
+GODOT_EXPORT_TEMPLATE="${GODOT_EXPORT_TEMPLATE:-$GODOT_TEMPLATE_DIR/$GODOT_TEMPLATE_VERSION/linux_${BUILD_TYPE_LOWER}.x86_64}"
 CMAKE_CONFIG_PRESET="Linux ${BUILD_TYPE_CAP} Config"
 CMAKE_BUILD_PRESET="Linux ${BUILD_TYPE_CAP} Build"
 CMAKE_BUILD_DIR="$PROJECT_ROOT/out/linux/$BUILD_TYPE_LOWER"
+GODOT_BIN_DIR="$GODOT_APP_DIR/bin/linux/$BUILD_TYPE_LOWER"
+GODOT_EXPORT_PRESET="Linux ${BUILD_TYPE_CAP}"
+GODOT_EXPORT_MODE="--export-debug"
+PARALLEL_JOBS="${JOBS:-8}"
+if [[ "$BUILD_TYPE_LOWER" == "release" ]]; then
+    GODOT_EXPORT_MODE="--export-release"
+fi
 
-if [[ -d "$PROJECT_ROOT/.devtools/flutter" ]]; then
-    FLUTTER_SDK="$PROJECT_ROOT/.devtools/flutter"
-    FLUTTER_BIN="$FLUTTER_SDK/bin/flutter"
-elif command -v flutter >/dev/null 2>&1; then
-    FLUTTER_BIN="$(command -v flutter)"
-    if command -v realpath >/dev/null 2>&1; then
-        RESOLVED_BIN="$(realpath "$FLUTTER_BIN")"
-    elif command -v python3 >/dev/null 2>&1; then
-        RESOLVED_BIN="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$FLUTTER_BIN")"
-    else
-        RESOLVED_BIN="$FLUTTER_BIN"
+ensure_vcpkg() {
+    if [[ ! -f "$VCPKG_ROOT/.vcpkg-root" ]]; then
+        echo "vcpkg is missing. Run tools/setup_linux.sh first." >&2
+        exit 1
     fi
-    FLUTTER_SDK="$(dirname "$(dirname "$RESOLVED_BIN")")"
-else
-    echo "Error: Flutter SDK not found in .devtools and not in PATH."
+    if [[ ! -x "$VCPKG_ROOT/vcpkg" ]]; then
+        (cd "$VCPKG_ROOT" && ./bootstrap-vcpkg.sh -disableMetrics)
+    fi
+}
+
+ensure_vcpkg
+
+ensure_godot_project_cache() {
+    local project_metadata_dir="$GODOT_APP_DIR/.godot"
+    local cache_metadata_dir="$AETHERKIRI_CACHE_DIR/godot-project"
+
+    if [[ -L "$project_metadata_dir" ]]; then
+        mkdir -p "$cache_metadata_dir"
+        return
+    fi
+    if [[ -e "$project_metadata_dir" && ! -L "$project_metadata_dir" ]]; then
+        echo "Using existing Godot project metadata at $project_metadata_dir"
+        return
+    fi
+    mkdir -p "$cache_metadata_dir"
+    ln -s "$cache_metadata_dir" "$project_metadata_dir"
+}
+
+ensure_godot_project_cache
+command -v cmake >/dev/null
+NINJA_BIN="${CMAKE_MAKE_PROGRAM:-$(command -v ninja || command -v ninja-build || true)}"
+if [[ -z "$NINJA_BIN" ]]; then
+    echo "Error: Ninja is required for the Linux build." >&2
     exit 1
 fi
+export CMAKE_MAKE_PROGRAM="$NINJA_BIN"
 
-FLUTTER_APP_DIR="$PROJECT_ROOT/apps/flutter_app"
+stage_vcpkg_runtime_libraries() {
+    local source_library="$1"
+    local runtime_dir="$CMAKE_BUILD_DIR/vcpkg_installed/x64-linux/lib"
+    local resolved_library
 
-if [[ -d "$PROJECT_ROOT/.devtools/vcpkg/.git" ]]; then
-    VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
-elif [[ -n "${VCPKG_ROOT:-}" && -f "$VCPKG_ROOT/.vcpkg-root" ]]; then
-    # Keep the environment VCPKG_ROOT if set
-    :
-else
-    echo "[INFO] vcpkg not found. Automatically setting up vcpkg in .devtools/vcpkg..."
-    mkdir -p "$PROJECT_ROOT/.devtools"
-    git clone https://github.com/microsoft/vcpkg.git "$PROJECT_ROOT/.devtools/vcpkg"
-    (cd "$PROJECT_ROOT/.devtools/vcpkg" && ./bootstrap-vcpkg.sh -disableMetrics)
-    VCPKG_ROOT="$PROJECT_ROOT/.devtools/vcpkg"
-fi
+    if [[ ! -d "$runtime_dir" ]]; then
+        echo "Error: vcpkg runtime library directory is missing: $runtime_dir" >&2
+        exit 1
+    fi
 
-PARALLEL_JOBS="${JOBS:-8}"
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-# ============================================================
-# Helper functions
-# ============================================================
-log_step() {
-    echo ""
-    echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}  $1${NC}"
-    echo -e "${CYAN}========================================${NC}"
+    while IFS= read -r resolved_library; do
+        [[ -n "$resolved_library" ]] || continue
+        cp -Lf "$resolved_library" "$GODOT_BIN_DIR/"
+    done < <(
+        LD_LIBRARY_PATH="$runtime_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            ldd "$source_library" | awk -v runtime_dir="$runtime_dir/" '
+                $2 == "=>" && index($3, runtime_dir) == 1 { print $3 }
+            ' | sort -u
+    )
 }
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+stage_all_vcpkg_runtime_libraries() {
+    local previous_count=-1
+    local current_count
+    local library
+
+    while true; do
+        current_count="$(find "$GODOT_BIN_DIR" -maxdepth 1 -type f -name 'lib*.so*' | wc -l)"
+        if [[ "$current_count" == "$previous_count" ]]; then
+            break
+        fi
+        previous_count="$current_count"
+        while IFS= read -r -d '' library; do
+            stage_vcpkg_runtime_libraries "$library"
+        done < <(find "$GODOT_BIN_DIR" -maxdepth 1 -type f -name 'lib*.so*' -print0)
+    done
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+verify_linux_libraries() {
+    local library
+    local missing=0
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+    while IFS= read -r -d '' library; do
+        if ldd "$library" | grep -q 'not found'; then
+            ldd "$library" >&2
+            missing=1
+        fi
+    done < <(find "$1" -maxdepth 1 -type f -name '*.so*' -print0)
 
-check_command() {
-    if ! command -v "$1" &>/dev/null; then
-        log_error "'$1' is not installed or not in PATH."
+    if ((missing)); then
+        echo "Error: Linux runtime bundle has unresolved shared-library dependencies." >&2
         exit 1
     fi
 }
 
-# ============================================================
-# Pre-flight checks
-# ============================================================
-log_step "Pre-flight checks"
+strip_linux_runtime_symbols() {
+    local binaries=()
+    local binary
 
-check_command cmake
-check_command ninja
+    while IFS= read -r -d '' binary; do
+        binaries+=("$binary")
+    done < <(find "$@" -maxdepth 1 -type f \
+        \( -name 'AetherKiri.x86_64' -o -name '*.so' -o -name '*.so.*' \) \
+        -print0)
+    if ((${#binaries[@]})); then
+        "$PROJECT_ROOT/tools/strip_runtime_symbols.sh" elf "${binaries[@]}"
+    fi
+}
 
-if [[ ! -x "$FLUTTER_BIN" ]]; then
-    log_error "Flutter SDK not found at: $FLUTTER_SDK"
-    log_info "Expected path: $FLUTTER_BIN"
-    exit 1
-fi
+stage_export_runtime_libraries() {
+    find "$GODOT_BIN_DIR" -maxdepth 1 -type f -name 'lib*.so*' \
+        -exec cp -Lf {} "$GODOT_EXPORT_DIR/" \;
+}
 
-if [[ ! -d "$VCPKG_ROOT" ]]; then
-    log_error "vcpkg not found at: $VCPKG_ROOT"
-    exit 1
-fi
+stage_release_extension_for_editor_scan() {
+    if [[ "$BUILD_TYPE_LOWER" != "release" ]]; then
+        return
+    fi
 
-log_info "Build type:    $BUILD_TYPE_CAP"
-log_info "Project root:  $PROJECT_ROOT"
-log_info "CMake preset:  $CMAKE_BUILD_PRESET"
-log_info "Flutter SDK:   $FLUTTER_SDK"
-log_info "Parallel jobs: $PARALLEL_JOBS"
+    # Godot opens the host debug GDExtension while importing the project,
+    # including before a release export. Use the ABI-compatible release
+    # runtime for that scan when this job has not built debug yet.
+    local debug_dir="$GODOT_APP_DIR/bin/linux/debug"
+    mkdir -p "$debug_dir"
+    find "$GODOT_BIN_DIR" -maxdepth 1 -type f -name 'lib*.so*' \
+        -exec cp -Lf {} "$debug_dir/" \;
+}
 
-# ============================================================
-# Step 1: Build C++ engine (shared library for Linux)
-# ============================================================
-log_step "Step 1/3: Building C++ engine"
-
-export VCPKG_ROOT
-
-# Always run a fresh configure so cached package/library paths do not drift
-log_info "Running fresh CMake configure..."
-cmake --preset "$CMAKE_CONFIG_PRESET" --fresh
-
-# Build
-log_info "Building C++ engine with $PARALLEL_JOBS parallel jobs..."
+echo "==> Building Linux engine and Godot extension"
+cmake --preset "$CMAKE_CONFIG_PRESET" \
+    -D "CMAKE_MAKE_PROGRAM=$CMAKE_MAKE_PROGRAM" \
+    -D "AETHERKIRI_ENABLE_INTERNAL=${AETHERKIRI_ENABLE_INTERNAL:-ON}"
 cmake --build --preset "$CMAKE_BUILD_PRESET" -- -j"$PARALLEL_JOBS"
 
-# Verify the shared library was built
-ENGINE_SO="$CMAKE_BUILD_DIR/bridge/engine_api/libengine_api.so"
-if [[ ! -f "$ENGINE_SO" ]]; then
-    log_error "Engine shared library not found at: $ENGINE_SO"
-    log_error "C++ engine build may have failed."
+mkdir -p "$GODOT_BIN_DIR"
+cp -f "$CMAKE_BUILD_DIR/bridge/engine_api/libengine_api.so" "$GODOT_BIN_DIR/"
+cp -f "$CMAKE_BUILD_DIR/bridge/godot_extension/libaether_kiri_godot.so" "$GODOT_BIN_DIR/"
+stage_all_vcpkg_runtime_libraries
+if [[ "$BUILD_TYPE_LOWER" == "release" ]]; then
+    echo "==> Removing non-runtime symbols from staged Linux Release libraries"
+    strip_linux_runtime_symbols "$GODOT_BIN_DIR"
+fi
+
+if readelf -d "$GODOT_BIN_DIR/libengine_api.so" | grep -Fq "$CMAKE_BUILD_DIR"; then
+    echo "Error: engine API retains a build-directory runtime path." >&2
+    exit 1
+fi
+verify_linux_libraries "$GODOT_BIN_DIR"
+stage_release_extension_for_editor_scan
+
+if [[ ! -x "$GODOT_BIN" ]]; then
+    echo "Error: Godot not found at $GODOT_BIN. Run tools/setup_linux.sh first." >&2
+    exit 1
+fi
+if [[ ! -f "$GODOT_EXPORT_TEMPLATE" ]]; then
+    echo "Error: Linux export template not found at $GODOT_EXPORT_TEMPLATE. Run tools/setup_linux.sh first." >&2
     exit 1
 fi
 
-log_info "Engine shared library built: $ENGINE_SO"
+echo "==> Validating GDExtension in headless Godot"
+"$GODOT_BIN" --headless --path "$GODOT_APP_DIR" --editor --quit
 
-# ============================================================
-# Step 2: Build Flutter Linux app
-# ============================================================
-log_step "Step 2/3: Building Flutter Linux app"
+GODOT_EXPORT_DIR="$PROJECT_ROOT/out/godot/linux/$BUILD_TYPE_LOWER"
+GODOT_EXPORT_APP="$GODOT_EXPORT_DIR/AetherKiri.x86_64"
+mkdir -p "$GODOT_EXPORT_DIR"
+echo "==> Exporting Linux Godot application"
+"$GODOT_BIN" --headless --path "$GODOT_APP_DIR" \
+    "$GODOT_EXPORT_MODE" "$GODOT_EXPORT_PRESET" "$GODOT_EXPORT_APP"
 
-export PATH="$FLUTTER_SDK/bin:$PATH"
-
-log_info "Running flutter pub get..."
-(cd "$FLUTTER_APP_DIR" && "$FLUTTER_BIN" pub get)
-
-FLUTTER_BUILD_MODE="$BUILD_TYPE_LOWER"
-log_info "Building Flutter Linux app ($FLUTTER_BUILD_MODE)..."
-(cd "$FLUTTER_APP_DIR" && "$FLUTTER_BIN" build linux --"$FLUTTER_BUILD_MODE")
-
-# Locate the bundle output directory
-BUNDLE_DIR="$FLUTTER_APP_DIR/build/linux/x64/$FLUTTER_BUILD_MODE/bundle"
-if [[ ! -d "$BUNDLE_DIR" ]]; then
-    log_error "Flutter Linux bundle not found at: $BUNDLE_DIR"
-    exit 1
+stage_export_runtime_libraries
+if [[ "$BUILD_TYPE_LOWER" == "release" ]]; then
+    echo "==> Removing non-runtime symbols from exported Linux Release application"
+    strip_linux_runtime_symbols "$GODOT_EXPORT_DIR"
 fi
-
-log_info "Flutter Linux bundle built: $BUNDLE_DIR"
-
-# ============================================================
-# Step 3: Bundle engine .so into Flutter bundle
-# ============================================================
-log_step "Step 3/3: Bundling engine .so into Flutter bundle"
-
-LIB_DIR="$BUNDLE_DIR/lib"
-mkdir -p "$LIB_DIR"
-
-cp -f "$ENGINE_SO" "$LIB_DIR/libengine_api.so"
-log_info "Copied libengine_api.so -> $LIB_DIR/"
-
-# Also copy any vcpkg shared libs that weren't statically linked
-VCPKG_LIB_DIR="$CMAKE_BUILD_DIR/vcpkg_installed/x64-linux/lib"
-if [[ -d "$VCPKG_LIB_DIR" ]]; then
-    while IFS= read -r -d '' sofile; do
-        cp -f "$sofile" "$LIB_DIR/"
-        log_info "  Bundled vcpkg .so: $(basename "$sofile")"
-    done < <(find "$VCPKG_LIB_DIR" -maxdepth 1 -name "*.so*" -type f -print0 2>/dev/null)
-fi
-
-# ============================================================
-# Done
-# ============================================================
-log_step "Build complete!"
-
-log_info "Bundle: $BUNDLE_DIR"
-log_info "Engine: $LIB_DIR/libengine_api.so"
-echo ""
-log_info "To run the app:"
-echo "  \"$BUNDLE_DIR/aetherkiri\""
-echo ""
+verify_linux_libraries "$GODOT_EXPORT_DIR"
+echo "Linux build output: $GODOT_EXPORT_APP"

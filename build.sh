@@ -7,11 +7,13 @@
 #   ./build.sh                          # Interactive platform selection
 #
 # Platforms:
-#   android, ios, macos, linux
+#   android, ios, macos, linux, web
 #
 # Options:
 #   debug|release       Build type (default: debug)
 #   --abi=<abis>        Android only: target ABIs (default: arm64-v8a)
+#   --simulator         iOS only: build for iOS Simulator
+#   --package-ipa       iOS only: build unsigned .ipa package for sideloading
 #   --jobs=<N>          Parallel build jobs (default: 8)
 #   --clean             Clean build artifacts before building
 #   --help, -h          Show this help message
@@ -20,6 +22,7 @@
 #   ./build.sh android debug --abi=arm64-v8a
 #   ./build.sh ios release
 #   ./build.sh macos debug --jobs=16
+#   ./build.sh web release
 #   ./build.sh --clean android release
 #
 
@@ -27,6 +30,30 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_SCRIPTS_DIR="$SCRIPT_DIR/build"
+
+# Keep the private package opt-in at the build boundary. CI sets
+# AETHERKIRI_WITH_INTERNAL; local builds auto-detect the checked-out package.
+internal_setting="${AETHERKIRI_ENABLE_INTERNAL:-}"
+if [[ -z "$internal_setting" && -n "${AETHERKIRI_WITH_INTERNAL:-}" ]]; then
+    internal_setting="$AETHERKIRI_WITH_INTERNAL"
+fi
+if [[ -z "$internal_setting" ]]; then
+    internal_package_dir="${AETHERKIRI_INTERNAL_DIR:-$SCRIPT_DIR/packages/AetherInternal}"
+    if [[ -f "$internal_package_dir/cmake/AetherInternalConfig.cmake" ]]; then
+        internal_setting="ON"
+    else
+        internal_setting="OFF"
+    fi
+fi
+case "$(printf '%s' "$internal_setting" | tr '[:upper:]' '[:lower:]')" in
+    1|on|true|yes) AETHERKIRI_ENABLE_INTERNAL="ON" ;;
+    0|off|false|no) AETHERKIRI_ENABLE_INTERNAL="OFF" ;;
+    *)
+        echo "[ERROR] AETHERKIRI_ENABLE_INTERNAL must be ON/OFF or true/false, got: $internal_setting" >&2
+        exit 1
+        ;;
+esac
+export AETHERKIRI_ENABLE_INTERNAL
 
 # Colors
 RED='\033[0;31m'
@@ -47,23 +74,27 @@ show_help() {
     echo "  ./build.sh                          # Interactive platform selection"
     echo ""
     echo "Platforms:"
-    echo "  android    Build Android APK (Flutter + native engine)"
-    echo "  ios        Build iOS app (C++ static lib + Flutter)"
-    echo "  macos      Build macOS app (C++ dylib + Flutter)"
-    echo "  linux      Build Linux x64 app (C++ .so + Flutter)"
+    echo "  android    Build Android Godot APK"
+    echo "  ios        Build iOS Godot app/export project"
+    echo "  macos      Build macOS Godot app"
+    echo "  linux      Build Linux Godot app"
+    echo "  web        Build Godot Web export with GDExtension side module"
     echo ""
     echo "Options:"
-    echo "  debug|release       Build type (default: debug)"
-    echo "  --abi=<abis>        Android only: comma-separated ABIs"
-    echo "                      (arm64-v8a, armeabi-v7a, x86_64, x86)"
-    echo "  --jobs=<N>          Parallel build jobs (default: 8)"
-    echo "  --clean             Clean build artifacts before building"
-    echo "  --help, -h          Show this help message"
+    echo "  debug|release       Build type (default: debug)
+  --abi=<abis>        Android only: comma-separated ABIs
+                      (arm64-v8a, armeabi-v7a, x86_64, x86)
+  --simulator         iOS only: build for iOS Simulator
+  --package-ipa       iOS only: build unsigned .ipa package for sideloading
+  --jobs=<N>          Parallel build jobs (default: 8)
+  --clean             Clean build artifacts before building
+  --help, -h          Show this help message"
     echo ""
     echo "Examples:"
     echo "  ./build.sh android debug --abi=arm64-v8a"
     echo "  ./build.sh ios release"
     echo "  ./build.sh macos debug --jobs=16"
+    echo "  ./build.sh web release"
     echo "  ./build.sh --clean android release"
     echo ""
 }
@@ -88,13 +119,22 @@ for arg in "$@"; do
         --jobs=*)
             export JOBS="${arg#*=}"
             ;;
-        android|ios|macos|linux)
+        android|ios|macos|linux|web)
             PLATFORM="$arg"
             ;;
         debug|release|Debug|Release)
             BUILD_TYPE="$(echo "$arg" | tr '[:upper:]' '[:lower:]')"
             ;;
         --abi=*)
+            EXTRA_ARGS+=("$arg")
+            ;;
+        --simulator)
+            EXTRA_ARGS+=("$arg")
+            ;;
+        --simulator-arch=*)
+            EXTRA_ARGS+=("$arg")
+            ;;
+        --package-ipa|--unsigned-ipa|--ipa)
             EXTRA_ARGS+=("$arg")
             ;;
         *)
@@ -119,19 +159,40 @@ if [[ -z "$PLATFORM" ]]; then
     echo "  2) ios"
     echo "  3) macos"
     echo "  4) linux"
+    echo "  5) web"
     echo ""
-    read -rp "Enter choice [1-4]: " choice
+    read -rp "Enter choice [1-5]: " choice
     case "$choice" in
         1|android)  PLATFORM="android" ;;
         2|ios)      PLATFORM="ios" ;;
         3|macos)    PLATFORM="macos" ;;
         4|linux)    PLATFORM="linux" ;;
+        5|web)      PLATFORM="web" ;;
         *)
             echo -e "${RED}[ERROR]${NC} Invalid choice: $choice"
             exit 1
             ;;
     esac
     echo ""
+
+    # Interactive build type selection after choosing platform
+    if [[ -z "$BUILD_TYPE" ]]; then
+        echo "Select build type:"
+        echo ""
+        echo "  1) debug (default)"
+        echo "  2) release"
+        echo ""
+        read -rp "Enter choice [1-2] (default: 1): " bt_choice
+        case "$bt_choice" in
+            ""|1|debug|Debug)   BUILD_TYPE="debug" ;;
+            2|release|Release)  BUILD_TYPE="release" ;;
+            *)
+                echo -e "${RED}[ERROR]${NC} Invalid choice: $bt_choice"
+                exit 1
+                ;;
+        esac
+        echo ""
+    fi
 fi
 
 # Default build type
@@ -156,19 +217,29 @@ if [[ "$CLEAN" == true ]]; then
     echo -e "${CYAN}Cleaning build artifacts for $PLATFORM...${NC}"
     case "$PLATFORM" in
         android)
-            rm -rf "$SCRIPT_DIR/apps/flutter_app/build/app"
-            rm -rf "$SCRIPT_DIR/apps/flutter_app/build/.cxx"
+            rm -rf "$SCRIPT_DIR/out/android"
+            rm -rf "$SCRIPT_DIR/out/godot/android/$BUILD_TYPE"
             echo -e "${GREEN}[INFO]${NC} Android build artifacts cleaned."
             ;;
         ios)
             rm -rf "$SCRIPT_DIR/out/ios/$BUILD_TYPE"
-            rm -rf "$SCRIPT_DIR/apps/flutter_app/build/ios"
+            rm -rf "$SCRIPT_DIR/out/godot/ios/$BUILD_TYPE"
             echo -e "${GREEN}[INFO]${NC} iOS build artifacts cleaned."
             ;;
         macos)
             rm -rf "$SCRIPT_DIR/out/macos/$BUILD_TYPE"
-            rm -rf "$SCRIPT_DIR/apps/flutter_app/build/macos"
+            rm -rf "$SCRIPT_DIR/out/godot/macos/$BUILD_TYPE"
             echo -e "${GREEN}[INFO]${NC} macOS build artifacts cleaned."
+            ;;
+        linux)
+            rm -rf "$SCRIPT_DIR/out/linux/$BUILD_TYPE"
+            rm -rf "$SCRIPT_DIR/out/godot/linux/$BUILD_TYPE"
+            echo -e "${GREEN}[INFO]${NC} Linux build artifacts cleaned."
+            ;;
+        web)
+            rm -rf "$SCRIPT_DIR/out/web/$BUILD_TYPE"
+            rm -rf "$SCRIPT_DIR/out/godot/web/$BUILD_TYPE"
+            echo -e "${GREEN}[INFO]${NC} Web build artifacts cleaned."
             ;;
     esac
     echo ""

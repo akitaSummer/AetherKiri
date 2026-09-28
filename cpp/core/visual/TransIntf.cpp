@@ -223,7 +223,6 @@ tjs_error tTVPScanLineProviderForBaseBitmap::GetHeight(/*in*/ tjs_int *height) {
         *height = Bitmap->GetHeight();
     return TJS_S_OK;
 }
-#if 0
 //---------------------------------------------------------------------------
 tjs_error
 	tTVPScanLineProviderForBaseBitmap::GetPixelFormat(/*out*/tjs_int *bpp)
@@ -269,7 +268,6 @@ tjs_error
 	return TJS_S_OK;
 }
 //---------------------------------------------------------------------------
-#endif
 
 iTVPTexture2D *tTVPScanLineProviderForBaseBitmap::GetTexture() {
     return Bitmap->GetTexture();
@@ -799,6 +797,16 @@ public:
             TVPThrowExceptionMessage(TVPSpecifyOption, TJS_W("time"));
         if(time < 2)
             time = 2; // too small time may cause problem
+
+#if defined(__EMSCRIPTEN__)
+        static bool logged_web_universal_fallback = false;
+        if(!logged_web_universal_fallback) {
+            logged_web_universal_fallback = true;
+            spdlog::info("web: using crossfade fallback for universal transitions");
+        }
+        return (iTVPBaseTransHandler *)(new tTVPCrossFadeTransHandler(
+            options, layertype, time));
+#endif
 
         // retrieve "vague" option
         tjs_int64 vague;

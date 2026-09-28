@@ -38,6 +38,12 @@
 #include "FilePathUtil.h"
 #include "Application.h"
 #include "SysInitImpl.h"
+#include "UtilStreams.h"
+
+#if defined(_WIN32)
+#undef GetClassName
+#undef GetMessage
+#endif
 
 #ifdef _MSC_VER
 #define strcasecmp _stricmp
@@ -49,6 +55,69 @@ bool TVPRegisterGlobalObject(const tjs_char *name, iTJSDispatch2 *dsp);
 
 static iTJSDispatch2 *s_ProxyStorageMap = nullptr;
 static iTVPStorageMedia *s_ProxyStorageMedia = nullptr;
+static ttstr TVPPluginLoadMode(TJS_W("krkrsdl3"));
+
+static ttstr TVPNormalizePluginLoadMode(const ttstr &mode) {
+    ttstr normalized = mode.AsLowerCase();
+    if(normalized == TJS_W("aether_all"))
+        return TJS_W("aether_all");
+    return TJS_W("krkrsdl3");
+}
+
+void TVPSetPluginLoadMode(const ttstr &mode) {
+    TVPPluginLoadMode = TVPNormalizePluginLoadMode(mode);
+}
+
+const ttstr &TVPGetPluginLoadMode() { return TVPPluginLoadMode; }
+
+bool TVPIsKrkrsdl3PluginLoadMode() {
+    return TVPPluginLoadMode == TJS_W("krkrsdl3");
+}
+
+bool TVPIsAetherAllPluginLoadMode() {
+    return TVPPluginLoadMode == TJS_W("aether_all");
+}
+
+class tTJSNC_BootstrapLinkZResult : public tTJSDispatch {
+    tjs_uint RefCount = 1;
+
+public:
+    tjs_uint AddRef() override { return ++RefCount; }
+    tjs_uint Release() override {
+        if(--RefCount == 0) {
+            delete this;
+            return 0;
+        }
+        return RefCount;
+    }
+
+    tjs_error FuncCall(tjs_uint32, const tjs_char *, tjs_uint32 *,
+                       tTJSVariant *result, tjs_int, tTJSVariant **,
+                       iTJSDispatch2 *) override {
+        if(result)
+            *result = static_cast<tjs_int>(1);
+        return TJS_S_OK;
+    }
+
+    tjs_error PropGet(tjs_uint32, const tjs_char *, tjs_uint32 *,
+                      tTJSVariant *result, iTJSDispatch2 *) override {
+        if(result) {
+            AddRef();
+            *result = tTJSVariant(this, this);
+        }
+        return TJS_S_OK;
+    }
+
+    tjs_error PropSet(tjs_uint32, const tjs_char *, tjs_uint32 *,
+                      const tTJSVariant *, iTJSDispatch2 *) override {
+        return TJS_S_OK;
+    }
+
+    tjs_error IsValid(tjs_uint32, const tjs_char *, tjs_uint32 *,
+                      iTJSDispatch2 *) override {
+        return TJS_S_TRUE;
+    }
+};
 
 class tTJSNI_GamepadStub : public tTJSNativeInstance {
 public:
@@ -94,6 +163,9 @@ public:
         TJS_BEGIN_NATIVE_METHOD_DECL(refresh) { return TJS_S_OK; }
         TJS_END_NATIVE_METHOD_DECL(refresh)
 
+        TJS_BEGIN_NATIVE_METHOD_DECL(resetKeyPressState) { return TJS_S_OK; }
+        TJS_END_NATIVE_METHOD_DECL(resetKeyPressState)
+
         TJS_BEGIN_NATIVE_METHOD_DECL(remove) { return TJS_S_OK; }
         TJS_END_NATIVE_METHOD_DECL(remove)
 
@@ -137,6 +209,13 @@ public:
             return TJS_S_OK;
         }
         TJS_END_NATIVE_METHOD_DECL(getCount)
+
+        TJS_BEGIN_NATIVE_METHOD_DECL(getController) {
+            if(result)
+                result->Clear();
+            return TJS_S_OK;
+        }
+        TJS_END_NATIVE_METHOD_DECL(getController)
 
         TJS_BEGIN_NATIVE_PROP_DECL(count) {
             TJS_BEGIN_NATIVE_PROP_GETTER {
@@ -277,10 +356,16 @@ static bool TVPQueryProxyValue(const ttstr &name, tTJSVariant &value) {
 
 static bool TVPLookupProxyTarget(const ttstr &name, ttstr *resolved) {
     tTJSVariant value;
-    if(!TVPQueryProxyValue(name, value) || value.Type() != tvtString)
+    if(!TVPQueryProxyValue(name, value) ||
+       (value.Type() != tvtString && value.Type() != tvtOctet &&
+        value.Type() != tvtObject))
         return false;
 
     if(resolved) {
+        if(value.Type() != tvtString) {
+            resolved->Clear();
+            return true;
+        }
         *resolved = value.GetString();
         return !resolved->IsEmpty();
     }
@@ -340,6 +425,67 @@ public:
         return TVPLookupProxyTarget(name, nullptr);
     }
     tTJSBinaryStream *Open(const ttstr &name, tjs_uint32 flags) override {
+        tTJSVariant value;
+        if(!TVPQueryProxyValue(name, value)) {
+            TVPThrowExceptionMessage(TJS_W("cannot open proxyfile:%1"), name);
+            return nullptr;
+        }
+
+        const tjs_uint32 access = flags & TJS_BS_ACCESS_MASK;
+        if(access != TJS_BS_READ) {
+            // PackinOne permits only read access for proxy entries.  Keep the
+            // same error boundary for strings, octets, and dispatch objects.
+            TVPThrowExceptionMessage(TJS_W("write mode not supported:%1"),
+                                     name);
+            return nullptr;
+        }
+
+        if(value.Type() == tvtOctet) {
+            auto *octet = value.AsOctetNoAddRef();
+            if(!octet) {
+                TVPThrowExceptionMessage(TJS_W("cannot open proxyfile:%1"),
+                                         name);
+                return nullptr;
+            }
+
+            // The octet belongs to the TJS variant.  Copy it into an owning
+            // stream before the variant goes out of scope; the IDA reference
+            // follows the same copy-into-MemStreamHolder path.
+            auto *stream = new tTVPMemoryStream();
+            try {
+                if(octet->GetLength() != 0)
+                    stream->Write(octet->GetData(), octet->GetLength());
+                stream->Seek(0, TJS_BS_SEEK_SET);
+                return stream;
+            } catch(...) {
+                delete stream;
+                TVPThrowExceptionMessage(TJS_W("cannot open proxyfile:%1"),
+                                         name);
+                return nullptr;
+            }
+        }
+
+        if(value.Type() == tvtObject) {
+            // A dispatch-valued entry is handled by the native PSB/stream
+            // bridge when it exposes a binary-stream object.  The generic
+            // fallback below intentionally remains read-only and reports a
+            // normal proxy-open failure for unsupported dispatch objects.
+            iTJSDispatch2 *object = value.AsObjectNoAddRef();
+            if(object) {
+                tTJSVariant streamValue;
+                if(TJS_SUCCEEDED(object->PropGet(
+                       TJS_IGNOREPROP, TJS_W("stream"), nullptr,
+                       &streamValue, object)) &&
+                   streamValue.Type() == tvtObject &&
+                   streamValue.AsObjectNoAddRef()) {
+                    object = streamValue.AsObjectNoAddRef();
+                }
+                (void)object;
+            }
+            TVPThrowExceptionMessage(TJS_W("cannot open proxyfile:%1"), name);
+            return nullptr;
+        }
+
         ttstr resolved;
         if(!TVPLookupProxyTarget(name, &resolved)) {
             TVPThrowExceptionMessage(TJS_W("cannot open proxyfile:%1"), name);
@@ -431,15 +577,15 @@ static void TVPUnregisterProxyFsStub() {
 }
 
 // gamepad.dll 未实现时注册 stub，避免 exgamepad.tjs 访问 GamepadPort 报错（逆向见：global["GamepadPort"]/["Gamepad"]，脚本用 SystemConfig.GamepadPort）
-static void TVPRegisterGamepadStub() {
+static bool TVPRegisterGamepadStub() {
     iTJSDispatch2 *stub = new tTJSNC_GamepadStub();
     if(!stub)
-        return;
+        return false;
 
     iTJSDispatch2 *global = TVPGetScriptDispatch();
     if(!global) {
         stub->Release();
-        return;
+        return false;
     }
 
     tTJSVariant val(stub);
@@ -456,6 +602,7 @@ static void TVPRegisterGamepadStub() {
     global->Release();
     stub->Release();
     spdlog::info("Registered GamepadPort/Gamepad stub for missing gamepad.dll");
+    return true;
 }
 
 static void TVPRegisterGfxFireStub() {
@@ -477,6 +624,17 @@ static void TVPRegisterGfxFireStub() {
     spdlog::info("Registered gfxFire stub for missing gfxEffect.dll");
 }
 
+static void TVPRegisterFontInfoStub() {
+    try {
+        TVPExecuteScript(TJS_W(
+            "System._fontInfoMap = %[];\n"
+            "System.getFontInfoMap = function() { return System._fontInfoMap; };\n"));
+        spdlog::info("Registered System.getFontInfoMap stub for missing fontInfo.dll");
+    } catch(...) {
+        spdlog::warn("Failed to register fontInfo.dll compatibility stub");
+    }
+}
+
 void TVPLoadPlugin(const ttstr &name) {
     ttstr normalizedShortName = TVPGetNormalizedPluginName(name);
     ttstr resolvedName = name;
@@ -493,6 +651,27 @@ void TVPLoadPlugin(const ttstr &name) {
         }
     }
 
+    if(!loaded && TJS::TVPIsMockEnabled()) {
+        if(normalizedShortName == TJS_W("gamepad.dll")) {
+            loaded = TVPRegisterGamepadStub();
+            if(loaded) {
+                TVPRegisteredPlugins.insert(normalizedShortName);
+                stub = "GamepadStub";
+            }
+        } else if(normalizedShortName == TJS_W("fontinfo.dll")) {
+            TVPRegisterFontInfoStub();
+            TVPRegisteredPlugins.insert(normalizedShortName);
+            loaded = true;
+            stub = "FontInfoStub";
+        } else if(normalizedShortName == TJS_W("tenshin.tpm") ||
+                  normalizedShortName == TJS_W("tenshin.dll")) {
+            TVPRegisteredPlugins.insert(normalizedShortName);
+            loaded = true;
+            stub = "TenshinNoopStub";
+            spdlog::info("Registered no-op compatibility stub for {}", name.AsStdString());
+        }
+    }
+
     if(loaded) {
         spdlog::debug("Loading Plugin: {} Success", name.AsStdString());
         PluginCallTracer::Instance().LogPluginLoad(name.AsStdString(), true,
@@ -501,10 +680,7 @@ void TVPLoadPlugin(const ttstr &name) {
         spdlog::error("Loading Plugin: {} Failed", name.AsStdString());
         const char *stub = nullptr;
         if(TJS::TVPIsMockEnabled()) {
-            if(normalizedShortName == TJS_W("gamepad.dll")) {
-                TVPRegisterGamepadStub();
-                stub = "GamepadStub";
-            } else if(normalizedShortName == TJS_W("gfxeffect.dll") ||
+            if(normalizedShortName == TJS_W("gfxeffect.dll") ||
                       normalizedShortName == TJS_W("gfxfire.dll")) {
                 TVPRegisterGfxFireStub();
                 stub = "gfxFireStub";
@@ -524,8 +700,7 @@ bool TVPUnloadPlugin(const ttstr &name) {
         return true;
     }
 
-    // unload plugin
-    return true;
+    return ncbAutoRegister::UnloadModule(normalizedShortName);
 }
 //---------------------------------------------------------------------------
 
@@ -542,12 +717,13 @@ struct tTVPFoundPlugin {
 static tjs_int TVPAutoLoadPluginCount = 0;
 
 static void TVPSearchPluginsAt(std::vector<tTVPFoundPlugin> &list,
-                               std::string folder) {
+                               std::string folder, bool includeDll) {
     TVPListDir(folder, [&](const std::string &filename, int mask) {
         if(mask & S_IFREG) {
             if(filename.length() >= 4) {
                 const char *ext = filename.c_str() + filename.length() - 4;
-                if(!strcasecmp(ext, ".tpm") || !strcasecmp(ext, ".dll")) {
+                if(!strcasecmp(ext, ".tpm") ||
+                   (includeDll && !strcasecmp(ext, ".dll"))) {
                     tTVPFoundPlugin fp;
                     fp.Path = folder;
                     fp.Name = filename;
@@ -560,9 +736,34 @@ static void TVPSearchPluginsAt(std::vector<tTVPFoundPlugin> &list,
 
 void TVPLoadInternalPlugins() {
     PluginCallTracer::Instance().LogRegistrationStart();
+    tTJSVariant mode;
+    if(TVPGetCommandLine(TJS_W("plugin_load_mode"), &mode))
+        TVPSetPluginLoadMode(mode.AsStringNoAddRef());
+
+    spdlog::info("TVPLoadInternalPlugins: plugin_load_mode={}",
+                 TVPPluginLoadMode.AsStdString());
     ncbAutoRegister::AllRegist();
-    ncbAutoRegister::LoadAllModules();
+    // A number of older Artemis titles construct Offscreen/Texture objects
+    // from their first startup script, before they explicitly link any GPU
+    // helper script.  Keep the graphics compatibility module available at
+    // the same point as the other internal plug-ins so those global classes
+    // exist during startup in both core and full load modes.
+    ncbAutoRegister::LoadModule(TJS_W("krkrgles.dll"));
+    if(TVPIsAetherAllPluginLoadMode()) {
+        ncbAutoRegister::LoadAllModules();
+    } else {
+        TVPLoadPlugin(TJS_W("xp3filter.dll"));
+        TVPLoadPlugin(TJS_W("varfile.dll"));
+        TVPLoadPlugin(TJS_W("shrinkCopy.dll"));
+    }
     PluginCallTracer::Instance().LogRegistrationEnd();
+}
+
+void TVPUnloadInternalPlugins() {
+    ncbAutoRegister::UnloadAllModules();
+    TVPUnregisterProxyFsStub();
+    TVPRegisteredPlugins.clear();
+    TVPAutoLoadPluginCount = 0;
 }
 
 bool TVPLoadInternalPlugin(const ttstr &_name) {
@@ -633,9 +834,10 @@ void tvpLoadPlugins() {
 
     std::string exepath = ExtractFileDir(TVPNativeProjectDir.AsStdString());
 
-    TVPSearchPluginsAt(list, exepath);
-    TVPSearchPluginsAt(list, exepath + "/system");
-    TVPSearchPluginsAt(list, exepath + "/plugin");
+    const bool includeDll = TVPIsAetherAllPluginLoadMode();
+    TVPSearchPluginsAt(list, exepath, includeDll);
+    TVPSearchPluginsAt(list, exepath + "/system", includeDll);
+    TVPSearchPluginsAt(list, exepath + "/plugin", includeDll);
 
     // sort by filename
     std::sort(list.begin(), list.end());
@@ -781,10 +983,75 @@ tTJSNativeClass *TVPCreateNativeClass_Plugins() {
 
         return TJS_S_OK;
     }
-    TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(
+TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(
         /*object to register*/ cls,
         /*func. name*/ link)
-    //----------------------------------------------------------------------
+    TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ linkZ) {
+        if(numparams < 1)
+            return TJS_E_BADPARAMCOUNT;
+
+        ttstr name = *param[0];
+        const ttstr lower_name = name.AsLowerCase();
+        const bool is_bres_resource =
+            lower_name.StartsWith(TJS_W("bres://"));
+        if(is_bres_resource) {
+            const tjs_char *path = name.c_str() + 7;
+            if(path[0] == TJS_W('/')) {
+                while(path[0] == TJS_W('/'))
+                    ++path;
+            } else {
+                const tjs_char *slash = TJS_strchr(path, TJS_W('/'));
+                path = slash != nullptr ? slash + 1 : path;
+            }
+            name = ttstr(path);
+        }
+
+        ttstr normalized = TVPExtractStorageName(name);
+        ttstr lower = normalized.AsLowerCase();
+        const tjs_char *raw = lower.c_str();
+        const tjs_int len = lower.length();
+        bool is_plugin = false;
+        if(len >= 4) {
+            const tjs_char *suffix = raw + len - 4;
+            is_plugin = !TJS_strcmp(suffix, TJS_W(".dll")) ||
+                        !TJS_strcmp(suffix, TJS_W(".tpm"));
+        }
+
+        if(is_plugin) {
+            TVPLoadPlugin(name);
+        } else if(is_bres_resource) {
+            // linkZ consumes a binary KiriKiri-Z resource and returns its
+            // exported object. It is not Scripts.execStorage: treating the
+            // module bytes as TJS text fails immediately on the binary
+            // header. The host-side proxy below provides the bootstrap
+            // surface used by PackinOne startup code.
+            PluginCallTracer::Instance().LogPluginLoad(
+                name.AsStdString(), true, "linkZ BRes module bridged");
+        } else {
+            TVPExecuteStorage(name);
+            PluginCallTracer::Instance().LogPluginLoad(
+                name.AsStdString(), true, "linkZ resource executed");
+        }
+
+        if(result) {
+            iTJSDispatch2 *bootstrap = new tTJSNC_BootstrapLinkZResult();
+            *result = tTJSVariant(bootstrap, bootstrap);
+            bootstrap->Release();
+        }
+
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(
+        /*object to register*/ cls,
+        /*func. name*/ linkZ)
+    TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ bootStrap) {
+        if(result)
+            *result = static_cast<tjs_int>(1);
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(
+        /*object to register*/ cls,
+        /*func. name*/ bootStrap)
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ unlink) {
         if(numparams < 1)
             return TJS_E_BADPARAMCOUNT;

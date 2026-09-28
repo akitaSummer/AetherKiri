@@ -12,6 +12,9 @@
 #include "tjsCommHead.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
 #include "MsgIntf.h"
 #include "VideoOvlImpl.h"
 #include "DebugIntf.h"
@@ -26,6 +29,11 @@
 
 #include "Application.h"
 #include "combase.h"
+
+static bool VideoTraceEnabled() {
+    const char *value = std::getenv("AETHERKIRI_VIDEO_TRACE");
+    return value != nullptr && value[0] != '\0';
+}
 
 extern void GetVideoOverlayObject(tTJSNI_VideoOverlay *callbackwin,
                                   struct IStream *stream,
@@ -50,6 +58,14 @@ extern void GetMFVideoOverlayObject(tTJSNI_VideoOverlay *callbackwin,
                                     const tjs_char *streamname,
                                     const tjs_char *type, uint64_t size,
                                     class iTVPVideoOverlay **out);
+
+static void TVPShutdownAndReleaseVideoOverlay(iTVPVideoOverlay *&overlay) {
+    if(!overlay)
+        return;
+    overlay->ShutdownPlayer();
+    overlay->Release();
+    overlay = nullptr;
+}
 
 //---------------------------------------------------------------------------
 static std::vector<tTJSNI_VideoOverlay *> TVPVideoOverlayVector;
@@ -119,12 +135,20 @@ tjs_error tTJSNI_VideoOverlay::Construct(tjs_int numparams, tTJSVariant **param,
 }
 //---------------------------------------------------------------------------
 void tTJSNI_VideoOverlay::Invalidate() {
+    if(VideoTraceEnabled()) {
+        std::fprintf(stderr,
+                     "[video-trace] overlay.invalidate this=%p native=%p layer1=%p layer2=%p file=%s status=%d\n",
+                     static_cast<void *>(this), static_cast<void *>(VideoOverlay),
+                     static_cast<void *>(Layer1), static_cast<void *>(Layer2),
+                     CachedPlayingFile.AsStdString().c_str(),
+                     static_cast<int>(Status));
+        std::fflush(stderr);
+    }
     inherited::Invalidate();
 
     Close();
     if(CachedOverlay) {
-        CachedOverlay->Release();
-        CachedOverlay = nullptr;
+        TVPShutdownAndReleaseVideoOverlay(CachedOverlay);
     }
     EventQueue.Deallocate();
 }
@@ -183,8 +207,7 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name) {
             VideoOverlay->Rewind();
         } else {
             if(CachedOverlay) {
-                CachedOverlay->Release();
-                CachedOverlay = nullptr;
+                TVPShutdownAndReleaseVideoOverlay(CachedOverlay);
             }
             if(Mode == vomLayer)
                 GetVideoLayerObject(EventQueue.GetOwner(), istream,
@@ -246,15 +269,22 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name) {
 }
 //---------------------------------------------------------------------------
 void tTJSNI_VideoOverlay::Close() {
+    if(VideoTraceEnabled()) {
+        std::fprintf(stderr,
+                     "[video-trace] overlay.close this=%p native=%p layer1=%p layer2=%p file=%s status=%d\n",
+                     static_cast<void *>(this), static_cast<void *>(VideoOverlay),
+                     static_cast<void *>(Layer1), static_cast<void *>(Layer2),
+                     CachedPlayingFile.AsStdString().c_str(),
+                     static_cast<int>(Status));
+        std::fflush(stderr);
+    }
     if(VideoOverlay) {
         if(CachedOverlay) {
-            CachedOverlay->Release();
-            CachedOverlay = nullptr;
+            TVPShutdownAndReleaseVideoOverlay(CachedOverlay);
         }
         VideoOverlay->SetVisible(false);
         VideoOverlay->Pause();
-        VideoOverlay->Release();
-        VideoOverlay = nullptr;
+        TVPShutdownAndReleaseVideoOverlay(VideoOverlay);
     }
     if(LocalTempStorageHolder)
         delete LocalTempStorageHolder, LocalTempStorageHolder = nullptr;
@@ -277,13 +307,11 @@ void tTJSNI_VideoOverlay::Shutdown() {
     try {
         if(VideoOverlay) {
             if(CachedOverlay) {
-                CachedOverlay->Release();
-                CachedOverlay = nullptr;
+                TVPShutdownAndReleaseVideoOverlay(CachedOverlay);
             }
             VideoOverlay->SetVisible(false);
             VideoOverlay->Pause();
-            VideoOverlay->Release();
-            VideoOverlay = nullptr;
+            TVPShutdownAndReleaseVideoOverlay(VideoOverlay);
         }
     } catch(...) {
         CanDeliverEvents = c;
@@ -311,6 +339,15 @@ void tTJSNI_VideoOverlay::Play() {
 //---------------------------------------------------------------------------
 void tTJSNI_VideoOverlay::Stop() {
     // stop playing
+    if(VideoTraceEnabled()) {
+        std::fprintf(stderr,
+                     "[video-trace] overlay.stop this=%p native=%p layer1=%p layer2=%p file=%s status=%d frame=%d\n",
+                     static_cast<void *>(this), static_cast<void *>(VideoOverlay),
+                     static_cast<void *>(Layer1), static_cast<void *>(Layer2),
+                     CachedPlayingFile.AsStdString().c_str(),
+                     static_cast<int>(Status), VideoOverlay ? GetFrame() : -1);
+        std::fflush(stderr);
+    }
     if(VideoOverlay) {
         VideoOverlay->Stop();
         ClearWndProcMessages();
@@ -521,6 +558,12 @@ void tTJSNI_VideoOverlay::WndProc(NativeEvent &ev) {
                     evcode = ev.WParam;
                     switch(evcode) {
                         case EC_COMPLETE:
+                            if(VideoTraceEnabled())
+                                spdlog::info(
+                                    "VideoOverlay EC_COMPLETE status={} mode={} loop={} overlay={}",
+                                    static_cast<int>(Status),
+                                    static_cast<int>(Mode), Loop ? 1 : 0,
+                                    static_cast<const void *>(VideoOverlay));
                             if(Status == ssPlay) {
                                 if(Loop) {
                                     Rewind();
@@ -528,18 +571,15 @@ void tTJSNI_VideoOverlay::WndProc(NativeEvent &ev) {
                                         perLoop); // fire period event
                                                   // by loop rewind
                                 } else {
-                                    TVPAddLog(TJS_W("(info) Video EC_COMPLETE: releasing video resources"));
-                                    SetStatusAsync(ssStop);
+                                    // Keep the layer bitmaps alive until script-side
+                                    // Close(); Layer1/Layer2 may still reference the
+                                    // most recent video frame after completion.
                                     VideoOverlay->Stop();
-                                    if(CachedOverlay) {
-                                        CachedOverlay->Release();
-                                        CachedOverlay = nullptr;
-                                    }
-                                    VideoOverlay->Release();
-                                    VideoOverlay = nullptr;
-                                    if(Bitmap[0]) { delete Bitmap[0]; Bitmap[0] = nullptr; }
-                                    if(Bitmap[1]) { delete Bitmap[1]; Bitmap[1] = nullptr; }
-                                    BmpBits[0] = BmpBits[1] = nullptr;
+                                    SetStatusAsync(ssStop); // All data has been rendered
+                                    if(VideoTraceEnabled())
+                                        spdlog::info(
+                                            "VideoOverlay EC_COMPLETE posted stop status mode={}",
+                                            static_cast<int>(Mode));
                                 }
                             }
                             break;
@@ -595,17 +635,22 @@ void tTJSNI_VideoOverlay::WndProc(NativeEvent &ev) {
                                 }
                                 tTVPBaseTexture *buff =
                                     VideoOverlay->GetFrontBuffer();
+                                if(buff == nullptr) {
+                                    return;
+                                }
                                 if(buff == Bitmap[0]) {
                                     if(l1)
                                         l1->AssignMainImage(Bitmap[0]);
                                     if(l2)
                                         l2->AssignMainImage(Bitmap[0]);
-                                } else // 0じゃなかったら、1とみなす。
+                                } else if(buff == Bitmap[1])
                                 {
                                     if(l1)
                                         l1->AssignMainImage(Bitmap[1]);
                                     if(l2)
                                         l2->AssignMainImage(Bitmap[1]);
+                                } else {
+                                    return;
                                 }
                                 if(l1)
                                     l1->Update();

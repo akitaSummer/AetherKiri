@@ -4,11 +4,13 @@
 #include FT_SFNT_NAMES_H
 #include FT_FREETYPE_H
 #include "StorageIntf.h"
+#include "SysInitIntf.h"
 #include "DebugIntf.h"
 #include "MsgIntf.h"
 #include <map>
 #include <cmath>
 #include "Application.h"
+#include "FontSystem.h"
 #include "Platform.h"
 #include "ConfigManager/IndividualConfigManager.h"
 #ifndef M_PI
@@ -17,23 +19,40 @@
 
 #include <fstream>
 #include <vector>
+#include <algorithm>
+#include <cctype>
+#include <dirent.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include "StorageImpl.h"
 #include "BinaryStream.h"
 #include <spdlog/spdlog.h>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <CoreFoundation/CoreFoundation.h>
 #if TARGET_OS_IOS
 #include <CoreText/CoreText.h>
-#include <CoreFoundation/CoreFoundation.h>
 #endif
 #endif
 
 tTJSHashTable<ttstr, TVPFontNamePathInfo, tTVPttstrHash> TVPFontNames;
 static ttstr TVPDefaultFontName;
 const ttstr &TVPGetDefaultFontName() { return TVPDefaultFontName; }
+extern FontSystem *TVPFontSystem;
+
+bool TVPSetDefaultFontName(const ttstr &fontName) {
+    if(fontName.IsEmpty() || !TVPFindFont(fontName))
+        return false;
+
+    TVPDefaultFontName = fontName;
+    if(TVPFontSystem)
+        TVPFontSystem->SetDefaultFontName(fontName);
+    spdlog::info("default font face set: {}", fontName.AsStdString());
+    return true;
+}
+
 void TVPGetAllFontList(std::vector<ttstr> &list) {
-    auto itend = TVPFontNames.GetLast();
-    for(auto it = TVPFontNames.GetFirst(); it != itend; ++it) {
+    for(auto it = TVPFontNames.GetFirst(); !it.IsNull(); ++it) {
         list.push_back(it.GetKey());
     }
 }
@@ -62,7 +81,8 @@ void TVPReleaseFontLibrary() {
 //---------------------------------------------------------------------------
 static int TVPInternalEnumFonts(
     FT_Byte *pBuf, int buflen, const ttstr &FontPath,
-    const std::function<tTJSBinaryStream *(TVPFontNamePathInfo *)> &getter) {
+    const std::function<tTJSBinaryStream *(TVPFontNamePathInfo *)> &getter,
+    std::vector<ttstr> *fontNames = nullptr) {
     unsigned int faceCount = 0;
     FT_Face fontface;
     FT_Error error =
@@ -122,9 +142,14 @@ static int TVPInternalEnumFonts(
                 }
                 TVPFontNamePathInfo info;
                 info.Path = FontPath;
-                info.Index = j;
+                info.Index = i;
                 info.Getter = getter;
                 TVPFontNames.Add(fontname, info);
+                if(fontNames &&
+                   std::find(fontNames->begin(), fontNames->end(), fontname) ==
+                       fontNames->end()) {
+                    fontNames->emplace_back(fontname);
+                }
                 addCount = 1;
             }
             /*if (!addCount)*/ {
@@ -134,6 +159,11 @@ static int TVPInternalEnumFonts(
                 info.Index = i;
                 info.Getter = getter;
                 TVPFontNames.Add(fontname, info);
+                if(fontNames &&
+                   std::find(fontNames->begin(), fontNames->end(), fontname) ==
+                       fontNames->end()) {
+                    fontNames->emplace_back(fontname);
+                }
             }
             ++faceCount;
         }
@@ -148,7 +178,8 @@ static int TVPInternalEnumFonts(
  * @param FontPath font path str
  * @return load failed return 0, otherwise > 0
  */
-int TVPEnumFontsProc(const ttstr &FontPath) {
+int TVPEnumFontsProc(const ttstr &FontPath,
+                     std::vector<ttstr> *fontNames) {
     if(!TVPIsExistentStorageNoSearch(FontPath)) {
         return 0;
     }
@@ -162,7 +193,8 @@ int TVPEnumFontsProc(const ttstr &FontPath) {
     buf.resize(bufflen);
     Stream->ReadBuffer(&buf.front(), bufflen);
     delete Stream;
-    return TVPInternalEnumFonts(&buf.front(), bufflen, FontPath, nullptr);
+    return TVPInternalEnumFonts(&buf.front(), bufflen, FontPath, nullptr,
+                                fontNames);
 }
 
 tTJSBinaryStream *TVPCreateFontStream(const ttstr &fontname) {
@@ -193,32 +225,200 @@ void TVPInitFontNames() {
 #ifdef __ANDROID__
     std::vector<ttstr> pathlist = Android_GetExternalStoragePath();
 #endif
+    auto tryReadFont = [](const std::string &path) -> std::vector<uint8_t> {
+        std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+        if(!ifs.is_open())
+            return {};
+        auto size = ifs.tellg();
+        if(size <= 0)
+            return {};
+        std::vector<uint8_t> data(static_cast<size_t>(size));
+        ifs.seekg(0);
+        ifs.read(reinterpret_cast<char *>(data.data()), size);
+        return data;
+    };
+
+    auto tryLoadFontDirect = [&tryReadFont](const std::string &path,
+                                            const std::string &label) -> bool {
+        auto fdata = tryReadFont(path);
+        if(fdata.empty())
+            return false;
+        spdlog::info("loaded font: {}", path);
+        return TVPInternalEnumFonts(
+                   fdata.data(), fdata.size(), label.c_str(),
+                   [&tryReadFont](TVPFontNamePathInfo *info) -> tTJSBinaryStream * {
+                       auto d = tryReadFont(info->Path.AsStdString());
+                       if(d.empty())
+                           return nullptr;
+                       auto *ret = new tTVPMemoryStream();
+                       ret->WriteBuffer(d.data(), d.size());
+                       ret->SetPosition(0);
+                       return ret;
+                   }) > 0;
+    };
+
+    auto tryLoadFontStorageOrDirect = [&tryLoadFontDirect](const ttstr &path) -> bool {
+        if(path.IsEmpty())
+            return false;
+        if(TVPEnumFontsProc(path))
+            return true;
+        std::string nativePath = path.AsStdString();
+        return tryLoadFontDirect(nativePath, nativePath);
+    };
+
+    auto joinNativePath = [](std::string folder,
+                             const std::string &leaf) -> std::string {
+        if(folder.empty())
+            return leaf;
+        if(folder.back() != '/' && folder.back() != '\\')
+            folder.push_back('/');
+        folder += leaf;
+        return folder;
+    };
+
+    auto tryLoadDefaultFontFromNativeDir =
+        [&tryLoadFontDirect, &joinNativePath](const std::string &folder) -> bool {
+            if(folder.empty())
+                return false;
+            static const char *kDefaultFontNames[] = {
+                "default.ttf", "default.ttc", "default.otf", "default.otc",
+                nullptr
+            };
+            for(const char **name = kDefaultFontNames; *name; ++name) {
+                const std::string path = joinNativePath(folder, *name);
+                if(tryLoadFontDirect(path, path))
+                    return true;
+            }
+            return false;
+        };
+
+#ifdef __APPLE__
+    auto appleBundleResourceDirs = []() -> std::vector<std::string> {
+        std::vector<std::string> dirs;
+        CFBundleRef bundle = CFBundleGetMainBundle();
+        if(!bundle)
+            return dirs;
+        CFURLRef resourceURL = CFBundleCopyResourcesDirectoryURL(bundle);
+        if(!resourceURL)
+            return dirs;
+        char path[PATH_MAX] = {};
+        if(CFURLGetFileSystemRepresentation(resourceURL, true,
+                                            reinterpret_cast<UInt8 *>(path),
+                                            sizeof(path))) {
+            dirs.emplace_back(path);
+            std::string fontDir(path);
+            if(!fontDir.empty() && fontDir.back() != '/')
+                fontDir.push_back('/');
+            fontDir += "fonts";
+            dirs.emplace_back(std::move(fontDir));
+        }
+        CFRelease(resourceURL);
+        return dirs;
+    };
+#endif
+
+    auto isFontFilePath = [](std::string path) -> bool {
+        auto slash = path.find_last_of("/\\");
+        if(slash != std::string::npos)
+            path = path.substr(slash + 1);
+        auto dot = path.find_last_of('.');
+        if(dot == std::string::npos)
+            return false;
+        std::string ext = path.substr(dot);
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return ext == ".ttf" || ext == ".ttc" || ext == ".otf" || ext == ".otc";
+    };
+
+    auto enumDirectFontDir = [&tryLoadFontDirect, &isFontFilePath](const ttstr &folder) -> int {
+        std::string dirPath = folder.AsStdString();
+        if(dirPath.empty())
+            return 0;
+        DIR *dir = opendir(dirPath.c_str());
+        if(!dir)
+            return 0;
+        int count = 0;
+        while(auto *entry = readdir(dir)) {
+            std::string name = entry->d_name;
+            if(name == "." || name == ".." || !isFontFilePath(name))
+                continue;
+            std::string fullPath = dirPath;
+            if(!fullPath.empty() && fullPath.back() != '/')
+                fullPath.push_back('/');
+            fullPath += name;
+            struct stat st {};
+            if(stat(fullPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+            if(tryLoadFontDirect(fullPath, fullPath))
+                ++count;
+        }
+        closedir(dir);
+        return count;
+    };
+
+    auto enumStorageFontDir = [&tryLoadFontStorageOrDirect, &isFontFilePath](const ttstr &folder) {
+        ttstr nativeFolder = folder;
+        try {
+            TVPGetLocalName(nativeFolder);
+        } catch(...) {
+            nativeFolder = folder;
+        }
+        TVPGetLocalFileListAt(nativeFolder, [&](const ttstr &, tTVPLocalFileInfo *s) {
+            if(!(s->Mode & S_IFREG) || !s->NativeName)
+                return;
+            std::string nativeName = s->NativeName;
+            if(!isFontFilePath(nativeName))
+                return;
+            ttstr fullPath = nativeFolder;
+            if(fullPath.GetLastChar() != TJS_W('/'))
+                fullPath += TJS_W("/");
+            fullPath += ttstr(nativeName.c_str());
+            tryLoadFontStorageOrDirect(fullPath);
+        });
+    };
+
     do {
+        tTJSVariant defaultFontOpt;
+        if(TVPGetCommandLine(TJS_W("default_font"), &defaultFontOpt)) {
+            ttstr defaultFontPath(defaultFontOpt);
+            if(tryLoadFontStorageOrDirect(defaultFontPath))
+                break;
+        }
+
         ttstr userFont =
             IndividualConfigManager::GetInstance()->GetValue<std::string>(
                 "default_font", "");
-        if(!userFont.IsEmpty() && TVPEnumFontsProc(userFont))
+        if(!userFont.IsEmpty() && tryLoadFontStorageOrDirect(userFont))
             break;
 
-        if(TVPEnumFontsProc(TVPGetAppPath() + "default.ttf"))
+#ifdef __APPLE__
+        for(const auto &folder : appleBundleResourceDirs()) {
+            if(tryLoadDefaultFontFromNativeDir(folder))
+                break;
+        }
+        if(TVPFontNames.GetCount() > 0)
             break;
-        if(TVPEnumFontsProc(TVPGetAppPath() + "default.ttc"))
+#endif
+
+        if(tryLoadFontStorageOrDirect(TVPGetAppPath() + "default.ttf"))
             break;
-        if(TVPEnumFontsProc(TVPGetAppPath() + "default.otf"))
+        if(tryLoadFontStorageOrDirect(TVPGetAppPath() + "default.ttc"))
             break;
-        if(TVPEnumFontsProc(TVPGetAppPath() + "default.otc"))
+        if(tryLoadFontStorageOrDirect(TVPGetAppPath() + "default.otf"))
+            break;
+        if(tryLoadFontStorageOrDirect(TVPGetAppPath() + "default.otc"))
             break;
 #if defined(__ANDROID__)
         int fontCount = 0;
         for(const ttstr &path : pathlist) {
-            fontCount += TVPEnumFontsProc(path + "/default.ttf");
+            fontCount += tryLoadFontStorageOrDirect(path + "/default.ttf");
             if(fontCount)
                 break;
         }
         if(fontCount)
             break;
 
-        if(TVPEnumFontsProc(Android_GetInternalStoragePath() + "/default.ttf"))
+        if(tryLoadFontStorageOrDirect(Android_GetInternalStoragePath() + "/default.ttf"))
             break;
 
 #elif defined(WIN32)
@@ -244,38 +444,7 @@ void TVPInitFontNames() {
             break;
 #endif
 #endif
-
         { // from internal storage (or system fonts on iOS)
-            // Read font file using standard file I/O
-            auto tryReadFont = [](const std::string &path) -> std::vector<uint8_t> {
-                std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-                if (!ifs.is_open()) return {};
-                auto size = ifs.tellg();
-                if (size <= 0) return {};
-                std::vector<uint8_t> data(static_cast<size_t>(size));
-                ifs.seekg(0);
-                ifs.read(reinterpret_cast<char*>(data.data()), size);
-                return data;
-            };
-
-            // Helper: load a font from POSIX path and register it.
-            auto tryLoadFontDirect = [&tryReadFont](const std::string &path,
-                                                     const std::string &label) -> bool {
-                auto fdata = tryReadFont(path);
-                if (fdata.empty()) return false;
-                spdlog::info("loaded system font: {}", path);
-                return TVPInternalEnumFonts(
-                    fdata.data(), fdata.size(), label.c_str(),
-                    [&tryReadFont](TVPFontNamePathInfo *info) -> tTJSBinaryStream * {
-                        auto d = tryReadFont(info->Path.AsStdString());
-                        if (d.empty()) return nullptr;
-                        auto *ret = new tTVPMemoryStream();
-                        ret->WriteBuffer(d.data(), d.size());
-                        ret->SetPosition(0);
-                        return ret;
-                    }) > 0;
-            };
-
 #if defined(__ANDROID__)
             if(tryLoadFontDirect("/system/fonts/NotoSansSC-Regular.otf",
                                  "/system/fonts/NotoSansSC-Regular.otf"))
@@ -357,26 +526,24 @@ void TVPInitFontNames() {
         TVPDefaultFontName = TVPFontNames.GetLast().GetKey();
     }
 
+    tTJSVariant fontDirOpt;
+    if(TVPGetCommandLine(TJS_W("font_dir"), &fontDirOpt)) {
+        enumDirectFontDir(ttstr(fontDirOpt));
+    }
+
     // check exePath + "/fonts/*.ttf"
     {
-        std::vector<ttstr> list;
-        auto lister = [&](const ttstr &name, tTVPLocalFileInfo *s) {
-            if(s->Mode & (S_IFREG | S_IFDIR)) {
-                list.emplace_back(name);
-            }
-        };
 #ifdef __ANDROID__
-        TVPGetLocalFileListAt(Android_GetInternalStoragePath() + "/fonts",
-                              lister);
+        enumDirectFontDir(Android_GetInternalStoragePath() + "/fonts");
         for(const ttstr &path : pathlist) {
-            TVPGetLocalFileListAt(path + "/fonts", lister);
+            enumDirectFontDir(path + "/fonts");
         }
 #endif
-        TVPGetLocalFileListAt(TVPGetAppPath() + "/fonts", lister);
-        auto itend = list.end();
-        for(auto it = list.begin(); it != itend; ++it) {
-            TVPEnumFontsProc(*it);
-        }
+        enumStorageFontDir(TVPGetAppPath() + "/fonts");
+    }
+
+    if(TVPDefaultFontName.IsEmpty() && TVPFontNames.GetCount() > 0) {
+        TVPDefaultFontName = TVPFontNames.GetLast().GetKey();
     }
 
     if(TVPDefaultFontName.IsEmpty()) {

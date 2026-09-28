@@ -2,6 +2,17 @@ cmake_minimum_required(VERSION 3.19)
 project(core_base_module LANGUAGES CXX)
 
 set(BASE_PATH ${CMAKE_CURRENT_LIST_DIR})
+
+set(BASE_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(BASE_D3DEMOTE_RESOURCE ${BASE_PATH}/resources/D3DEmote.tjs)
+set(BASE_D3DEMOTE_SOURCE ${BASE_GENERATED_DIR}/D3DEmote_tjs.cpp)
+file(MAKE_DIRECTORY ${BASE_GENERATED_DIR})
+file(READ ${BASE_D3DEMOTE_RESOURCE} BASE_D3DEMOTE_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1,"
+       BASE_D3DEMOTE_BYTES "${BASE_D3DEMOTE_HEX}")
+configure_file(${BASE_PATH}/resources/D3DEmote_tjs.cpp.in
+               ${BASE_D3DEMOTE_SOURCE} @ONLY)
+
 set(BASE_SOURCE_FILES
     ${BASE_PATH}/7zArchive.cpp
     ${BASE_PATH}/BinaryStream.cpp
@@ -15,6 +26,7 @@ set(BASE_SOURCE_FILES
     ${BASE_PATH}/TextStream.cpp
     ${BASE_PATH}/UtilStreams.cpp
     ${BASE_PATH}/XP3Archive.cpp
+    ${BASE_PATH}/XP3ArchiveCxDecoder.cpp
     ${BASE_PATH}/ZIPArchive.cpp
     ${BASE_PATH}/KAGParser.cpp
     ${BASE_PATH}/MsgIntf.cpp
@@ -27,6 +39,7 @@ set(BASE_SOURCE_FILES
     ${BASE_PATH}/impl/SysInitImpl.cpp
     ${BASE_PATH}/impl/SystemImpl.cpp
     ${BASE_PATH}/impl/MsgImpl.cpp
+    ${BASE_D3DEMOTE_SOURCE}
 )
 
 set(BASE_HEADERS_DIR
@@ -35,6 +48,14 @@ set(BASE_HEADERS_DIR
 )
 
 add_library(${PROJECT_NAME} STATIC ${BASE_SOURCE_FILES})
+
+# Keep Debug symbols while optimizing the event/script bridge.  Scene changes
+# enter through this module and the legacy -Og default makes each queued TJS
+# callback needlessly expensive, even though the visual output is identical.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE -O2)
+endif()
+
 target_include_directories(${PROJECT_NAME} PUBLIC ${BASE_HEADERS_DIR})
 target_link_libraries(${PROJECT_NAME} PUBLIC tjs2 PRIVATE core_visual_module core_plugin_module core_environ_module core_extension_module core_sound_module core_utils_module)
 

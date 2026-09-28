@@ -9,17 +9,22 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include "WindowIntf.h"
 #include <cstring>
 #include <optional>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "LayerIntf.h"
 #include "LayerBitmapIntf.h"
+#include "LayerManager.h"
 #include "GraphicsLoaderIntf.h"
 #include "tvpgl.h"
 #include "RuntimeSupport.h"
@@ -33,6 +38,7 @@
 #include "ScriptMgnIntf.h"
 #include "NodeTree.h"
 #include "MotionNode.h"
+#include "MotionPlayerExtension.h"
 
 #define LOGGER spdlog::get("plugin")
 #define STUB_WARN(name) LOGGER->warn("Player::" #name "() stub called")
@@ -40,11 +46,506 @@
 namespace motion {
 namespace internal {
 
+        inline bool sameMotionOwnershipIdentity(
+            const std::string &childPath,
+            const ttstr &childChara,
+            const ttstr &childMotion,
+            const std::string &ancestorPath,
+            const ttstr &ancestorChara,
+            const ttstr &ancestorMotion) {
+            // One PSB commonly owns several independent objects whose clips
+            // share generic names such as `show`, `normal`, or `off`.  Those
+            // are valid ownership edges (for example TITLE2/show ->
+            // char/show), not recursion.  A cycle requires the complete
+            // resource/object/clip identity to repeat.
+            return childPath == ancestorPath &&
+                childChara == ancestorChara &&
+                childMotion == ancestorMotion;
+        }
+
+        // Binder layers are structural containers. Kirikiri allows them to
+        // participate in the layer tree, but drawable-only APIs such as
+        // GetImageWidth/SetHasImage must never be used on them.
+        inline bool presentationLayerTypeCanReceivePixels(
+            tTVPLayerType type) {
+            return type != ltBinder;
+        }
+
+        inline bool d3dEmoteFrameReuseRouteEligible(
+            bool isEmoteMode,
+            bool retainD3DPresentation,
+            std::size_t commandCount) {
+            return isEmoteMode && !retainD3DPresentation &&
+                commandCount != 0;
+        }
+
+        inline bool d3dEmoteFrameCacheMatches(
+            const detail::PlayerRuntime::EmoteRenderFrameCacheEntry &entry,
+            const std::string &motion,
+            double frame,
+            int canvasWidth,
+            int canvasHeight,
+            std::size_t commandSignature) {
+            return entry.bitmap && entry.motion == motion &&
+                entry.canvasWidth == canvasWidth &&
+                entry.canvasHeight == canvasHeight &&
+                std::fabs(entry.frame - frame) < 0.0001 &&
+                entry.bitmap->GetWidth() == canvasWidth &&
+                entry.bitmap->GetHeight() == canvasHeight &&
+                entry.commandSignature == commandSignature;
+        }
+
+        inline const MotionRenderPolicyV1 *motionRenderPolicy() {
+            const auto *extension = motionPlayerExtension();
+            return extension != nullptr ? extension->renderPolicy : nullptr;
+        }
+
+        inline bool isDifferenceAlphaPassThroughLeaf(
+            bool hasOwnSource,
+            bool groupOnly,
+            int blendMode) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isDifferenceAlphaPassThroughLeaf != nullptr &&
+                policy->isDifferenceAlphaPassThroughLeaf(
+                    hasOwnSource, groupOnly, blendMode);
+        }
+
+        inline bool isIndependentDifferenceAlphaMaskGroup(
+            bool groupOnly,
+            bool hasExplicitMasks,
+            int itemFlags,
+            bool hasConcreteRenderParent) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isIndependentDifferenceAlphaMaskGroup != nullptr &&
+                policy->isIndependentDifferenceAlphaMaskGroup(
+                    groupOnly, hasExplicitMasks, itemFlags,
+                    hasConcreteRenderParent);
+        }
+
+        inline bool canReceiveIndependentDifferenceAlphaMask(
+            bool hasOwnSource,
+            bool groupOnly,
+            int blendMode) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->canReceiveIndependentDifferenceAlphaMask != nullptr &&
+                policy->canReceiveIndependentDifferenceAlphaMask(
+                    hasOwnSource, groupOnly, blendMode);
+        }
+
+        inline bool isSyntheticMotionBlankSource(
+            const std::string &sourceKey) {
+            // E-mote uses blank/<width>:<height>:<origin-x>:<origin-y> as an
+            // intrinsic transparent mesh canvas.  This is part of the motion
+            // stream format, not a resource supplied by an engine extension.
+            if(sourceKey.rfind("blank/", 0) == 0) return true;
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isSyntheticMotionBlankSource != nullptr &&
+                policy->isSyntheticMotionBlankSource(sourceKey);
+        }
+
+        inline bool renderClipCoversCanvas(
+            const std::array<int, 4> &clipRect,
+            int canvasWidth,
+            int canvasHeight) {
+            return canvasWidth > 0 && canvasHeight > 0 &&
+                clipRect[0] <= 0 && clipRect[1] <= 0 &&
+                clipRect[2] >= canvasWidth &&
+                clipRect[3] >= canvasHeight;
+        }
+
+        inline bool
+        startupLogoUsesCenteredOrigin(const std::array<float, 4> &bounds,
+                                      int canvasWidth, int canvasHeight) {
+            if(canvasWidth <= 0 || canvasHeight <= 0 ||
+               !std::all_of(bounds.begin(), bounds.end(),
+                            [](float value) { return std::isfinite(value); })) {
+                return false;
+            }
+
+            const float width = bounds[2] - bounds[0];
+            const float height = bounds[3] - bounds[1];
+            if(width <= 0.0f || height <= 0.0f) {
+                return false;
+            }
+
+            const bool crossesOrigin = bounds[0] < 0.0f && bounds[1] < 0.0f &&
+                bounds[2] > 0.0f && bounds[3] > 0.0f;
+            if(!crossesOrigin) {
+                return false;
+            }
+
+            const float canvasWidthF = static_cast<float>(canvasWidth);
+            const float canvasHeightF = static_cast<float>(canvasHeight);
+            const float centerX = (bounds[0] + bounds[2]) * 0.5f;
+            const float centerY = (bounds[1] + bounds[3]) * 0.5f;
+            const float centeredToleranceX =
+                std::min(canvasWidthF * 0.1f, width * 0.2f + 1e-3f);
+            const float centeredToleranceY =
+                std::min(canvasHeightF * 0.1f, height * 0.2f + 1e-3f);
+            return std::fabs(centerX) <= centeredToleranceX &&
+                std::fabs(centerY) <= centeredToleranceY;
+        }
+
+        inline bool startupLogoMotionUsesCenteredOrigin(
+            std::string motionPath) {
+            std::transform(motionPath.begin(), motionPath.end(),
+                           motionPath.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            return motionPath.find("yuzulogo.mtn") != std::string::npos;
+        }
+
+        inline bool startupLogoMotionScalesAroundCanvasCenter(
+            std::string motionPath) {
+            std::transform(motionPath.begin(), motionPath.end(),
+                           motionPath.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            return motionPath.find("yuzulogo.mtn") != std::string::npos ||
+                motionPath.find("m2logo.mtn") != std::string::npos;
+        }
+
+        inline bool startupLogoMotionUsesStableBackdropReference(
+            std::string motionPath) {
+            std::transform(motionPath.begin(), motionPath.end(),
+                           motionPath.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            return motionPath.find("m2logo.mtn") != std::string::npos;
+        }
+
+        inline bool startupLogoStableBackdropSource(
+            const std::string &motionPath,
+            std::string sourceKey) {
+            if(!startupLogoMotionUsesStableBackdropReference(motionPath)) {
+                return false;
+            }
+            std::transform(sourceKey.begin(), sourceKey.end(),
+                           sourceKey.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            return sourceKey == "src/logo/icon50" ||
+                sourceKey.find("/logo/icon/icon50") != std::string::npos;
+        }
+
+        inline bool startupLogoPresentationScaleAppliesToSource(
+            const std::string &motionPath,
+            const std::string &sourceKey) {
+            return !startupLogoMotionUsesStableBackdropReference(motionPath) ||
+                startupLogoStableBackdropSource(motionPath, sourceKey);
+        }
+
+        inline std::array<float, 2> startupLogoPresentationScale(
+            std::string motionPath,
+            float canvasWidth,
+            float canvasHeight,
+            float referenceWidth,
+            float referenceHeight) {
+            if(!std::isfinite(canvasWidth) || !std::isfinite(canvasHeight) ||
+               !std::isfinite(referenceWidth) ||
+               !std::isfinite(referenceHeight) ||
+               canvasWidth <= 0.0f || canvasHeight <= 0.0f ||
+               referenceWidth <= 0.0f || referenceHeight <= 0.0f) {
+                return { 1.0f, 1.0f };
+            }
+
+            const float scaleX = canvasWidth / referenceWidth;
+            const float scaleY = canvasHeight / referenceHeight;
+            if(startupLogoMotionUsesStableBackdropReference(motionPath)) {
+                const float coveredScale = std::max(scaleX, scaleY);
+                return { coveredScale, coveredScale };
+            }
+            return { scaleX, scaleY };
+        }
+
+        inline bool shouldCaptureYuzuTitlePresentationHoldFrame(
+            bool hadHeldFrame,
+            bool finalFrameRendered,
+            bool hasOpaqueCanvasBaseFrame,
+            bool hasStableFrame,
+            bool hasOpaqueFinalOverlayFrame) {
+            if(!hadHeldFrame) {
+                return hasOpaqueCanvasBaseFrame || hasStableFrame ||
+                    hasOpaqueFinalOverlayFrame;
+            }
+            return !finalFrameRendered && hasOpaqueFinalOverlayFrame;
+        }
+
+        inline bool yuzuTitlePresentationFrameIsStable(
+            bool hasStableComposition,
+            bool hasActiveTransientLogo) {
+            return hasStableComposition && !hasActiveTransientLogo;
+        }
+
+        inline bool yuzuTitlePresentationHoldFrameIsResident(
+            bool exactLayer,
+            bool layerVisible,
+            bool parentVisible,
+            bool hasImage,
+            bool hasMainImage,
+            int opacity) {
+            return exactLayer && layerVisible && parentVisible && hasImage &&
+                hasMainImage && opacity > 0;
+        }
+
+        inline bool isFullCanvasCompositeRenderRoot(
+            bool groupOnly,
+            bool hasRenderParent,
+            bool alphaMaskOnly,
+            int opacity,
+            const std::array<int, 4> &clipRect,
+            int canvasWidth,
+            int canvasHeight) {
+            return groupOnly && !hasRenderParent && !alphaMaskOnly &&
+                opacity > 0 &&
+                renderClipCoversCanvas(
+                    clipRect, canvasWidth, canvasHeight);
+        }
+
+        inline bool isFullCanvasDirectRenderPlane(
+            bool hasOwnSource,
+            bool groupOnly,
+            bool hasRenderParent,
+            bool alphaMaskOnly,
+            int blendMode,
+            int opacity,
+            const std::array<int, 4> &clipRect,
+            int canvasWidth,
+            int canvasHeight) {
+            return hasOwnSource && !groupOnly && !hasRenderParent &&
+                !alphaMaskOnly && blendMode == 0 && opacity > 0 &&
+                renderClipCoversCanvas(
+                    clipRect, canvasWidth, canvasHeight);
+        }
+
+        inline bool isAuthoredDifferenceAlphaPair(
+            const std::string &colourLabel,
+            const std::string &alphaLabel) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isAuthoredDifferenceAlphaPair != nullptr &&
+                policy->isAuthoredDifferenceAlphaPair(
+                    colourLabel, alphaLabel);
+        }
+
+        inline bool isNestedDifferenceAlphaPair(
+            std::size_t colourCommandIndex,
+            const std::vector<std::size_t> &alphaAncestry) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isNestedDifferenceAlphaPair != nullptr &&
+                policy->isNestedDifferenceAlphaPair(
+                    colourCommandIndex, alphaAncestry);
+        }
+
+        inline bool isGenericDifferenceAlphaLabel(
+            const std::string &label) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isGenericDifferenceAlphaLabel != nullptr &&
+                policy->isGenericDifferenceAlphaLabel(label);
+        }
+
+        inline bool isUnambiguousNestedDifferenceAlphaPair(
+            std::size_t nestedPairCount) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->isUnambiguousNestedDifferenceAlphaPair != nullptr &&
+                policy->isUnambiguousNestedDifferenceAlphaPair(
+                    nestedPairCount);
+        }
+
+        inline bool shouldUseCombinedDifferenceAlphaMask(
+            bool hasSelectedPair,
+            std::size_t nestedSourceCount) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->shouldUseCombinedDifferenceAlphaMask != nullptr &&
+                policy->shouldUseCombinedDifferenceAlphaMask(
+                    hasSelectedPair, nestedSourceCount);
+        }
+
+        inline bool shouldRecoverDifferenceAlphaFromRgb(
+            std::size_t alphaPixelCount,
+            std::size_t rgbPixelCount) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                policy->shouldRecoverDifferenceAlphaFromRgb != nullptr &&
+                policy->shouldRecoverDifferenceAlphaFromRgb(
+                    alphaPixelCount, rgbPixelCount);
+        }
+
+        inline std::uint8_t differenceAlphaFromRgb(
+            std::uint8_t blue,
+            std::uint8_t green,
+            std::uint8_t red) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                    policy->differenceAlphaFromRgb != nullptr
+                ? policy->differenceAlphaFromRgb(blue, green, red)
+                : static_cast<std::uint8_t>(0);
+        }
+
+        inline int independentDifferenceAlphaMaskOperation(
+            bool hasAuthoredPair, int groupItemFlags) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                    policy->independentDifferenceAlphaMaskOperation != nullptr
+                ? policy->independentDifferenceAlphaMaskOperation(
+                      hasAuthoredPair, groupItemFlags)
+                : 1;
+        }
+
+        inline std::uint8_t applyMotionAlphaMaskValueLike_0x6AC4E4(
+            std::uint8_t destinationAlpha,
+            std::uint8_t maskAlpha,
+            bool thresholdMaskMode,
+            int operation,
+            std::uint8_t threshold = 64) {
+            const auto *policy = motionRenderPolicy();
+            if(policy != nullptr &&
+               policy->applyMotionAlphaMaskValue != nullptr) {
+                return policy->applyMotionAlphaMaskValue(
+                    destinationAlpha, maskAlpha, thresholdMaskMode,
+                    operation, threshold);
+            }
+            if(operation != 1) {
+                return destinationAlpha;
+            }
+            if(thresholdMaskMode) {
+                return maskAlpha < threshold
+                    ? static_cast<std::uint8_t>(0)
+                    : destinationAlpha;
+            }
+            return static_cast<std::uint8_t>(
+                (static_cast<int>(destinationAlpha) *
+                 static_cast<int>(maskAlpha)) /
+                255);
+        }
+
 
         // Return true if a source path is a motion cross-reference
         // (e.g. "motion/title_bg/char_move"), not an image source.
         inline bool isMotionCrossReference(const std::string &src) {
             return src.rfind("motion/", 0) == 0;
+        }
+
+        inline bool shouldSearchCachedMotionComposition(
+            const std::string &motionRef, const std::string &motionIcon) {
+            const auto *policy = motionRenderPolicy();
+            return policy != nullptr &&
+                    policy->shouldSearchCachedMotionComposition != nullptr
+                ? policy->shouldSearchCachedMotionComposition(
+                      motionRef, motionIcon)
+                : !motionIcon.empty();
+        }
+
+        inline bool isPsbRLCompressName(const std::optional<std::string> &name) {
+            if(!name) {
+                return false;
+            }
+            std::string lowered = *name;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            return lowered == "rl";
+        }
+
+        inline std::string psbDebugLowercase(std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            return value;
+        }
+
+        inline bool shouldDebugPsbSource(
+            const detail::MotionSnapshot &snapshot,
+            const std::string &source) {
+            const char *enabled = std::getenv("AETHERKIRI_MOTION_DEBUG");
+            const bool debugEnabled =
+                enabled && *enabled && std::strcmp(enabled, "0") != 0;
+            if(!debugEnabled) {
+                return false;
+            }
+            const auto path = psbDebugLowercase(snapshot.path);
+            const auto src = psbDebugLowercase(source);
+            return path.find("title.pimg") != std::string::npos ||
+                path.find("title.psb") != std::string::npos ||
+                src.find("title") != std::string::npos;
+        }
+
+        inline std::string samplePsbPixelStats(
+            const std::vector<std::uint8_t> &data) {
+            const size_t pixels = data.size() / 4u;
+            if(pixels == 0) {
+                return "pixels=0 sampled=0 alpha=0 visible=0 color=0 any=0 maxA=0 maxC=0";
+            }
+            const size_t stride = std::max<size_t>(1u, pixels / 4096u);
+            size_t sampled = 0;
+            size_t alpha = 0;
+            size_t visible = 0;
+            size_t color = 0;
+            size_t any = 0;
+            int maxAlpha = 0;
+            int maxColor = 0;
+            for(size_t i = 0; i < pixels; i += stride) {
+                const size_t offset = i * 4u;
+                if(offset + 3u >= data.size()) {
+                    break;
+                }
+                const int c0 = data[offset + 0u];
+                const int c1 = data[offset + 1u];
+                const int c2 = data[offset + 2u];
+                const int a = data[offset + 3u];
+                const int maxRgb = std::max(c0, std::max(c1, c2));
+                ++sampled;
+                if(a != 0) {
+                    ++alpha;
+                }
+                if(maxRgb != 0) {
+                    ++color;
+                }
+                if((c0 | c1 | c2 | a) != 0) {
+                    ++any;
+                }
+                if(a != 0 && maxRgb != 0) {
+                    ++visible;
+                }
+                maxAlpha = std::max(maxAlpha, a);
+                maxColor = std::max(maxColor, maxRgb);
+            }
+            std::ostringstream out;
+            out << "pixels=" << pixels << " sampled=" << sampled
+                << " alpha=" << alpha << " visible=" << visible
+                << " color=" << color << " any=" << any
+                << " maxA=" << maxAlpha << " maxC=" << maxColor;
+            return out.str();
+        }
+
+        inline std::uint32_t psbDataHeader(
+            const std::vector<std::uint8_t> &data) {
+            if(data.size() < 4u) {
+                return 0;
+            }
+            return static_cast<std::uint32_t>(data[0]) |
+                (static_cast<std::uint32_t>(data[1]) << 8u) |
+                (static_cast<std::uint32_t>(data[2]) << 16u) |
+                (static_cast<std::uint32_t>(data[3]) << 24u);
+        }
+
+        inline bool markPsbDebugLogged(const std::string &key) {
+            static std::unordered_set<std::string> loggedKeys;
+            return loggedKeys.insert(key).second;
         }
 
         // PSB RL decompression: each RGBA channel is separately RL-compressed.
@@ -168,7 +669,167 @@ namespace internal {
                 return !decodedOut.empty();
             }
 
+            if(pixelResource.data.size() >= pixelCount * 4u) {
+                decodedOut.assign(pixelResource.data.begin(),
+                                  pixelResource.data.begin() +
+                                      static_cast<std::ptrdiff_t>(pixelCount * 4u));
+                return true;
+            }
+
             return false;
+        }
+
+        inline std::uint8_t expandPsb5To8(const std::uint16_t value) {
+            return static_cast<std::uint8_t>((value << 3u) | (value >> 2u));
+        }
+
+        inline std::uint8_t expandPsb6To8(const std::uint16_t value) {
+            return static_cast<std::uint8_t>((value << 2u) | (value >> 4u));
+        }
+
+        inline void decodePsbBcColorPalette(
+            const std::uint8_t *block,
+            bool allowDxt1Transparency,
+            std::array<std::array<std::uint8_t, 4>, 4> &palette) {
+            const auto color0 = static_cast<std::uint16_t>(block[0]) |
+                (static_cast<std::uint16_t>(block[1]) << 8u);
+            const auto color1 = static_cast<std::uint16_t>(block[2]) |
+                (static_cast<std::uint16_t>(block[3]) << 8u);
+            const auto decode565 = [](const std::uint16_t value) {
+                return std::array<std::uint8_t, 4>{
+                    expandPsb5To8(static_cast<std::uint16_t>((value >> 11u) & 0x1fu)),
+                    expandPsb6To8(static_cast<std::uint16_t>((value >> 5u) & 0x3fu)),
+                    expandPsb5To8(static_cast<std::uint16_t>(value & 0x1fu)),
+                    0xffu,
+                };
+            };
+            palette[0] = decode565(color0);
+            palette[1] = decode565(color1);
+            if(!allowDxt1Transparency || color0 > color1) {
+                for(size_t channel = 0; channel < 3; ++channel) {
+                    palette[2][channel] = static_cast<std::uint8_t>(
+                        (2u * palette[0][channel] + palette[1][channel]) / 3u);
+                    palette[3][channel] = static_cast<std::uint8_t>(
+                        (palette[0][channel] + 2u * palette[1][channel]) / 3u);
+                }
+                palette[2][3] = 0xffu;
+                palette[3][3] = 0xffu;
+            } else {
+                for(size_t channel = 0; channel < 3; ++channel) {
+                    palette[2][channel] = static_cast<std::uint8_t>(
+                        (palette[0][channel] + palette[1][channel]) / 2u);
+                    palette[3][channel] = 0u;
+                }
+                palette[2][3] = 0xffu;
+                palette[3][3] = 0u;
+            }
+        }
+
+        // Decode only the selected icon rectangle from a BC1/DXT1 or
+        // BC3/DXT5 atlas. E-mote character PSBs commonly keep a 4096x4096
+        // DXT5 texture in source/<group>/texture/pixel and reference small
+        // rectangles from source/<group>/icon/*.
+        inline bool decodePsbBlockCompressedAtlasRegion(
+            const std::vector<std::uint8_t> &compressed,
+            const std::string &formatName,
+            int atlasWidth,
+            int atlasHeight,
+            int left,
+            int top,
+            int width,
+            int height,
+            std::vector<std::uint8_t> &rgbaOut) {
+            const auto format = psbDebugLowercase(formatName);
+            const bool isDxt1 = format == "dxt1" || format == "bc1";
+            const bool isDxt5 = format == "dxt5" || format == "bc3";
+            if((!isDxt1 && !isDxt5) || atlasWidth <= 0 || atlasHeight <= 0 ||
+               left < 0 || top < 0 || width <= 0 || height <= 0 ||
+               left + width > atlasWidth || top + height > atlasHeight) {
+                return false;
+            }
+
+            const size_t blockBytes = isDxt5 ? 16u : 8u;
+            const size_t blocksWide =
+                (static_cast<size_t>(atlasWidth) + 3u) / 4u;
+            const size_t blocksHigh =
+                (static_cast<size_t>(atlasHeight) + 3u) / 4u;
+            if(compressed.size() < blocksWide * blocksHigh * blockBytes) {
+                return false;
+            }
+
+            rgbaOut.assign(static_cast<size_t>(width) *
+                               static_cast<size_t>(height) * 4u,
+                           0u);
+            const int firstBlockX = left / 4;
+            const int firstBlockY = top / 4;
+            const int lastBlockX = (left + width - 1) / 4;
+            const int lastBlockY = (top + height - 1) / 4;
+            for(int blockY = firstBlockY; blockY <= lastBlockY; ++blockY) {
+                for(int blockX = firstBlockX; blockX <= lastBlockX; ++blockX) {
+                    const size_t blockOffset =
+                        (static_cast<size_t>(blockY) * blocksWide +
+                         static_cast<size_t>(blockX)) * blockBytes;
+                    const auto *block = compressed.data() + blockOffset;
+                    const auto *colorBlock = block + (isDxt5 ? 8u : 0u);
+                    std::array<std::array<std::uint8_t, 4>, 4> colors{};
+                    decodePsbBcColorPalette(colorBlock, isDxt1, colors);
+                    const std::uint32_t colorIndices =
+                        static_cast<std::uint32_t>(colorBlock[4]) |
+                        (static_cast<std::uint32_t>(colorBlock[5]) << 8u) |
+                        (static_cast<std::uint32_t>(colorBlock[6]) << 16u) |
+                        (static_cast<std::uint32_t>(colorBlock[7]) << 24u);
+
+                    std::array<std::uint8_t, 8> alphas{};
+                    std::uint64_t alphaIndices = 0;
+                    if(isDxt5) {
+                        alphas[0] = block[0];
+                        alphas[1] = block[1];
+                        if(alphas[0] > alphas[1]) {
+                            for(size_t index = 2; index < 8; ++index) {
+                                alphas[index] = static_cast<std::uint8_t>(
+                                    ((8u - index) * alphas[0] +
+                                     (index - 1u) * alphas[1]) / 7u);
+                            }
+                        } else {
+                            for(size_t index = 2; index < 6; ++index) {
+                                alphas[index] = static_cast<std::uint8_t>(
+                                    ((6u - index) * alphas[0] +
+                                     (index - 1u) * alphas[1]) / 5u);
+                            }
+                            alphas[6] = 0u;
+                            alphas[7] = 0xffu;
+                        }
+                        for(size_t byte = 0; byte < 6; ++byte) {
+                            alphaIndices |= static_cast<std::uint64_t>(
+                                block[2u + byte]) << (8u * byte);
+                        }
+                    }
+
+                    for(int localY = 0; localY < 4; ++localY) {
+                        const int atlasY = blockY * 4 + localY;
+                        if(atlasY < top || atlasY >= top + height) continue;
+                        for(int localX = 0; localX < 4; ++localX) {
+                            const int atlasX = blockX * 4 + localX;
+                            if(atlasX < left || atlasX >= left + width) continue;
+                            const int blockPixel = localY * 4 + localX;
+                            const auto colorIndex = static_cast<size_t>(
+                                (colorIndices >> (2u * blockPixel)) & 0x3u);
+                            const size_t outOffset =
+                                (static_cast<size_t>(atlasY - top) *
+                                     static_cast<size_t>(width) +
+                                 static_cast<size_t>(atlasX - left)) * 4u;
+                            rgbaOut[outOffset + 0u] = colors[colorIndex][0];
+                            rgbaOut[outOffset + 1u] = colors[colorIndex][1];
+                            rgbaOut[outOffset + 2u] = colors[colorIndex][2];
+                            rgbaOut[outOffset + 3u] = isDxt5
+                                ? alphas[static_cast<size_t>(
+                                      (alphaIndices >> (3u * blockPixel)) & 0x7u)]
+                                : colors[colorIndex][3];
+                        }
+                    }
+                }
+            }
+            return true;
         }
 
         constexpr double kMotionFramesPerMillisecond = 60.0 / 1000.0;
@@ -200,23 +861,115 @@ namespace internal {
             return snapshot;
         }
 
+        inline bool splitEmoteCandidateBase(const ttstr &candidate,
+                                            std::string &base) {
+            std::string storage = detail::narrow(
+                TVPExtractStorageName(candidate));
+            if(storage.empty()) {
+                storage = detail::narrow(candidate);
+                if(const auto slash = storage.find_last_of("/\\");
+                   slash != std::string::npos) {
+                    storage = storage.substr(slash + 1);
+                }
+            }
+            storage = psbDebugLowercase(std::move(storage));
+            const auto stripSuffix = [](std::string &value,
+                                        const std::string &suffix) {
+                if(value.size() < suffix.size() ||
+                   value.compare(value.size() - suffix.size(), suffix.size(),
+                                 suffix) != 0) {
+                    return false;
+                }
+                value.resize(value.size() - suffix.size());
+                return true;
+            };
+            if(!stripSuffix(storage, ".mtn") &&
+               !stripSuffix(storage, ".psb")) {
+                stripSuffix(storage, ".mt");
+            }
+            if(storage.size() <= 3 ||
+               storage.compare(storage.size() - 3, 3, "emo") != 0) {
+                return false;
+            }
+            base = storage.substr(0, storage.size() - 3);
+            return !base.empty();
+        }
+
+        inline bool motionSnapshotHasTimelineSuffix(
+            const detail::MotionSnapshot &snapshot,
+            const std::string &loweredSuffix) {
+            const auto matches = [&loweredSuffix](const std::string &label) {
+                const auto lowered = psbDebugLowercase(label);
+                const auto emoteSuffix = loweredSuffix + "emo";
+                return lowered == loweredSuffix || lowered == emoteSuffix ||
+                    (lowered.size() > loweredSuffix.size() &&
+                     lowered.compare(lowered.size() - loweredSuffix.size(),
+                                     loweredSuffix.size(), loweredSuffix) == 0) ||
+                    (lowered.size() > emoteSuffix.size() &&
+                     lowered.compare(lowered.size() - emoteSuffix.size(),
+                                     emoteSuffix.size(), emoteSuffix) == 0);
+            };
+            return std::any_of(snapshot.mainTimelineLabels.begin(),
+                               snapshot.mainTimelineLabels.end(), matches) ||
+                std::any_of(snapshot.diffTimelineLabels.begin(),
+                            snapshot.diffTimelineLabels.end(), matches) ||
+                std::any_of(snapshot.clipsByLabel.begin(),
+                            snapshot.clipsByLabel.end(),
+                            [&matches](const auto &entry) {
+                                return matches(entry.first);
+                            });
+        }
+
+        inline std::shared_ptr<detail::MotionSnapshot>
+        fallbackSplitEmoteMotion(const ResourceManager &resourceManager,
+                                 const ttstr &candidate) {
+            std::string base;
+            if(!splitEmoteCandidateBase(candidate, base)) {
+                return nullptr;
+            }
+            const auto snapshot = detail::lookupModuleSnapshot(
+                resourceManager.getLastLoadedModule());
+            if(!snapshot ||
+               !motionSnapshotHasTimelineSuffix(*snapshot, base)) {
+                return nullptr;
+            }
+            if(LOGGER) {
+                LOGGER->info(
+                    "motion resolve split emote candidate from cached module: request={} source={}",
+                    candidate.AsStdString(), snapshot->path);
+            }
+            return snapshot;
+        }
+
         inline std::shared_ptr<detail::MotionSnapshot>
         activateMotion(detail::PlayerRuntime &runtime,
                        const std::shared_ptr<detail::MotionSnapshot> &snapshot) {
+            runtime.clearMotionBitmapCaches();
             runtime.activeMotion = snapshot;
             runtime.timelines.clear();
+            runtime.lastExplicitTimelineLabel.clear();
             // Reset persistent node tree so it gets rebuilt for new motion
             runtime.nodes.clear();
             runtime.nodesBuilt = false;
             runtime.nodeLabelMap.clear();
-            // Detect emote mode from PSB root "type" field.
-            // Aligned to libkrkr2.so Player_playImpl (0x6B2284):
-            //   type=0 → non-emote (motion), type=1 → emote
+            runtime.yuzuPresentationCenteredOriginConfirmed = false;
+            runtime.yuzuPresentationTranslateX = 0.0f;
+            runtime.yuzuPresentationTranslateY = 0.0f;
+            // The public backend supports the numeric module contract it has
+            // always exposed. Optional packages may recognize additional
+            // vendor-specific module layouts through the extension seam.
             runtime.isEmoteMode = false;
             if(snapshot && snapshot->root) {
                 auto typeVal = (*snapshot->root)["type"];
                 if(auto num = std::dynamic_pointer_cast<PSB::PSBNumber>(typeVal)) {
                     runtime.isEmoteMode = (num->getValue<int>() == 1);
+                }
+                if(!runtime.isEmoteMode) {
+                    if(const auto *extension = motionPlayerExtension();
+                       extension && extension->detectExtendedEmoteMode) {
+                        runtime.isEmoteMode =
+                            extension->detectExtendedEmoteMode(*snapshot);
+                    }
                 }
             }
             if(snapshot) {
@@ -248,15 +1001,59 @@ namespace internal {
                     return it->second;
                 }
 
+                // KAG commonly preloads a module through ResourceManager and
+                // then asks a newly-created Player to bind the same storage.
+                // Prefer that shared immutable snapshot.  Parsing here first
+                // made rapid dialogue advancement rescan large E-mote PSBs on
+                // the main/render thread even though the module was cached.
+                if(resourceManager != nullptr) {
+                    const auto loaded =
+                        resourceManager->findLoadedModule(resolved);
+                    if(const auto snapshot =
+                           detail::lookupModuleSnapshot(loaded)) {
+                        resourceManager->rememberLoadedModule(
+                            name, snapshot->moduleValue);
+                        return cacheMotion(runtime, requestKey, resolvedKey,
+                                           snapshot);
+                    }
+                }
+
                 const auto snapshot = detail::loadMotionSnapshot(
                     resolved, ResourceManager::getEmotePSBDecryptSeed());
                 if(snapshot) {
+                    if(resourceManager != nullptr) {
+                        resourceManager->rememberLoadedModule(
+                            resolved, snapshot->moduleValue);
+                        resourceManager->rememberLoadedModule(
+                            name, snapshot->moduleValue);
+                    }
                     return cacheMotion(runtime, requestKey, resolvedKey, snapshot);
                 }
             }
 
             if(resourceManager != nullptr) {
                 for(const auto &candidate : candidates) {
+                    if(const auto loaded =
+                           resourceManager->findLoadedModule(candidate);
+                       loaded.Type() == tvtObject) {
+                        if(const auto snapshot =
+                               detail::lookupModuleSnapshot(loaded)) {
+                            return cacheMotion(runtime, requestKey,
+                                               detail::narrow(candidate),
+                                               snapshot);
+                        }
+                    }
+                    if(const auto snapshot = fallbackSplitEmoteMotion(
+                           *resourceManager, candidate)) {
+                        resourceManager->rememberLoadedModule(
+                            candidate, snapshot->moduleValue);
+                        return cacheMotion(runtime, requestKey,
+                                           detail::narrow(candidate),
+                                           snapshot);
+                    }
+                    if(TVPGetPlacedPath(candidate).IsEmpty()) {
+                        continue;
+                    }
                     const auto loaded = resourceManager->load(candidate);
                     if(const auto snapshot = detail::lookupModuleSnapshot(loaded)) {
                         return cacheMotion(runtime, requestKey,
@@ -348,9 +1145,14 @@ namespace internal {
         }
 
         inline tjs_int getObjectCount(const tTJSVariant &object) {
-            tTJSVariant count;
-            return getObjectProperty(object, TJS_W("count"), count)
-                ? count.AsInteger()
+            if(object.Type() != tvtObject || object.AsObjectNoAddRef() == nullptr) {
+                return 0;
+            }
+
+            tjs_int count = 0;
+            return TJS_SUCCEEDED(object.AsObjectClosureNoAddRef().GetCount(
+                       &count, nullptr, nullptr, nullptr))
+                ? count
                 : 0;
         }
 
@@ -361,22 +1163,36 @@ namespace internal {
                 return false;
             }
 
-            iTJSDispatch2 *obj = value.AsObjectNoAddRef();
-            if(TJS_SUCCEEDED(obj->NativeInstanceSupport(
-                   TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID,
-                   reinterpret_cast<iTJSNativeInstance **>(&layer))) &&
-               layer != nullptr) {
-                return true;
-            }
-
-            // Fallback: try via closure's Object member (may differ from
-            // AsObjectNoAddRef for certain TJS value representations)
-            const auto closure = value.AsObjectClosureNoAddRef();
-            if(closure.Object && closure.Object != obj) {
-                return TJS_SUCCEEDED(closure.Object->NativeInstanceSupport(
+            auto tryDispatch = [&](iTJSDispatch2 *obj) {
+                if(!obj) {
+                    return false;
+                }
+                layer = nullptr;
+                return TJS_SUCCEEDED(obj->NativeInstanceSupport(
                            TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID,
                            reinterpret_cast<iTJSNativeInstance **>(&layer))) &&
                     layer != nullptr;
+            };
+
+            iTJSDispatch2 *obj = value.AsObjectNoAddRef();
+            if(tryDispatch(obj)) {
+                return true;
+            }
+
+            // Fallback: try both closure sides. Some TJS calls pass a closure
+            // whose Object is a method/class dispatch while ObjThis is the
+            // actual Layer instance.
+            const auto closure = value.AsObjectClosureNoAddRef();
+            if(closure.Object && closure.Object != obj) {
+                if(tryDispatch(closure.Object)) {
+                    return true;
+                }
+            }
+            if(closure.ObjThis && closure.ObjThis != obj &&
+               closure.ObjThis != closure.Object) {
+                if(tryDispatch(closure.ObjThis)) {
+                    return true;
+                }
             }
 
             return false;
@@ -390,48 +1206,131 @@ namespace internal {
             }
 
             iTJSDispatch2 *obj = value.AsObjectNoAddRef();
+            const auto closure = value.AsObjectClosureNoAddRef();
+            iTJSDispatch2 *candidates[] = {
+                obj,
+                closure.ObjThis,
+                closure.Object,
+                nullptr,
+            };
 
             // Direct Layer check
-            {
+            for(auto *candidate : candidates) {
+                if(!candidate) {
+                    continue;
+                }
                 tTJSNI_BaseLayer *layer = nullptr;
-                if(TJS_SUCCEEDED(obj->NativeInstanceSupport(
+                if(TJS_SUCCEEDED(candidate->NativeInstanceSupport(
                        TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID,
                        reinterpret_cast<iTJSNativeInstance **>(&layer))) &&
                    layer) {
-                    return obj;
+                    return candidate;
                 }
             }
 
             // ncb SeparateLayerAdaptor → owner
-            if(auto *adaptor =
-                   ncbInstanceAdaptor<SeparateLayerAdaptor>::GetNativeInstance(
-                       obj, false)) {
-                auto *ownerObj = adaptor->getOwner();
-                if(ownerObj) {
-                    auto ownerResolved = tryResolveLayerDispatch(
-                        tTJSVariant(ownerObj, ownerObj));
-                    if(ownerResolved) return ownerResolved;
+            for(auto *candidate : candidates) {
+                if(!candidate) {
+                    continue;
+                }
+                if(auto *adaptor =
+                       ncbInstanceAdaptor<SeparateLayerAdaptor>::GetNativeInstance(
+                           candidate, false)) {
+                    auto *ownerObj = adaptor->getOwner();
+                    if(ownerObj) {
+                        auto ownerResolved = tryResolveLayerDispatch(
+                            tTJSVariant(ownerObj, ownerObj));
+                        if(ownerResolved) return ownerResolved;
+                    }
                 }
             }
 
-            // TJS property chain: owner, _owner, targetLayer
-            static const tjs_char *propNames[] = {
-                TJS_W("owner"), TJS_W("_owner"), TJS_W("targetLayer"),
+            static const tjs_char *explicitLayerProps[] = {
+                TJS_W("targetLayer"), TJS_W("_targetLayer"),
+                TJS_W("renderTarget"), TJS_W("_renderTarget"),
                 TJS_W("layer"), TJS_W("_layer"), TJS_W("baseLayer"),
-                TJS_W("_base"), TJS_W("parent"), nullptr };
+                TJS_W("_base"), TJS_W("base"), TJS_W("fore"),
+                TJS_W("back"), TJS_W("primaryLayer"), nullptr };
+            static const tjs_char *ownerLayerProps[] = {
+                TJS_W("owner"), TJS_W("_owner"), TJS_W("parent"), nullptr };
 
-            for(int i = 0; propNames[i]; ++i) {
-                tTJSVariant propVal;
-                if(getObjectProperty(value, propNames[i], propVal) &&
-                   propVal.Type() == tvtObject &&
-                   propVal.AsObjectNoAddRef() != nullptr &&
-                   propVal.AsObjectNoAddRef() != obj) {
-                    auto *resolved = tryResolveLayerDispatch(propVal);
-                    if(resolved) return resolved;
+            auto tryProps = [&](const tjs_char *const *propNames) -> iTJSDispatch2 * {
+                for(int i = 0; propNames[i]; ++i) {
+                    tTJSVariant propVal;
+                    if(getObjectProperty(value, propNames[i], propVal) &&
+                       propVal.Type() == tvtObject &&
+                       propVal.AsObjectNoAddRef() != nullptr &&
+                       propVal.AsObjectNoAddRef() != obj) {
+                        auto *resolved = tryResolveLayerDispatch(propVal);
+                        if(resolved) return resolved;
+                    }
                 }
-            }
+                return nullptr;
+            };
+
+            if(auto *resolved = tryProps(explicitLayerProps)) return resolved;
+            if(auto *resolved = tryProps(ownerLayerProps)) return resolved;
 
             return nullptr;
+        }
+
+        inline bool isYuzuTitlePresentationMotionPath(
+            const std::string &motionPath) {
+            const auto motion = psbDebugLowercase(motionPath);
+            return motion.find("title_bg") != std::string::npos ||
+                motion.find("titlebg") != std::string::npos;
+        }
+
+        inline iTJSDispatch2 *resolveYuzuTitlePresentationTargetFromLayerTree(
+            const std::string &motionPath) {
+            if(!isYuzuTitlePresentationMotionPath(motionPath) ||
+               !TVPMainWindow || !TVPMainWindow->GetDrawDevice()) {
+                return nullptr;
+            }
+
+            auto *primary = TVPMainWindow->GetDrawDevice()->GetPrimaryLayer();
+            if(!primary || !primary->GetManager()) {
+                return nullptr;
+            }
+
+            auto &nodes = primary->GetManager()->GetAllNodes();
+            tTJSNI_BaseLayer *titleBg = nullptr;
+            tTJSNI_BaseLayer *sysCover = nullptr;
+            tTJSNI_BaseLayer *looseTitleBg = nullptr;
+            for(auto *node : nodes) {
+                if(!node || !node->GetOwnerNoAddRef()) {
+                    continue;
+                }
+                const auto rawName = node->GetName().AsStdString();
+                const auto lowerName = psbDebugLowercase(rawName);
+                if(rawName == "title_bg") {
+                    titleBg = node;
+                    break;
+                }
+                if(!sysCover && rawName == "SysCoverLayer") {
+                    sysCover = node;
+                }
+                if(!looseTitleBg &&
+                   lowerName.find("title") != std::string::npos &&
+                   lowerName.find("bg") != std::string::npos) {
+                    looseTitleBg = node;
+                }
+            }
+
+            auto *best = titleBg ? titleBg : (sysCover ? sysCover : looseTitleBg);
+            if(!best) {
+                return nullptr;
+            }
+            const char *debug = std::getenv("AETHERKIRI_MOTION_DEBUG");
+            if(LOGGER && debug && *debug && std::strcmp(debug, "0") != 0) {
+                LOGGER->info(
+                    "motion yuzu title target fallback: motion={} layer={} visible={} parentVisible={} opacity={}",
+                    motionPath, best->GetName().AsStdString(),
+                    best->GetVisible() ? 1 : 0,
+                    best->GetParentVisible() ? 1 : 0,
+                    static_cast<int>(best->GetOpacity()));
+            }
+            return best->GetOwnerNoAddRef();
         }
 
         inline iTJSDispatch2 *tryResolveSeparateAdaptorOwner(const tTJSVariant &value) {
@@ -524,6 +1423,7 @@ namespace internal {
             bool visible = false;
             int frameType = 0;        // frame["type"] from sub_6926B4: 0/2/3
             std::string src;
+            std::string motionIcon;   // E-mote object-group motion ("icon")
             std::vector<std::string> srcList;  // For particle nodes: array of "chara/motion" paths
             double x = 0.0;
             double y = 0.0;
@@ -554,6 +1454,13 @@ namespace internal {
             BezierCurve occ;          // mask 0x8000: opacity curve control
             BezierCurve cc;           // position curve (slot+296, "cc" PSB key)
             ControlPointCurve cp;     // rotation spline (slot+268, "cp" PSB key)
+            // mask 0x02000000: E-mote BezierPatch payload. Native slots keep
+            // the mesh easing curve at +296 and 32 normalized XY floats at
+            // +320. Keep it separate from the legacy top-level cc field so
+            // ordinary motion position easing is unaffected.
+            bool hasMeshPayload = false;
+            BezierCurve meshCc;
+            std::vector<float> meshControlPoints;
             // === Subsystem data (mask 0x80000+) ===
             // mask 0x80000: motion sub-object (sub_692AB0 at 0x6938CC)
             int motionMask = 0;
@@ -632,6 +1539,108 @@ namespace internal {
                 return boolean->value ? 1.0 : 0.0;
             }
             return std::nullopt;
+        }
+
+        inline const std::array<float, 32> &identityMeshControlPoints() {
+            static const std::array<float, 32> points = [] {
+                std::array<float, 32> value{};
+                for(int y = 0; y < 4; ++y) {
+                    for(int x = 0; x < 4; ++x) {
+                        const int index = (y * 4 + x) * 2;
+                        value[index] = static_cast<float>(x) / 3.0f;
+                        value[index + 1] = static_cast<float>(y) / 3.0f;
+                    }
+                }
+                return value;
+            }();
+            return points;
+        }
+
+        template<typename ResolveVariable>
+        inline bool evaluateMeshCombinators(
+            std::vector<detail::MotionNode::MeshCombinatorEntry> &entries,
+            ResolveVariable &&resolveVariable,
+            std::vector<float> &controlPoints) {
+            constexpr std::size_t kPatchFloatCount = 32;
+            bool havePatch = false;
+            bool modified = false;
+            for(auto &entry : entries) {
+                if(entry.meshCount <= 0 ||
+                   entry.rawMeshes.size() <
+                       static_cast<std::size_t>(entry.meshCount) *
+                           kPatchFloatCount) {
+                    continue;
+                }
+
+                double neutralValue = entry.rangeBegin;
+                if(entry.meshCount > 1) {
+                    neutralValue +=
+                        (entry.rangeEnd - entry.rangeBegin) *
+                        std::clamp(entry.neutralIndex, 0,
+                                   entry.meshCount - 1) /
+                        static_cast<double>(entry.meshCount - 1);
+                }
+                const double rawValue = resolveVariable(entry.variable,
+                                                        neutralValue);
+                const double range = entry.rangeEnd - entry.rangeBegin;
+                const double normalized = std::abs(range) > 0.0000001
+                    ? std::clamp((rawValue - entry.rangeBegin) / range,
+                                 0.0, 1.0)
+                    : 0.0;
+                const double meshPosition =
+                    normalized * static_cast<double>(entry.meshCount - 1);
+                const float nativeMeshPosition =
+                    static_cast<float>(meshPosition);
+                havePatch = true;
+                // libartemis.so 0x6D9A84 and compatible-v2 0x6DB8A8 use an
+                // exact float comparison here.  The sampled Bezier patch and
+                // its layer sum survive until a controller actually moves.
+                if(entry.sampledPatchValid &&
+                   entry.sampledPosition == nativeMeshPosition) {
+                    continue;
+                }
+                const int meshA = std::clamp(
+                    static_cast<int>(nativeMeshPosition), 0,
+                    entry.meshCount - 1);
+                const int meshB = std::min(meshA + 1,
+                                           entry.meshCount - 1);
+                const float ratio = nativeMeshPosition - meshA;
+                const std::size_t offsetA =
+                    static_cast<std::size_t>(meshA) * kPatchFloatCount;
+                const std::size_t offsetB =
+                    static_cast<std::size_t>(meshB) * kPatchFloatCount;
+                for(std::size_t point = 0; point < kPatchFloatCount;
+                    ++point) {
+                    const double valueA = entry.rawMeshes[offsetA + point];
+                    const double valueB = entry.rawMeshes[offsetB + point];
+                    entry.sampledPatch[point] = static_cast<float>(
+                        valueA * (1.0 - ratio) + valueB * ratio);
+                }
+                entry.sampledPosition = nativeMeshPosition;
+                entry.sampledPatchValid = true;
+                modified = true;
+            }
+            if(!havePatch) {
+                controlPoints.clear();
+                return false;
+            }
+            if(!modified && controlPoints.size() == kPatchFloatCount) {
+                return true;
+            }
+            // The binary chooses SumAllMesh when at least half of a layer's
+            // operators changed and DiffModifiedMesh otherwise.  A portable
+            // node rarely has more than a handful of 32-float contributors;
+            // summing their retained samples gives the same result while
+            // avoiding a second mutable patch and all raw-resource reads.
+            std::array<float, kPatchFloatCount> combined{};
+            for(const auto &entry : entries) {
+                if(!entry.sampledPatchValid) continue;
+                for(std::size_t point = 0; point < kPatchFloatCount; ++point) {
+                    combined[point] += entry.sampledPatch[point];
+                }
+            }
+            controlPoints.assign(combined.begin(), combined.end());
+            return true;
         }
 
         inline std::optional<double>
@@ -844,6 +1853,20 @@ namespace internal {
             return 0.0;
         }
 
+        inline double motionClipEndTimeLikeKrkrsdl3(
+            const detail::MotionClip *clip) {
+            if(!clip) {
+                return 0.0;
+            }
+            if(clip->syncTime > 0.0) {
+                return clip->syncTime;
+            }
+            if(clip->selfSyncTime > 0.0) {
+                return clip->selfSyncTime;
+            }
+            return clip->totalFrames;
+        }
+
         inline void mergeFrameContent(const std::shared_ptr<PSB::PSBDictionary> &content,
                                FrameContentState &state,
                                int nodeType) {
@@ -874,6 +1897,24 @@ namespace internal {
                         }
                     }
                     if(!state.srcList.empty()) state.src = state.srcList[0];
+                }
+                const auto icon = psbDictionaryString(content, "icon");
+                if(!icon.empty() && !state.src.empty()) {
+                    if(nodeType == 3) {
+                        // Motion nodes address a named motion inside the
+                        // object group held in src.
+                        state.motionIcon = icon;
+                    } else if(state.src == "blank") {
+                        // E-mote transparent transform sources use
+                        // blank/<width>:<height>:<originX>:<originY>.
+                        state.src += "/" + icon;
+                    } else if(state.src.rfind("src/", 0) == 0) {
+                        state.src += "/" + icon;
+                    } else {
+                        // Image nodes use src as the PSB source group and
+                        // icon as the concrete image within that group.
+                        state.src = "src/" + state.src + "/" + icon;
+                    }
                 }
             }
 
@@ -1032,6 +2073,29 @@ namespace internal {
                                         if (auto v = psbNumberValue((*sp)[si])) seg.p.push_back(*v);
                             }
                             state.cp.s.push_back(std::move(seg));
+                        }
+                    }
+                }
+            }
+
+            // E-mote BezierPatch data. libgame.so sub_68FE90 checks mask
+            // 0x02000000, reads mesh.cc (fallback mesh.m), then requires
+            // mesh.bp (fallback mesh.b) to contain exactly 32 floats.
+            if(mask & 0x02000000) {
+                state.hasMeshPayload = true;
+                if(auto mesh = psbDictionaryValue(content, "mesh")) {
+                    auto curve = psbDictionaryValue(mesh, "cc");
+                    if(!curve) curve = psbDictionaryValue(mesh, "m");
+                    if(curve) state.meshCc = parseBezierCurve(curve);
+
+                    auto points = psbDictionaryList(mesh, "bp");
+                    if(!points) points = psbDictionaryList(mesh, "b");
+                    if(points && points->size() == 32) {
+                        state.meshControlPoints.reserve(32);
+                        for(size_t index = 0; index < 32; ++index) {
+                            state.meshControlPoints.push_back(static_cast<float>(
+                                psbNumberValue((*points)[static_cast<int>(index)])
+                                    .value_or(0.0)));
                         }
                     }
                 }
@@ -1275,11 +2339,32 @@ namespace internal {
                 state.opacity = std::clamp(opaInt / 255.0, 0.0, 1.0);
             }
 
-            // Aligned to sub_699AE4 (0x699FD4..0x699FF8):
-            // the node state consumes four packed color DWORDs from the
-            // current slot representation rather than expanding them to
-            // independent RGBA channel scalars here.
-            state.packedColors = slotA.packedColors;
+            // ccc controls both opacity and the four corner colors. Keep the
+            // colors packed for the renderer, but interpolate each byte here
+            // so animated tints do not remain pinned to the first keyframe.
+            auto interpolatePackedColor = [&](uint32_t colorA,
+                                               uint32_t colorB) {
+                uint32_t result = 0;
+                for(int shift = 0; shift < 32; shift += 8) {
+                    const double channel = lerp(
+                        static_cast<double>((colorA >> shift) & 0xffu),
+                        static_cast<double>((colorB >> shift) & 0xffu),
+                        t_ccc);
+                    const int rounded = channel < 0.0
+                        ? static_cast<int>(std::ceil(channel - 0.5))
+                        : static_cast<int>(std::floor(channel + 0.5));
+                    result |= static_cast<uint32_t>(
+                        std::clamp(rounded, 0, 255)) << shift;
+                }
+                return result;
+            };
+            for(size_t colorIndex = 0;
+                colorIndex < state.packedColors.size();
+                ++colorIndex) {
+                state.packedColors[colorIndex] = interpolatePackedColor(
+                    slotA.packedColors[colorIndex],
+                    slotB.packedColors[colorIndex]);
+            }
 
             // Angle with 360° wrap — uses acc-eased t (sub_699AE4 at 0x699DEC)
             double curAngle = state.angle;
@@ -1318,12 +2403,35 @@ namespace internal {
             if(state.height != slotB.height)
                 state.height = lerp(state.height, slotB.height, t);
 
+            // E-mote mesh interpolation (libgame.so sub_696EC4 ->
+            // sub_69802C). A missing bp list is the global identity 4x4
+            // patch, not an absent deformation node.
+            if(slotA.hasMeshPayload || slotB.hasMeshPayload ||
+               !slotA.meshControlPoints.empty() ||
+               !slotB.meshControlPoints.empty()) {
+                state.hasMeshPayload = true;
+                const auto &identity = identityMeshControlPoints();
+                const float *pointsA = slotA.meshControlPoints.size() == 32
+                    ? slotA.meshControlPoints.data() : identity.data();
+                const float *pointsB = slotB.meshControlPoints.size() == 32
+                    ? slotB.meshControlPoints.data() : identity.data();
+                const double meshT = !slotA.meshCc.empty()
+                    ? evaluateBezierCurve(slotA.meshCc, t) : t;
+                state.meshControlPoints.resize(32);
+                for(size_t index = 0; index < 32; ++index) {
+                    state.meshControlPoints[index] = static_cast<float>(
+                        lerp(pointsA[index], pointsB[index], meshT));
+                }
+                state.meshCc = slotA.meshCc;
+            }
+
             // FlipX/FlipY: not interpolated, use slot A value
             // (sub_699AE4 copies directly from clip slot, no lerp)
 
             // Use src from slot A (or B if A is empty)
             if(state.src.empty() && !slotB.src.empty()) {
                 state.src = slotB.src;
+                state.motionIcon = slotB.motionIcon;
             }
 
             return state;
@@ -1337,54 +2445,148 @@ namespace internal {
         inline FrameContentState
         evaluateLayerContent(const std::shared_ptr<const PSB::PSBDictionary> &layer,
                              double time,
-                             int nodeType) {
+                             int nodeType,
+                             bool collectDebug = false) {
             FrameContentState state;
-            const auto frames = psbDictionaryList(layer, "frameList");
-            if(!frames || frames->size() == 0) {
+            if(!layer) {
+                return state;
+            }
+
+            // Motion PSB dictionaries are immutable after loading. Parsing
+            // their mask-gated frame payloads for every node on every draw
+            // duplicated thousands of dictionary lookups and temporary
+            // vectors in E-mote scenes. Keep a per-update-thread parsed view;
+            // OpenMP workers then read independent caches without a shared
+            // lock. The weak owner prevents a reused raw address from binding
+            // to a previous game's PSB object.
+            struct ParsedLayerKey {
+                const PSB::PSBDictionary *layer = nullptr;
+                int nodeType = 0;
+                bool operator==(const ParsedLayerKey &other) const {
+                    return layer == other.layer && nodeType == other.nodeType;
+                }
+            };
+            struct ParsedLayerKeyHash {
+                size_t operator()(const ParsedLayerKey &key) const {
+                    const auto address =
+                        reinterpret_cast<std::uintptr_t>(key.layer);
+                    return std::hash<std::uintptr_t>{}(address) ^
+                        (std::hash<int>{}(key.nodeType) +
+                         0x9e3779b9u + (address << 6u) + (address >> 2u));
+                }
+            };
+            struct ParsedLayerFrames {
+                std::weak_ptr<const PSB::PSBDictionary> owner;
+                bool hasTransformOrder = false;
+                int transformOrder[4] = {0, 1, 2, 3};
+                std::vector<std::optional<ParsedFrame>> frames;
+            };
+            static thread_local std::unordered_map<
+                ParsedLayerKey, ParsedLayerFrames, ParsedLayerKeyHash>
+                parsedLayerCache;
+
+            const ParsedLayerKey cacheKey{layer.get(), nodeType};
+            auto cacheIt = parsedLayerCache.find(cacheKey);
+            const std::weak_ptr<const PSB::PSBDictionary> requestedOwner =
+                layer;
+            const bool sameCachedOwner =
+                cacheIt != parsedLayerCache.end() &&
+                !cacheIt->second.owner.owner_before(requestedOwner) &&
+                !requestedOwner.owner_before(cacheIt->second.owner);
+            const bool cacheHit =
+                cacheIt != parsedLayerCache.end() && sameCachedOwner;
+            if(!cacheHit) {
+                if(parsedLayerCache.size() > 4096) {
+                    for(auto it = parsedLayerCache.begin();
+                        it != parsedLayerCache.end(); ) {
+                        if(it->second.owner.expired()) {
+                            it = parsedLayerCache.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+
+                ParsedLayerFrames parsed;
+                parsed.owner = layer;
+                if(auto toList = psbDictionaryList(
+                       std::const_pointer_cast<PSB::PSBDictionary>(layer),
+                       "transformOrder")) {
+                    for(int i = 0;
+                        i < 4 && i < static_cast<int>(toList->size()); ++i) {
+                        if(auto value = psbNumberValue((*toList)[i])) {
+                            parsed.transformOrder[i] =
+                                static_cast<int>(*value);
+                        }
+                    }
+                    parsed.hasTransformOrder = true;
+                }
+
+                if(const auto frames =
+                       psbDictionaryList(layer, "frameList")) {
+                    parsed.frames.reserve(frames->size());
+                    for(size_t index = 0; index < frames->size(); ++index) {
+                        const auto frame =
+                            std::dynamic_pointer_cast<PSB::PSBDictionary>(
+                                (*frames)[static_cast<int>(index)]);
+                        if(frame) {
+                            parsed.frames.emplace_back(
+                                parseFrame(frame, nodeType));
+                        } else {
+                            parsed.frames.emplace_back(std::nullopt);
+                        }
+                    }
+                }
+                cacheIt = parsedLayerCache.insert_or_assign(
+                    cacheKey, std::move(parsed)).first;
+            }
+            const auto &parsedLayer = cacheIt->second;
+            if(parsedLayer.frames.empty()) {
                 return state;
             }
 
             // Read transformOrder from layer dict (stored at node+84..96 in libkrkr2.so).
             // sub_699940 uses this to determine the order of Flip/Angle/Zoom/Slant.
-            if(auto toList = psbDictionaryList(
-                   std::const_pointer_cast<PSB::PSBDictionary>(layer),
-                   "transformOrder")) {
-                for(int i = 0; i < 4 && i < static_cast<int>(toList->size()); i++) {
-                    if(auto v = psbNumberValue((*toList)[i]))
-                        state.transformOrder[i] = static_cast<int>(*v);
-                }
+            if(parsedLayer.hasTransformOrder) {
+                std::copy(parsedLayer.transformOrder,
+                          parsedLayer.transformOrder + 4,
+                          state.transformOrder);
                 state.hasTransformOrder = true;
             }
 
             // Step 1: Find active frame (last frame with time <= time)
             int activeIndex = -1;
-            for(size_t index = 0; index < frames->size(); ++index) {
-                const auto frame = std::dynamic_pointer_cast<PSB::PSBDictionary>(
-                    (*frames)[static_cast<int>(index)]);
-                if(!frame) continue;
-                const double frameTime =
-                    psbDictionaryNumber(frame, "time").value_or(0.0);
-                if(frameTime > time) break;
+            for(size_t index = 0;
+                index < parsedLayer.frames.size(); ++index) {
+                if(!parsedLayer.frames[index]) {
+                    continue;
+                }
+                if(parsedLayer.frames[index]->time > time) {
+                    break;
+                }
                 activeIndex = static_cast<int>(index);
             }
 
             if(activeIndex < 0) return state;
-            state.debugEvaluated = true;
-            state.debugActiveIndex = activeIndex;
-
-            const auto activeFrame = std::dynamic_pointer_cast<PSB::PSBDictionary>(
-                (*frames)[activeIndex]);
-            if(!activeFrame) return state;
+            if(collectDebug) {
+                state.debugEvaluated = true;
+                state.debugActiveIndex = activeIndex;
+            }
 
             // Step 2: Parse active frame via sub_6926B4
-            ParsedFrame frameA = parseFrame(activeFrame, nodeType);
-            state.debugFrameATime = frameA.time;
-            state.debugFrameAType = frameA.type;
-            state.debugFrameAInvisible = frameA.invisible;
-            state.debugFrameAOpacity = frameA.slot.opacity;
-            state.debugFrameAScaleX = frameA.slot.scaleX;
-            state.debugFrameAScaleY = frameA.slot.scaleY;
-            state.debugFrameASrc = frameA.slot.src;
+            const auto &frameAOptional =
+                parsedLayer.frames[static_cast<size_t>(activeIndex)];
+            if(!frameAOptional) return state;
+            const ParsedFrame &frameA = *frameAOptional;
+            if(collectDebug) {
+                state.debugFrameATime = frameA.time;
+                state.debugFrameAType = frameA.type;
+                state.debugFrameAInvisible = frameA.invisible;
+                state.debugFrameAOpacity = frameA.slot.opacity;
+                state.debugFrameAScaleX = frameA.slot.scaleX;
+                state.debugFrameAScaleY = frameA.slot.scaleY;
+                state.debugFrameASrc = frameA.slot.src;
+            }
 
             // type=0: node is invisible at this time
             if(frameA.invisible) {
@@ -1399,82 +2601,100 @@ namespace internal {
             state = frameA.slot;
             state.visible = true;
             state.clipStartTime = frameA.time;  // slot+328: frame start time
-            state.debugEvaluated = true;
-            state.debugActiveIndex = activeIndex;
-            state.debugFrameATime = frameA.time;
-            state.debugFrameAType = frameA.type;
-            state.debugFrameAInvisible = frameA.invisible;
-            state.debugFrameAOpacity = frameA.slot.opacity;
-            state.debugFrameAScaleX = frameA.slot.scaleX;
-            state.debugFrameAScaleY = frameA.slot.scaleY;
-            state.debugFrameASrc = frameA.slot.src;
+            if(collectDebug) {
+                state.debugEvaluated = true;
+                state.debugActiveIndex = activeIndex;
+                state.debugFrameATime = frameA.time;
+                state.debugFrameAType = frameA.type;
+                state.debugFrameAInvisible = frameA.invisible;
+                state.debugFrameAOpacity = frameA.slot.opacity;
+                state.debugFrameAScaleX = frameA.slot.scaleX;
+                state.debugFrameAScaleY = frameA.slot.scaleY;
+                state.debugFrameASrc = frameA.slot.src;
+            }
             if(savedHasTO) {
                 std::copy(savedTO, savedTO + 4, state.transformOrder);
                 state.hasTransformOrder = true;
             }
 
-            // type=2: static display, no interpolation
+            // Native ForwardFrame (libartemis.so 0x6B30F0,
+            // compatible-v2 0x6B43E8) toggles LayerInfo::activeSlot before
+            // loading the following frame into the other slot. BuildFrameParam
+            // (0x6B4988 / 0x6B5F7C) then tests activeSlot+241, so type=3 is a
+            // property of frameA and controls the span leaving that frame.
+            // This distinction is visible in E-mote mouth tracks authored as
+            // 0:type2, 12:type3, 60:type3: values below the first mouth
+            // threshold stay closed, then the 12..60 span opens monotonically.
             if(!frameA.interpolate) {
                 return state;
             }
 
-            // type=3: interpolate with next frame's slot
             const int nextIndex = activeIndex + 1;
-            if(nextIndex >= static_cast<int>(frames->size())) {
+            if(nextIndex >= static_cast<int>(parsedLayer.frames.size())) {
                 return state;  // no next frame, just use slot A
             }
-            state.debugNextIndex = nextIndex;
-
-            const auto nextFrame = std::dynamic_pointer_cast<PSB::PSBDictionary>(
-                (*frames)[nextIndex]);
-            if(!nextFrame) return state;
+            if(collectDebug) {
+                state.debugNextIndex = nextIndex;
+            }
 
             // Step 3: Parse next frame via sub_6926B4
-            ParsedFrame frameB = parseFrame(nextFrame, nodeType);
-            state.debugFrameBTime = frameB.time;
-            state.debugFrameBType = frameB.type;
-            state.debugFrameBInvisible = frameB.invisible;
-            state.debugFrameBOpacity = frameB.slot.opacity;
-            state.debugFrameBScaleX = frameB.slot.scaleX;
-            state.debugFrameBScaleY = frameB.slot.scaleY;
-            state.debugFrameBSrc = frameB.slot.src;
-            // Inherit src from slot A if slot B doesn't set one
-            if(frameB.slot.src.empty()) frameB.slot.src = state.src;
-
+            const auto &frameBOptional =
+                parsedLayer.frames[static_cast<size_t>(nextIndex)];
+            if(!frameBOptional) return state;
+            const ParsedFrame &frameB = *frameBOptional;
+            if(collectDebug) {
+                state.debugFrameBTime = frameB.time;
+                state.debugFrameBType = frameB.type;
+                state.debugFrameBInvisible = frameB.invisible;
+                state.debugFrameBOpacity = frameB.slot.opacity;
+                state.debugFrameBScaleX = frameB.slot.scaleX;
+                state.debugFrameBScaleY = frameB.slot.scaleY;
+                state.debugFrameBSrc = frameB.slot.src;
+            }
             // Compute interpolation ratio
             const double duration = frameB.time - frameA.time;
             if(duration <= 0.0) return state;
 
             const double t = std::clamp(
                 (time - frameA.time) / duration, 0.0, 1.0);
-            state.debugInterpT = t;
+            if(collectDebug) {
+                state.debugInterpT = t;
+            }
 
             if(t <= 0.0 || frameB.invisible) {
                 return state;  // at exact start or next is invisible
             }
 
             // Step 4: Interpolate via sub_699AE4
-            state = interpolateSlots(state, frameB.slot, t);
+            if(frameB.slot.src.empty()) {
+                FrameContentState inheritedSlotB = frameB.slot;
+                inheritedSlotB.src = state.src;
+                state = interpolateSlots(state, inheritedSlotB, t);
+            } else {
+                state = interpolateSlots(state, frameB.slot, t);
+            }
             state.visible = true;
-            state.debugEvaluated = true;
-            state.debugActiveIndex = activeIndex;
-            state.debugNextIndex = nextIndex;
-            state.debugFrameATime = frameA.time;
-            state.debugFrameAType = frameA.type;
-            state.debugFrameAInvisible = frameA.invisible;
-            state.debugFrameAOpacity = frameA.slot.opacity;
-            state.debugFrameAScaleX = frameA.slot.scaleX;
-            state.debugFrameAScaleY = frameA.slot.scaleY;
-            state.debugFrameASrc = frameA.slot.src;
-            state.debugFrameBTime = frameB.time;
-            state.debugFrameBType = frameB.type;
-            state.debugFrameBInvisible = frameB.invisible;
-            state.debugFrameBOpacity = frameB.slot.opacity;
-            state.debugFrameBScaleX = frameB.slot.scaleX;
-            state.debugFrameBScaleY = frameB.slot.scaleY;
-            state.debugFrameBSrc = frameB.slot.src;
-            state.debugInterpT = t;
-            state.debugInterpolated = true;
+            if(collectDebug) {
+                state.debugEvaluated = true;
+                state.debugActiveIndex = activeIndex;
+                state.debugNextIndex = nextIndex;
+                state.debugFrameATime = frameA.time;
+                state.debugFrameAType = frameA.type;
+                state.debugFrameAInvisible = frameA.invisible;
+                state.debugFrameAOpacity = frameA.slot.opacity;
+                state.debugFrameAScaleX = frameA.slot.scaleX;
+                state.debugFrameAScaleY = frameA.slot.scaleY;
+                state.debugFrameASrc = frameA.slot.src;
+                state.debugFrameBTime = frameB.time;
+                state.debugFrameBType = frameB.type;
+                state.debugFrameBInvisible = frameB.invisible;
+                state.debugFrameBOpacity = frameB.slot.opacity;
+                state.debugFrameBScaleX = frameB.slot.scaleX;
+                state.debugFrameBScaleY = frameB.slot.scaleY;
+                state.debugFrameBSrc = frameB.slot.src;
+                state.debugInterpT = t;
+                state.debugInterpolated = true;
+            }
 
             if(savedHasTO) {
                 std::copy(savedTO, savedTO + 4, state.transformOrder);
@@ -1521,7 +2741,13 @@ namespace internal {
             int &outWidth, int &outHeight,
             std::vector<std::uint8_t> &decompressedOut,
             double &outOriginX, double &outOriginY,
-            bool *outDecodedIsBgra = nullptr) {
+            bool *outDecodedIsBgra = nullptr,
+            bool decodePixelData = true,
+            std::string *outResourcePath = nullptr,
+            std::string *outCompressName = nullptr,
+            int *outDecodedWidth = nullptr,
+            int *outDecodedHeight = nullptr,
+            std::array<int, 4> *outDecodedSourceRect = nullptr) {
             outWidth = 0;
             outHeight = 0;
             outOriginX = 0.0;
@@ -1530,7 +2756,62 @@ namespace internal {
             if(outDecodedIsBgra) {
                 *outDecodedIsBgra = false;
             }
+            if(outResourcePath) {
+                outResourcePath->clear();
+            }
+            if(outCompressName) {
+                outCompressName->clear();
+            }
+            if(outDecodedWidth) {
+                *outDecodedWidth = 0;
+            }
+            if(outDecodedHeight) {
+                *outDecodedHeight = 0;
+            }
+            if(outDecodedSourceRect) {
+                *outDecodedSourceRect = {0, 0, 0, 0};
+            }
             if(source.empty() || isMotionCrossReference(source)) {
+                return nullptr;
+            }
+
+            // E-mote uses synthetic transparent sources as transform/mesh
+            // containers.  They are encoded directly in the source name as
+            //
+            //     blank/<width>:<height>:<originX>:<originY>
+            //
+            // and therefore have no PSB pixel resource to look up.  Native
+            // libgame still fills the node's clip rectangle and anchor from
+            // these four values; descendants are then evaluated through the
+            // blank node's Bezier patch.  Leaving the dimensions at zero
+            // drops that patch and detaches face/hair/body child layers.
+            if(source.rfind("blank/", 0) == 0) {
+                const char *cursor = source.c_str() + 6;
+                double values[4]{};
+                bool valid = true;
+                for(int i = 0; i < 4; ++i) {
+                    char *end = nullptr;
+                    values[i] = std::strtod(cursor, &end);
+                    if(end == cursor || !std::isfinite(values[i])) {
+                        valid = false;
+                        break;
+                    }
+                    if(i < 3) {
+                        if(*end != ':') {
+                            valid = false;
+                            break;
+                        }
+                        cursor = end + 1;
+                    } else if(*end != '\0') {
+                        valid = false;
+                    }
+                }
+                if(valid && values[0] > 0.0 && values[1] > 0.0) {
+                    outWidth = static_cast<int>(std::lround(values[0]));
+                    outHeight = static_cast<int>(std::lround(values[1]));
+                    outOriginX = values[2];
+                    outOriginY = values[3];
+                }
                 return nullptr;
             }
 
@@ -1579,11 +2860,254 @@ namespace internal {
                            outWidth > 0 && outHeight > 0) {
                             auto compressStr =
                                 psbDictionaryString(iconNode, "compress");
-                            decodePsbPixelResource(
+                            if(outResourcePath) {
+                                *outResourcePath = pixelPath;
+                            }
+                            if(outCompressName) {
+                                *outCompressName = compressStr;
+                            }
+                            if(!decodePixelData) {
+                                return resIt->second.get();
+                            }
+                            const bool isRL =
+                                isPsbRLCompressName(compressStr);
+                            const bool decoded = decodePsbPixelResource(
                                 snapshot, iconPath, *resIt->second,
-                                outWidth, outHeight, compressStr == "RL",
+                                outWidth, outHeight,
+                                isRL,
                                 decompressedOut, outDecodedIsBgra);
-                            return resIt->second.get();
+                            if(LOGGER && shouldDebugPsbSource(snapshot, source) &&
+                               markPsbDebugLogged(snapshot.path + "|" +
+                                                  source + "|" + pixelPath)) {
+                                const auto palPath = iconPath + "/pal";
+                                const auto palIt =
+                                    snapshot.resourcesByPath.find(palPath);
+                                const size_t palBytes =
+                                    (palIt != snapshot.resourcesByPath.end() &&
+                                     palIt->second)
+                                    ? palIt->second->data.size()
+                                    : 0u;
+                                LOGGER->info(
+                                    "motion psb source: path={} source={} pixel={} size={}x{} raw={} expected={} header=0x{:08x} compress={} isRL={} pal={} decoded={} decodedBytes={} decodedBgra={} rawStats=[{}] decodedStats=[{}]",
+                                    snapshot.path, source, pixelPath,
+                                    outWidth, outHeight,
+                                    resIt->second->data.size(),
+                                    static_cast<size_t>(outWidth) *
+                                        static_cast<size_t>(outHeight) * 4u,
+                                    psbDataHeader(resIt->second->data),
+                                    compressStr.empty() ? "<none>" : compressStr,
+                                    isRL ? 1 : 0,
+                                    palBytes,
+                                    decoded ? 1 : 0,
+                                    decompressedOut.size(),
+                                    outDecodedIsBgra && *outDecodedIsBgra ? 1 : 0,
+                                    samplePsbPixelStats(resIt->second->data),
+                                    samplePsbPixelStats(decompressedOut));
+                            }
+                            if(decoded) {
+                                return resIt->second.get();
+                            }
+                        }
+
+                        // Some E-mote exports (including Maitetsu) pack every
+                        // icon in a group into one RGBA atlas:
+                        //
+                        //   source/<group>/texture/pixel
+                        //
+                        // The icon node then contains only left/top/width/
+                        // height/origin.  Treat the selected atlas rectangle
+                        // as this source's pixel resource.
+                        const auto texturePath =
+                            "source/" + group + "/texture";
+                        const auto atlasPixelPath = texturePath + "/pixel";
+                        const auto atlasIt =
+                            snapshot.resourcesByPath.find(atlasPixelPath);
+                        const auto atlasNode =
+                            navigatePSBPath(snapshot.root, texturePath);
+                        if(atlasIt != snapshot.resourcesByPath.end() &&
+                           atlasIt->second && !atlasIt->second->data.empty() &&
+                           outWidth > 0 && outHeight > 0) {
+                            const auto left = psbDictionaryNumber(
+                                iconNode, "left").value_or(0.0);
+                            const auto top = psbDictionaryNumber(
+                                iconNode, "top").value_or(0.0);
+                            int atlasWidth = atlasNode
+                                ? static_cast<int>(psbDictionaryNumber(
+                                      atlasNode, "width").value_or(0.0))
+                                : 0;
+                            int atlasHeight = atlasNode
+                                ? static_cast<int>(psbDictionaryNumber(
+                                      atlasNode, "height").value_or(0.0))
+                                : 0;
+                            const auto atlasPixels =
+                                atlasIt->second->data.size() / 4u;
+                            if(atlasWidth <= 0 || atlasHeight <= 0) {
+                                const auto squareSide = static_cast<int>(
+                                    std::lround(std::sqrt(
+                                        static_cast<double>(atlasPixels))));
+                                if(squareSide > 0 &&
+                                   static_cast<size_t>(squareSide) *
+                                       static_cast<size_t>(squareSide) ==
+                                       atlasPixels) {
+                                    atlasWidth = squareSide;
+                                    atlasHeight = squareSide;
+                                }
+                            }
+                            const int atlasLeft =
+                                static_cast<int>(std::lround(left));
+                            const int atlasTop =
+                                static_cast<int>(std::lround(top));
+                            if(atlasWidth > 0 && atlasHeight > 0 &&
+                               atlasLeft >= 0 && atlasTop >= 0 &&
+                               atlasLeft + outWidth <= atlasWidth &&
+                               atlasTop + outHeight <= atlasHeight) {
+                                const auto compressStr = atlasNode
+                                    ? psbDictionaryString(
+                                          atlasNode, "compress")
+                                    : std::string{};
+                                const auto textureType = atlasNode
+                                    ? psbDictionaryString(atlasNode, "type")
+                                    : std::string{};
+                                const auto resourceEncoding = textureType.empty()
+                                    ? compressStr : textureType;
+                                if(outResourcePath) {
+                                    *outResourcePath = iconPath +
+                                        fmt::format(
+                                            "/atlas@{},{},{},{}",
+                                            atlasLeft, atlasTop,
+                                            outWidth, outHeight);
+                                }
+                                if(outCompressName) {
+                                    *outCompressName = resourceEncoding;
+                                }
+
+                                // Native MPSBTex keeps the complete atlas
+                                // bound while RenderMesh addresses the icon
+                                // rectangle inside it.  A tightly cropped
+                                // replacement texture clamps its outermost
+                                // texel instead, turning the common 0.5x
+                                // E-mote presentation into a dark, serrated
+                                // silhouette.  Callers which consume the
+                                // decoded layout request a small piece of the
+                                // original atlas gutter and sample only the
+                                // logical icon rectangle within it.
+                                constexpr int kFilterGutter = 2;
+                                const bool preserveFilterGutter =
+                                    outDecodedWidth || outDecodedHeight ||
+                                    outDecodedSourceRect;
+                                const int decodedLeft = preserveFilterGutter
+                                    ? std::max(0, atlasLeft - kFilterGutter)
+                                    : atlasLeft;
+                                const int decodedTop = preserveFilterGutter
+                                    ? std::max(0, atlasTop - kFilterGutter)
+                                    : atlasTop;
+                                const int decodedRight = preserveFilterGutter
+                                    ? std::min(atlasWidth,
+                                               atlasLeft + outWidth +
+                                                   kFilterGutter)
+                                    : atlasLeft + outWidth;
+                                const int decodedBottom = preserveFilterGutter
+                                    ? std::min(atlasHeight,
+                                               atlasTop + outHeight +
+                                                   kFilterGutter)
+                                    : atlasTop + outHeight;
+                                const int decodedWidth =
+                                    decodedRight - decodedLeft;
+                                const int decodedHeight =
+                                    decodedBottom - decodedTop;
+                                const int insetLeft = atlasLeft - decodedLeft;
+                                const int insetTop = atlasTop - decodedTop;
+                                if(outDecodedWidth) {
+                                    *outDecodedWidth = decodedWidth;
+                                }
+                                if(outDecodedHeight) {
+                                    *outDecodedHeight = decodedHeight;
+                                }
+                                if(outDecodedSourceRect) {
+                                    *outDecodedSourceRect = {
+                                        insetLeft, insetTop,
+                                        insetLeft + outWidth,
+                                        insetTop + outHeight};
+                                }
+                                if(!decodePixelData) {
+                                    return atlasIt->second.get();
+                                }
+
+                                if(decodePsbBlockCompressedAtlasRegion(
+                                       atlasIt->second->data,
+                                       resourceEncoding,
+                                       atlasWidth, atlasHeight,
+                                       decodedLeft, decodedTop,
+                                       decodedWidth, decodedHeight,
+                                       decompressedOut)) {
+                                    if(outDecodedIsBgra) {
+                                        *outDecodedIsBgra = false;
+                                    }
+                                    return atlasIt->second.get();
+                                }
+
+                                std::vector<std::uint8_t> atlasPixelsDecoded;
+                                bool atlasIsBgra = false;
+                                const auto paletteIt =
+                                    snapshot.resourcesByPath.find(
+                                        texturePath + "/pal");
+                                const bool hasPalette =
+                                    paletteIt !=
+                                        snapshot.resourcesByPath.end() &&
+                                    paletteIt->second &&
+                                    !paletteIt->second->data.empty();
+                                const size_t atlasByteCount =
+                                    static_cast<size_t>(atlasWidth) *
+                                    static_cast<size_t>(atlasHeight) * 4u;
+                                const std::vector<std::uint8_t> *atlasData =
+                                    nullptr;
+                                if(!hasPalette &&
+                                   !isPsbRLCompressName(compressStr) &&
+                                   atlasIt->second->data.size() >=
+                                       atlasByteCount) {
+                                    // Raw atlases are common and can be
+                                    // cropped directly. Avoid copying a
+                                    // 4-16 MiB atlas once for every icon.
+                                    atlasData = &atlasIt->second->data;
+                                } else if(decodePsbPixelResource(
+                                              snapshot, texturePath,
+                                              *atlasIt->second,
+                                              atlasWidth, atlasHeight,
+                                              isPsbRLCompressName(
+                                                  compressStr),
+                                              atlasPixelsDecoded,
+                                              &atlasIsBgra)) {
+                                    atlasData = &atlasPixelsDecoded;
+                                }
+                                if(atlasData &&
+                                   atlasData->size() >= atlasByteCount) {
+                                    const size_t rowBytes =
+                                        static_cast<size_t>(decodedWidth) * 4u;
+                                    decompressedOut.resize(
+                                        rowBytes *
+                                        static_cast<size_t>(decodedHeight));
+                                    for(int row = 0; row < decodedHeight; ++row) {
+                                        const auto sourceOffset =
+                                            (static_cast<size_t>(
+                                                 decodedTop + row) *
+                                                 static_cast<size_t>(
+                                                     atlasWidth) +
+                                             static_cast<size_t>(decodedLeft)) *
+                                            4u;
+                                        std::memcpy(
+                                            decompressedOut.data() +
+                                                static_cast<size_t>(row) *
+                                                    rowBytes,
+                                            atlasData->data() +
+                                                sourceOffset,
+                                            rowBytes);
+                                    }
+                                    if(outDecodedIsBgra) {
+                                        *outDecodedIsBgra = atlasIsBgra;
+                                    }
+                                    return atlasIt->second.get();
+                                }
+                            }
                         }
                     }
                 }
@@ -1623,10 +3147,54 @@ namespace internal {
                             auto compressStr =
                                 psbDictionaryString(node, "compress");
                             if(outWidth > 0 && outHeight > 0) {
-                                decodePsbPixelResource(
+                                if(outResourcePath) {
+                                    *outResourcePath = resPath;
+                                }
+                                if(outCompressName) {
+                                    *outCompressName = compressStr;
+                                }
+                                if(!decodePixelData) {
+                                    return resource.get();
+                                }
+                                const bool isRL =
+                                    isPsbRLCompressName(compressStr);
+                                const bool decoded = decodePsbPixelResource(
                                     snapshot, parentPath, *resource,
-                                    outWidth, outHeight, compressStr == "RL",
+                                    outWidth, outHeight,
+                                    isRL,
                                     decompressedOut, outDecodedIsBgra);
+                                if(LOGGER &&
+                                   shouldDebugPsbSource(snapshot, source) &&
+                                   markPsbDebugLogged(snapshot.path + "|" +
+                                                      source + "|" + resPath)) {
+                                    const auto palPath = parentPath + "/pal";
+                                    const auto palIt =
+                                        snapshot.resourcesByPath.find(palPath);
+                                    const size_t palBytes =
+                                        (palIt != snapshot.resourcesByPath.end() &&
+                                         palIt->second)
+                                        ? palIt->second->data.size()
+                                        : 0u;
+                                    LOGGER->info(
+                                        "motion psb source fallback: path={} source={} pixel={} size={}x{} raw={} expected={} header=0x{:08x} compress={} isRL={} pal={} decoded={} decodedBytes={} decodedBgra={} rawStats=[{}] decodedStats=[{}]",
+                                        snapshot.path, source, resPath,
+                                        outWidth, outHeight,
+                                        resource->data.size(),
+                                        static_cast<size_t>(outWidth) *
+                                            static_cast<size_t>(outHeight) * 4u,
+                                        psbDataHeader(resource->data),
+                                        compressStr.empty() ? "<none>" : compressStr,
+                                        isRL ? 1 : 0,
+                                        palBytes,
+                                        decoded ? 1 : 0,
+                                        decompressedOut.size(),
+                                        outDecodedIsBgra && *outDecodedIsBgra ? 1 : 0,
+                                        samplePsbPixelStats(resource->data),
+                                        samplePsbPixelStats(decompressedOut));
+                                }
+                                if(!decoded) {
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1761,6 +3329,46 @@ namespace internal {
         // with pre-computed positions for the sub_6C7440 render loop.
         // Aligned to libkrkr2.so: full 2x3 affine [m11,m21,m12,m22,tx,ty]
         using Affine2x3 = std::array<double, 6>;
+
+        inline Affine2x3 startupLogoGeometryParentTransform(
+            const std::string &motionPath,
+            const Affine2x3 &parent,
+            int inheritFlags) {
+            if(!startupLogoMotionUsesStableBackdropReference(motionPath) ||
+               (inheritFlags & 0x060) == 0x060) {
+                return parent;
+            }
+
+            const double basisX =
+                std::hypot(parent[0], parent[1]);
+            const double basisY =
+                std::hypot(parent[2], parent[3]);
+            if(!std::isfinite(basisX) || !std::isfinite(basisY) ||
+               basisX <= 1.0e-9 || basisY <= 1.0e-9) {
+                return parent;
+            }
+
+            // A skewed basis cannot be separated into independent authored
+            // X/Y scales without changing its slant. M2's text parent is an
+            // orthogonal uniform-scale transform, so keep the compatibility
+            // correction deliberately narrow.
+            const double basisDot =
+                parent[0] * parent[2] + parent[1] * parent[3];
+            if(std::fabs(basisDot) > basisX * basisY * 1.0e-6) {
+                return parent;
+            }
+
+            Affine2x3 result = parent;
+            if((inheritFlags & 0x020) == 0) {
+                result[0] /= basisX;
+                result[1] /= basisX;
+            }
+            if((inheritFlags & 0x040) == 0) {
+                result[2] /= basisY;
+                result[3] /= basisY;
+            }
+            return result;
+        }
 
         // Compose: result = parent * Translate(lx, ly)
         inline Affine2x3 affineTranslate(const Affine2x3 &p, double lx, double ly) {

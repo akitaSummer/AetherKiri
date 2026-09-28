@@ -13,6 +13,10 @@
 #include "resources/ImageMetadata.h"
 
 namespace PSB {
+    namespace detail {
+        bool IsSupportedImageHeader(const std::vector<uint8_t> &data);
+    }
+
     struct PSBMediaCacheStats {
         size_t entryCount = 0;
         size_t entryLimit = 0;
@@ -67,6 +71,7 @@ namespace PSB {
     public:
         struct CachedImageInfo {
             std::string debugKey;
+            std::string label;
             int width = 0;
             int height = 0;
             int left = 0;
@@ -93,8 +98,25 @@ namespace PSB {
             std::string key;
             CachedImageInfo info;
         };
+        bool ensureArchiveLoaded(const std::string &archiveKey,
+                                 bool reloadIfLoaded = false);
         std::vector<ImageInfoEntry> getImagesByPrefix(const std::string &prefix) const;
         bool getImageInfo(const std::string &key, CachedImageInfo &outInfo) const;
+
+        // Motion PSBs can contain the source images consumed by a sliced
+        // layer without shipping standalone .tlg files.  Keep the authored
+        // image order as a storage-level capability; the private PackinOne
+        // compatibility layer may resolve a bare slice request to one of
+        // these indexed aliases without knowing a title's layer names.
+        void addMotionSliceSet(std::string archiveKey,
+                               std::vector<std::string> imageKeys,
+                               int authoredWidth = 0,
+                               int authoredHeight = 0);
+        bool resolveMotionSliceStorage(const std::string &request,
+                                       std::string &resolved);
+        bool getMotionSliceCanvasSize(const std::string &storage,
+                                      int &width,
+                                      int &height) const;
 
         struct LayerPosition {
             std::string sceneName;
@@ -128,8 +150,11 @@ namespace PSB {
         using ResourceMap = std::unordered_map<std::string, CacheEntry>;
 
         std::string canonicalizeKey(const std::string &key) const;
+        std::vector<std::string> discoverMotionArchives(
+            const std::string &request);
         ResourceMap::iterator findBySuffixLocked(const std::string &key);
-        bool tryLazyLoadArchive(const std::string &key);
+        bool tryLazyLoadArchive(const std::string &key,
+                                bool reloadIfLoaded = false);
         void touchLocked(CacheEntry &entry);
         void adaptBudgetByMemoryPressureLocked();
         void evictIfNeededLocked();
@@ -140,13 +165,32 @@ namespace PSB {
         std::list<std::string> _lru;
         size_t _bytesInUse = 0;
         size_t _configuredMaxEntryCount = 2048;
-        size_t _configuredMaxByteSize = 192ULL * 1024ULL * 1024ULL;
+        size_t _configuredMaxByteSize = 256ULL * 1024ULL * 1024ULL;
         size_t _maxEntryCount = 2048;
-        size_t _maxByteSize = 192ULL * 1024ULL * 1024ULL;
+        size_t _maxByteSize = 256ULL * 1024ULL * 1024ULL;
         uint64_t _hitCount = 0;
         uint64_t _missCount = 0;
         std::unordered_set<std::string> _loadedArchives;
+        std::unordered_set<std::string> _failedArchives;
+        std::unordered_set<std::string> _knownResourceKeys;
+        std::unordered_set<std::string> _missingResourceKeys;
         std::unordered_map<std::string, std::vector<LayerPosition>> _layerPositions;
         std::unordered_map<std::string, std::vector<ButtonBoundInfo>> _buttonBoundsMap;
+        mutable std::mutex _motionDiscoveryMutex;
+        std::unordered_set<std::string> _motionScannedRoots;
+        std::vector<std::string> _motionKnownArchives;
+
+        struct MotionSliceSet {
+            std::string archiveKey;
+            std::vector<std::string> imageKeys;
+            std::unordered_map<std::string, std::string> assignments;
+            int authoredWidth = 0;
+            int authoredHeight = 0;
+            size_t nextImage = 0;
+            uint64_t generation = 0;
+        };
+        std::vector<MotionSliceSet> _motionSliceSets;
+        std::unordered_map<std::string, std::string> _motionSliceAliases;
+        uint64_t _motionSliceGeneration = 0;
     };
 } // namespace PSB

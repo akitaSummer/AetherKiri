@@ -15,6 +15,9 @@
 #include "AEStream.h"
 #include "krffmpeg.h"
 #include "WaveMixer.h"
+#include <chrono>
+#include <cstdio>
+#include <spdlog/spdlog.h>
 
 #ifdef HAS_OMXPLAYER
 #include "../omxplayer/OMXPlayerAudio.h"
@@ -23,6 +26,11 @@
 #endif
 
 NS_KRMOVIE_BEGIN
+
+static bool VideoTraceEnabled() {
+    const char *value = std::getenv("AETHERKIRI_VIDEO_TRACE");
+    return value != nullptr && value[0] != '\0';
+}
 
 void CSelectionStreams::Clear(StreamType type, StreamSource source) {
     std::lock_guard<std::recursive_mutex> lock(m_section);
@@ -189,25 +197,39 @@ BasePlayer::BasePlayer(CBaseRenderer *renderer) :
     m_streamPlayerSpeed = DVD_PLAYSPEED_NORMAL;
     m_caching = CACHESTATE_DONE;
     memset(&m_SpeedState, 0, sizeof(m_SpeedState));
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer created player={}",
+                     static_cast<const void *>(this));
 }
 
 BasePlayer::~BasePlayer() {
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer destroying file={} player={} running={}",
+                     m_strFileName, static_cast<const void *>(this),
+                     IsRunning() ? 1 : 0);
     CloseInputStream();
     DestroyPlayers();
     ::Application->RegisterActiveEvent(this, nullptr);
 }
 
 void BasePlayer::Play() {
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer play file={} player={} speed={}",
+                     m_strFileName, static_cast<const void *>(this),
+                     GetSpeed());
     m_bStopStatus = false;
 
     if(!m_ThreadId)
         Create();
 
     if(GetSpeed() == 0)
-        SetSpeed(1 /*m_newPlaySpeed*/);
+        SetSpeed(m_origSpeed > 0 ? m_origSpeed : 1.0);
 }
 
 void BasePlayer::Stop() {
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer stop file={} player={}", m_strFileName,
+                     static_cast<const void *>(this));
     m_bStopStatus = true;
     // pause and rewind
     SetSpeed(0);
@@ -215,24 +237,65 @@ void BasePlayer::Stop() {
 }
 
 void BasePlayer::Pause() {
-    if(GetSpeed() != 0)
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer pause file={} player={} speed={}",
+                     m_strFileName, static_cast<const void *>(this),
+                     GetSpeed());
+    if(GetSpeed() != 0) {
+        m_origSpeed = GetSpeed();
         SetSpeed(0);
+    }
 }
 
 void BasePlayer::GetVideoSize(long *width, long *height) {
+    auto set_size = [&](long w, long h) -> bool {
+        if(w <= 0 || h <= 0)
+            return false;
+        *width = w;
+        *height = h;
+        return true;
+    };
+
     std::lock_guard<std::recursive_mutex> lock(m_SelectionStreams.m_section);
+
+    if(set_size(m_CurrentVideo.hint.width, m_CurrentVideo.hint.height))
+        return;
+
     int streamId = GetVideoStream();
 
-    if(streamId < 0) {
-        *width = 0;
-        *height = 0;
-        return;
+    if(streamId >= 0) {
+        SelectionStream &s = m_SelectionStreams.Get(STREAM_VIDEO, streamId);
+        if(set_size(s.width, s.height))
+            return;
     }
 
-    SelectionStream &s = m_SelectionStreams.Get(STREAM_VIDEO, streamId);
+    if(m_pDemuxer && m_CurrentVideo.demuxerId >= 0 && m_CurrentVideo.id >= 0) {
+        CDemuxStream *stream =
+            m_pDemuxer->GetStream(m_CurrentVideo.demuxerId, m_CurrentVideo.id);
+        if(stream && stream->type == STREAM_VIDEO) {
+            auto *videoStream = static_cast<CDemuxStreamVideo *>(stream);
+            if(set_size(videoStream->iWidth, videoStream->iHeight))
+                return;
+        }
+    }
 
-    *width = s.width;
-    *height = s.height;
+    for(const auto &s : m_SelectionStreams.Get(STREAM_VIDEO)) {
+        if(set_size(s.width, s.height))
+            return;
+    }
+
+    if(m_pDemuxer) {
+        for(auto *stream : m_pDemuxer->GetStreams()) {
+            if(stream && stream->type == STREAM_VIDEO) {
+                auto *videoStream = static_cast<CDemuxStreamVideo *>(stream);
+                if(set_size(videoStream->iWidth, videoStream->iHeight))
+                    return;
+            }
+        }
+    }
+
+    *width = 0;
+    *height = 0;
 }
 
 void BasePlayer::SetLoopSegement(int beginFrame, unsigned int endFrame) {
@@ -276,6 +339,10 @@ bool BasePlayer::OpenFromStream(IStream *stream, const tjs_char *streamname,
 
     TJS::tTJSNarrowStringHolder holder(streamname);
     std::string filename = holder.operator const tjs_nchar *();
+    m_strFileName = filename;
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer open file={} player={} size={}",
+                     m_strFileName, static_cast<const void *>(this), size);
 
     m_bAbortRequest = false;
     SetPlaySpeed(DVD_PLAYSPEED_NORMAL);
@@ -342,6 +409,11 @@ bool BasePlayer::OpenFromStream(IStream *stream, const tjs_char *streamname,
 }
 
 bool BasePlayer::CloseInputStream() {
+    if(VideoTraceEnabled())
+        spdlog::info(
+            "MoviePlayer close input file={} player={} running={} abort={}",
+            m_strFileName, static_cast<const void *>(this),
+            IsRunning() ? 1 : 0, m_bAbortRequest ? 1 : 0);
     //	CLog::Log(LOGNOTICE, "CVideoPlayer::CloseFile()");
 
     // set the abort request so that other threads can finish up
@@ -384,6 +456,11 @@ bool BasePlayer::CanSeek() {
 }
 
 void BasePlayer::OnExit() {
+    if(VideoTraceEnabled())
+        std::fprintf(stderr,
+                     "[MovieTrace] thread exit file=%s player=%p abort=%d\n",
+                     m_strFileName.c_str(), static_cast<void *>(this),
+                     m_bAbortRequest ? 1 : 0);
     //	CLog::Log(LOGNOTICE, "CVideoPlayer::OnExit()");
 
     // set event to inform openfile something went wrong in case
@@ -535,6 +612,11 @@ void BasePlayer::CheckStreamChanges(CCurrentStream &current,
 }
 
 void BasePlayer::Process() {
+    constexpr auto eofDrainStallLimit = std::chrono::seconds(2);
+    auto eofLastProgressAt = std::chrono::steady_clock::time_point{};
+    int eofAudioDataSize = -1;
+    int eofVideoDataSize = -1;
+
     while(!m_bAbortRequest) {
         // handle messages send to this thread, like seek or demuxer
         // reset requests
@@ -577,8 +659,10 @@ void BasePlayer::Process() {
         // 			continue;
 
         // if the queues are full, no need to read more
-        if((!m_VideoPlayerAudio->AcceptsData() && m_CurrentAudio.id >= 0) ||
-           (!m_VideoPlayerVideo->AcceptsData() && m_CurrentVideo.id >= 0)) {
+        if((!m_VideoPlayerAudio->AcceptsData() && m_CurrentAudio.id >= 0 &&
+            m_CurrentAudio.inited) ||
+           (!m_VideoPlayerVideo->AcceptsData() && m_CurrentVideo.id >= 0 &&
+            m_CurrentVideo.inited)) {
             Sleep(10);
             continue;
         }
@@ -603,19 +687,18 @@ void BasePlayer::Process() {
             if(m_playSpeed == DVD_PLAYSPEED_PAUSE)
                 continue;
 
-            if(m_iLoopSegmentBegin != -1) { // process loop info
-                double start = DVD_NOPTS_VALUE;
-                if(m_pDemuxer &&
-                   m_pDemuxer->SeekTime(m_iLoopSegmentBegin / GetFPS() *
-                                            DVD_PLAYSPEED_NORMAL,
-                                        true, &start)) {
-                    continue;
-                }
-            }
+            // Do not rewind as soon as the demuxer reaches EOF. Demuxing runs
+            // ahead of presentation, so seeking here leaves decoded frames in
+            // the queues and keeps the playback clock at the end of the first
+            // pass. Frames from the next pass then have timestamps near zero
+            // and are discarded as late. Drain the queues and emit Ended
+            // below; the VideoOverlay/layerExMovie loop handlers perform the
+            // synchronized rewind and resume after the final frame is shown.
 
 #ifdef _WIN32
 #undef SendMessage
 #endif
+            const bool firstEof = m_CurrentAudio.inited || m_CurrentVideo.inited;
             if(m_CurrentAudio.inited)
                 m_VideoPlayerAudio->SendMessage(
                     new CDVDMsg(CDVDMsg::GENERAL_EOF));
@@ -643,9 +726,66 @@ void BasePlayer::Process() {
 
             // while players are still playing, keep going to allow
             // seekbacks
-            if(m_VideoPlayerAudio->HasData() || m_VideoPlayerVideo->HasData()) {
-                Sleep(100);
-                continue;
+            int audioDataSize = m_VideoPlayerAudio->GetPendingDataSize();
+            int videoDataSize = m_VideoPlayerVideo->GetPendingDataSize();
+            if(VideoTraceEnabled() && firstEof)
+                spdlog::info(
+                    "MoviePlayer demux eof file={} player={} audio_bytes={} video_bytes={} "
+                    "audio_worker={} video_worker={} callback={}",
+                    m_strFileName, static_cast<const void *>(this),
+                    audioDataSize, videoDataSize,
+                    m_VideoPlayerAudio->IsWorkerRunning() ? 1 : 0,
+                    m_VideoPlayerVideo->IsWorkerRunning() ? 1 : 0,
+                    m_callback ? 1 : 0);
+
+            if(audioDataSize > 0 || videoDataSize > 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const bool madeProgress =
+                    eofLastProgressAt ==
+                        std::chrono::steady_clock::time_point{} ||
+                    audioDataSize != eofAudioDataSize ||
+                    videoDataSize != eofVideoDataSize;
+                if(madeProgress) {
+                    eofLastProgressAt = now;
+                    eofAudioDataSize = audioDataSize;
+                    eofVideoDataSize = videoDataSize;
+                }
+
+                const bool audioWorkerStopped =
+                    audioDataSize > 0 &&
+                    !m_VideoPlayerAudio->IsWorkerRunning();
+                const bool videoWorkerStopped =
+                    videoDataSize > 0 &&
+                    !m_VideoPlayerVideo->IsWorkerRunning();
+                const bool drainStalled =
+                    !madeProgress &&
+                    now - eofLastProgressAt >= eofDrainStallLimit;
+
+                if(audioWorkerStopped || videoWorkerStopped || drainStalled) {
+                    if(VideoTraceEnabled())
+                        spdlog::warn(
+                            "MoviePlayer discarding undrainable eof packets file={} player={} "
+                            "audio_bytes={} video_bytes={} audio_worker={} "
+                            "video_worker={} stalled={}",
+                            m_strFileName, static_cast<const void *>(this),
+                            audioDataSize, videoDataSize,
+                            m_VideoPlayerAudio->IsWorkerRunning() ? 1 : 0,
+                            m_VideoPlayerVideo->IsWorkerRunning() ? 1 : 0,
+                            drainStalled ? 1 : 0);
+                    if(audioDataSize > 0)
+                        m_VideoPlayerAudio->FlushMessages();
+                    if(videoDataSize > 0)
+                        m_VideoPlayerVideo->FlushMessages();
+                    audioDataSize =
+                        m_VideoPlayerAudio->GetPendingDataSize();
+                    videoDataSize =
+                        m_VideoPlayerVideo->GetPendingDataSize();
+                }
+
+                if(audioDataSize > 0 || videoDataSize > 0) {
+                    Sleep(100);
+                    continue;
+                }
             }
 #ifdef HAS_OMXPLAYER
             if(m_omxplayer_mode &&
@@ -661,10 +801,19 @@ void BasePlayer::Process() {
             // TODO process loop info
             SetSpeed(0);
             SeekTime(0); // rewind
+            if(VideoTraceEnabled())
+                spdlog::info(
+                    "MoviePlayer eof drained; emitting ended file={} player={} callback={}",
+                    m_strFileName, static_cast<const void *>(this),
+                    m_callback ? 1 : 0);
             if(m_callback)
                 m_callback(KRMovieEvent::Ended, nullptr);
             continue;
         }
+
+        eofLastProgressAt = std::chrono::steady_clock::time_point{};
+        eofAudioDataSize = -1;
+        eofVideoDataSize = -1;
 
         // it's a valid data packet, reset error counter
         m_errorCount = 0;
@@ -1435,6 +1584,12 @@ void BasePlayer::HandleMessages() {
             FlushBuffers(false);
         } else if(pMsg->IsType(CDVDMsg::PLAYER_SETSPEED)) {
             int speed = static_cast<CDVDMsgInt *>(pMsg)->m_value;
+            if(VideoTraceEnabled())
+                spdlog::info(
+                    "MoviePlayer apply speed file={} player={} old={} new={}",
+                    m_strFileName, static_cast<const void *>(this),
+                    static_cast<double>(m_playSpeed) / DVD_PLAYSPEED_NORMAL,
+                    static_cast<double>(speed) / DVD_PLAYSPEED_NORMAL);
 
             // correct our current clock, as it would start going
             // wrong otherwise
@@ -1781,6 +1936,10 @@ void BasePlayer::SetSpeed(double speed) {
     if(!CanSeek())
         return;
 
+    if(VideoTraceEnabled())
+        spdlog::info(
+            "MoviePlayer request speed file={} player={} current={} new={}",
+            m_strFileName, static_cast<const void *>(this), GetSpeed(), speed);
     m_newPlaySpeed = speed * DVD_PLAYSPEED_NORMAL;
     SetPlaySpeed(speed * DVD_PLAYSPEED_NORMAL);
 }

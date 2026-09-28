@@ -110,7 +110,7 @@ static void TVPInitGLExtensionInfo() {
         return;
     TVPGLExtensionInfoInited = true;
     const char *ext_str = (const char *)glGetString(GL_EXTENSIONS);
-    if(!ext_str) return; // No GL context (e.g. Flutter mode without EGL surface)
+    if(!ext_str) return; // No GL context (e.g. embedded host mode without EGL surface)
     std::string gl_extensions = ext_str;
     const char *p = gl_extensions.c_str();
     for(char &c : gl_extensions) {
@@ -150,6 +150,8 @@ namespace GL { // independ from global gl functions
     typedef PROC(WINAPI fGetProcAddress)(LPCSTR);
 #elif defined(TARGET_OS_IPHONE)
     typedef void *(fGetProcAddress)(const char *);
+#elif defined(__APPLE__) && defined(EGLAPIENTRY)
+    typedef void *(EGLAPIENTRY fGetProcAddress)(const char *);
 #elif defined(__ANDROID__)
     typedef void *(EGLAPIENTRY fGetProcAddress)(const char *);
 #elif defined(__linux__) || defined(LINUX)
@@ -517,7 +519,7 @@ static void _RestoreGLStatues() {
     }
     krkr::gl::BlendResetToCache();
     TVPSetRenderTarget(0);
-    // viewport will be set by the host rendering system (Flutter)
+    // viewport will be set by the host rendering system (Application host)
 }
 
 static tjs_uint8 *TVPShrinkXYBy2(tjs_uint *dpitch, const tjs_uint8 *src,
@@ -2065,7 +2067,7 @@ public:
         std::string coord("a_texCoord");
         for(int i = 0; i < m_nTex; ++i) {
             char sCounter[8];
-            sprintf(sCounter, "%d", i);
+            snprintf(sCounter, sizeof(sCounter), "%d", i);
             int loc = glGetUniformLocation(program, (tex + sCounter).c_str());
             glUniform1i(loc, i);
             loc = glGetAttribLocation(program, (coord + sCounter).c_str());
@@ -2959,7 +2961,7 @@ protected:
                 SATATUE_CASE(GL_FRAMEBUFFER_UNSUPPORTED);
                 default: {
                     char tmp[16];
-                    sprintf(tmp, "0x%X", errcode);
+                    snprintf(tmp, sizeof(tmp), "0x%X", errcode);
                     TVPConsoleLog(
                         (std::string("glCheckFramebufferStatus = ") + tmp)
                             .c_str());
@@ -4133,7 +4135,7 @@ public:
             int blkw = (w + block_width - 1) / block_width;
             int blkh = (h + block_height - 1) / block_height;
             int blksize = 0;
-            switch(format) {
+            switch((int)format) {
                 case TVPTextureFormat::Compressed + GL_COMPRESSED_RGB8_ETC2:
                     blksize = 8;
                     break;
@@ -4159,7 +4161,7 @@ public:
             tjs_uint32 *pixeldata =
                 (tjs_uint32 *)TJSAlignedAlloc(pitch * blkh * block_height, 4);
             bool opaque = false;
-            switch(format) {
+            switch((int)format) {
                 case TVPTextureFormat::Compressed + GL_COMPRESSED_RGB8_ETC2:
                     ETCPacker::decode(pixel, pixeldata, pitch, h, blkw, blkh);
                     opaque = true;
@@ -4839,7 +4841,7 @@ public:
             std::string coord("a_texCoord");
             for(int i = 0; i < m_nTex; ++i) {
                 char sCounter[8];
-                sprintf(sCounter, "%d", i);
+                snprintf(sCounter, sizeof(sCounter), "%d", i);
                 int loc =
                     glGetUniformLocation(program, (tex + sCounter).c_str());
                 glUniform1i(loc, i);

@@ -12,6 +12,7 @@
 #include "tjsCommHead.h"
 
 #include "XP3Archive.h"
+#include "XP3ArchiveCxDecoder.h"
 #include "MsgIntf.h"
 #include "DebugIntf.h"
 #include "EventIntf.h"
@@ -20,6 +21,10 @@
 
 #include <zlib.h>
 #include <algorithm>
+#include <array>
+#include <limits>
+#include <map>
+#include <vector>
 
 #include "TVPMmapAlloc.h"
 
@@ -56,6 +61,15 @@ static tTVPArchiveHandleCacheItem *TVPArchiveHandleCachePool = nullptr;
 static bool TVPArchiveHandleCacheInit = false;
 static bool TVPArchiveHandleCacheShutdown = false;
 static tTJSCriticalSection TVPArchiveHandleCacheCS;
+
+static void TVPDeleteArchiveStreamNoThrow(tTJSBinaryStream *&stream) noexcept {
+    tTJSBinaryStream *stream_to_delete = stream;
+    stream = nullptr;
+    try {
+        delete stream_to_delete;
+    } catch(...) {
+    }
+}
 
 //---------------------------------------------------------------------------
 tTJSBinaryStream *TVPGetCachedArchiveHandle(void *pointer, const ttstr &name) {
@@ -134,7 +148,7 @@ tTJSBinaryStream *TVPGetCachedArchiveHandle(void *pointer, const ttstr &name) {
     // free oldest cell and fill it
     tTVPArchiveHandleCacheItem *oldest_item =
         TVPArchiveHandleCachePool + oldest;
-    delete oldest_item->Stream, oldest_item->Stream = nullptr;
+    TVPDeleteArchiveStreamNoThrow(oldest_item->Stream);
     oldest_item->Pointer = pointer;
     oldest_item->Stream = stream;
     oldest_item->Age = ++TVPArchiveHandleCacheAge;
@@ -152,7 +166,7 @@ tTJSBinaryStream *TVPGetCachedArchiveHandle(void *pointer, const ttstr &name) {
     for(tjs_int i = 0; i < TVP_MAX_ARCHIVE_HANDLE_CACHE; i++) {
         tTVPArchiveHandleCacheItem *item = TVPArchiveHandleCachePool + i;
         if(item->Stream && item->Pointer == pointer) {
-            delete item->Stream, item->Stream = nullptr;
+            TVPDeleteArchiveStreamNoThrow(item->Stream);
             item->Pointer = nullptr;
             item->Age = 0;
         }
@@ -172,7 +186,7 @@ static void TVPFreeArchiveHandlePool() {
     for(tjs_int i = 0; i < TVP_MAX_ARCHIVE_HANDLE_CACHE; i++) {
         tTVPArchiveHandleCacheItem *item = TVPArchiveHandleCachePool + i;
         if(item->Stream) {
-            delete item->Stream, item->Stream = nullptr;
+            TVPDeleteArchiveStreamNoThrow(item->Stream);
             item->Pointer = nullptr;
             item->Age = 0;
         }
@@ -319,6 +333,58 @@ bool TVPIsXP3Archive(const ttstr &name) {
 }
 
 //---------------------------------------------------------------------------
+namespace {
+
+bool TVPReadXP3ItemHeader(tTJSBinaryStream *stream,
+                          const tTVPXP3Archive::tArchiveItem &item,
+                          std::array<tjs_uint8, 8> &header) {
+    if(item.Segments.empty())
+        return false;
+
+    const auto &segment = item.Segments.front();
+    if(segment.Offset != 0 || segment.OrgSize < header.size())
+        return false;
+
+    const tjs_uint64 originalPosition = stream->GetPosition();
+    bool succeeded = false;
+    try {
+        stream->SetPosition(segment.Start);
+        if(segment.IsCompressed) {
+            if(segment.ArcSize <= std::numeric_limits<tjs_uint>::max() &&
+               segment.OrgSize <= std::numeric_limits<tjs_uint>::max()) {
+                std::vector<tjs_uint8> archived(
+                    static_cast<std::size_t>(segment.ArcSize));
+                std::vector<tjs_uint8> original(
+                    static_cast<std::size_t>(segment.OrgSize));
+                stream->ReadBuffer(archived.data(),
+                                   static_cast<tjs_uint>(archived.size()));
+                unsigned long originalSize =
+                    static_cast<unsigned long>(original.size());
+                succeeded =
+                    uncompress(original.data(), &originalSize,
+                               archived.data(),
+                               static_cast<unsigned long>(archived.size())) ==
+                        Z_OK &&
+                    originalSize == original.size();
+                if(succeeded)
+                    std::copy_n(original.begin(), header.size(),
+                                header.begin());
+            }
+        } else {
+            stream->ReadBuffer(header.data(),
+                               static_cast<tjs_uint>(header.size()));
+            succeeded = true;
+        }
+    } catch(...) {
+        succeeded = false;
+    }
+    stream->SetPosition(originalPosition);
+    return succeeded;
+}
+
+} // namespace
+
+//---------------------------------------------------------------------------
 void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
                           bool normalizeName) {
     tjs_uint64 offset = off;
@@ -333,11 +399,22 @@ void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
                                          0x67 /*'g'*/, 0x6d /*'m'*/ };
     static const tjs_uint8 cn_adlr[] = { 0x61 /*'a'*/, 0x64 /*'d'*/,
                                          0x6c /*'l'*/, 0x72 /*'r'*/ };
+    static const tjs_uint8 cn_hnfn[] = { 0x68 /*'h'*/, 0x6e /*'n'*/,
+                                         0x66 /*'f'*/, 0x6e /*'n'*/ };
 
     TVPAddLog(TVPFormatMessage(
         TVPInfoTryingToReadXp3VirtualFileSystemInformationFrom, ArchiveName));
 
     int segmentcount = 0;
+    // XP3 v3 stores real names in top-level hnfn chunks while File.info
+    // contains an opaque name. Different files can share the same content
+    // hash, and the mappings can span continued index blocks, so retain every
+    // name in archive order instead of overwriting it by hash.
+    struct tXP3FilenameMappings {
+        std::vector<ttstr> Names;
+        size_t Next = 0;
+    };
+    std::map<tjs_uint32, tXP3FilenameMappings> filenameMap;
     try {
         // retrieve archive offset
         if(off < 0)
@@ -405,6 +482,34 @@ void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
                 TVPThrowExceptionMessage(TVPReadError);
             }
 
+            // Collect the v3 hash-to-filenames mapping before parsing File
+            // chunks. hnfn chunks are not guaranteed to precede their File
+            // chunks within an index block.
+            tjs_uint ch_hnfn_start = 0;
+            tjs_uint ch_hnfn_size = index_size;
+            for(;;) {
+                if(!FindChunk(indexdata, cn_hnfn, ch_hnfn_start,
+                              ch_hnfn_size))
+                    break;
+                if(ch_hnfn_size >= 6) {
+                    const tjs_uint32 hash =
+                        ReadI32FromMem(indexdata + ch_hnfn_start);
+                    const tjs_int nameLength =
+                        ReadI16FromMem(indexdata + ch_hnfn_start + 4);
+                    const tjs_uint64 requiredSize =
+                        6u + static_cast<tjs_uint64>(nameLength) * 2u;
+                    if(nameLength >= 0 && requiredSize <= ch_hnfn_size) {
+                        filenameMap[hash].Names.push_back(
+                            TVPStringFromBMPUnicode(
+                                reinterpret_cast<const tjs_uint16 *>(
+                                    indexdata + ch_hnfn_start + 6),
+                                nameLength));
+                    }
+                }
+                ch_hnfn_start += ch_hnfn_size;
+                ch_hnfn_size = index_size - ch_hnfn_start;
+            }
+
             // read index information from memory
             tjs_uint ch_file_start = 0;
             tjs_uint ch_file_size = index_size;
@@ -424,6 +529,7 @@ void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
                 tArchiveItem item;
                 tjs_uint32 flags =
                     ReadI32FromMem(indexdata + ch_info_start + 0);
+                item.Flags = flags;
                 if(!TVPAllowExtractProtectedStorage &&
                    (flags & TVP_XP3_FILE_PROTECTED))
                     TVPThrowExceptionMessage(
@@ -435,8 +541,6 @@ void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
                 ttstr name = TVPStringFromBMPUnicode(
                     (const tjs_uint16 *)(indexdata + ch_info_start + 22), len);
                 item.Name = name;
-                if(normalizeName)
-                    NormalizeInArchiveStorageName(item.Name);
 
                 // find 'segm' sub-chunk
                 // Each of in-archive storages can be splitted into
@@ -490,6 +594,15 @@ void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
                 // read 'aldr' sub-chunk
                 item.FileHash = ReadI32FromMem(indexdata + ch_adlr_start);
 
+                const auto mappedName = filenameMap.find(item.FileHash);
+                if(mappedName != filenameMap.end() &&
+                   mappedName->second.Next < mappedName->second.Names.size()) {
+                    item.Name =
+                        mappedName->second.Names[mappedName->second.Next++];
+                }
+                if(normalizeName)
+                    NormalizeInArchiveStorageName(item.Name);
+
                 // push information
                 ItemVector.push_back(item);
 
@@ -501,6 +614,32 @@ void tTVPXP3Archive::Init(tTJSBinaryStream *st, tjs_int64 off,
 
             if(!(index_flag & TVP_XP3_INDEX_CONTINUE))
                 break; // continue reading index when the bit sets
+        }
+
+        // A content hash alone is not enough to select Cx: translated XP3s
+        // can retain protected metadata after their payload is already
+        // decrypted. Probe the root startup payload before enabling the
+        // decoder for this archive.
+        for(const auto &item : ItemVector) {
+            if(item.Name != TJS_W("startup.tjs") ||
+               !TVPIsBuiltinXP3CxScheme(item.FileHash))
+                continue;
+
+            std::array<tjs_uint8, 8> header{};
+            const bool headerRead = TVPReadXP3ItemHeader(st, item, header);
+            if(TVPShouldUseBuiltinXP3CxDecoder(
+                   item.FileHash, headerRead ? header.data() : nullptr,
+                   headerRead ? header.size() : 0)) {
+                UseBuiltinCxDecoder =
+                    TVPActivateBuiltinXP3CxDecoder(item.FileHash);
+                if(UseBuiltinCxDecoder)
+                    TVPAddImportantLog(
+                        TJS_W("(info) Activated built-in XP3 Cx decoder"));
+            } else {
+                TVPAddImportantLog(
+                    TJS_W("(info) Protected XP3 payload is already decoded; skipped built-in Cx decoder"));
+            }
+            break;
         }
 
         // sort item vector by its name (required for tTVPArchive
@@ -532,7 +671,12 @@ tTVPXP3Archive::tTVPXP3Archive(const ttstr &name, tTJSBinaryStream *st,
 }
 
 //---------------------------------------------------------------------------
-tTVPXP3Archive::~tTVPXP3Archive() { TVPFreeArchiveHandlePoolByPointer(this); }
+tTVPXP3Archive::~tTVPXP3Archive() {
+    try {
+        TVPFreeArchiveHandlePoolByPointer(this);
+    } catch(...) {
+    }
+}
 
 tTVPArchive *tTVPXP3Archive::Create(const ttstr &name, tTJSBinaryStream *st,
                                     bool normalizeFileName) {
@@ -638,7 +782,7 @@ tjs_int64 tTVPXP3Archive::ReadI64FromMem(const tjs_uint8 *mem) {
 // Compressed segment cache related
 //---------------------------------------------------------------------------
 #define TVP_SEGCACHE_ONE_LIMIT (1024 * 1024) // max size limit for each segment
-#define TVP_SEGCACHE_TOTAL_LIMIT (1024 * 1024) // total segment cache size
+#define TVP_SEGCACHE_TOTAL_LIMIT (256 * 1024 * 1024) // total segment cache size
 tjs_uint TVPSegmentCacheLimit = TVP_SEGCACHE_TOTAL_LIMIT;
 
 //---------------------------------------------------------------------------
@@ -690,13 +834,16 @@ public:
 
     void SetData(unsigned long outsize, tTJSBinaryStream *instream,
                  unsigned long insize) {
+        if((tjs_uint)insize != insize || (tjs_uint)outsize != outsize)
+            TVPThrowExceptionMessage(TVPReadError);
+
 #ifdef TVP_USE_MMAP_TEMP
         tjs_uint8 *indata = (tjs_uint8 *)TVPMmapAlloc(insize);
 #else
         tjs_uint8 *indata = new tjs_uint8[insize];
 #endif
         try {
-            instream->Read(indata, insize);
+            instream->ReadBuffer(indata, (tjs_uint)insize);
 
 #ifdef TVP_USE_MMAP_TEMP
             Data = (tjs_uint8 *)TVPMmapAlloc(outsize);
@@ -704,11 +851,11 @@ public:
             Data = new tjs_uint8[outsize];
 #endif
             unsigned long destlen = outsize;
-            int result = uncompress((unsigned char *)Data, &outsize,
+            int result = uncompress((unsigned char *)Data, &destlen,
                                     (unsigned char *)indata, insize);
             if(result != Z_OK || destlen != outsize)
                 TVPThrowExceptionMessage(TVPUncompressionFailed);
-            Size = outsize;
+            Size = (tjs_uint)destlen;
         } catch(...) {
 #ifdef TVP_USE_MMAP_TEMP
             TVPMmapFree(indata);
@@ -1028,6 +1175,16 @@ tjs_uint tTVPXP3ArchiveStream::Read(void *buffer, tjs_uint read_size) {
                 Owner->GetFileHash(StorageIndex), Owner->GetName(StorageIndex));
             TVPXP3ArchiveExtractionFilter((tTVPXP3ExtractionFilterInfo *)&info,
                                           &FilterContext);
+        } else if(Owner->IsFileProtected(StorageIndex) &&
+                  TVPIsBuiltinXP3CxDecoderActive()) {
+            // The Cx scheme is selected by the protected startup entry in
+            // the project's data archive, but the encrypted payload is split
+            // across sibling XP3 archives (for example adult.xp3). Keep the
+            // selection process global so protected entries in those sibling
+            // archives receive the same decoder.
+            TVPDecodeBuiltinXP3Cx(
+                Owner->GetFileHash(StorageIndex), CurPos,
+                static_cast<tjs_uint8 *>(buffer) + write_size, one_size);
         }
 
         // adjust members

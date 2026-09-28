@@ -23,6 +23,8 @@ enum {
     ssMiddle = TVP_SS_MIDDLE,
     ssDouble = TVP_SS_DOUBLE,
     ssRepeat = TVP_SS_REPEAT,
+    ssX1 = TVP_SS_X1,
+    ssX2 = TVP_SS_X2,
 };
 #if 0
 class tTVPWindow {
@@ -313,7 +315,7 @@ enum {
     orientLandscape,
 };
 
-// Scene-tree based rendering is removed; Flutter handles display.
+// Scene-tree based rendering is removed; Godot handles display.
 using TVPOverlayNode = void;
 
 class iWindowLayer {
@@ -334,7 +336,8 @@ public:
     virtual void UpdateCursorPos(tjs_int x, tjs_int y) {}
     virtual void SetHintText(const ttstr &text) = 0;
     virtual void SetAttentionPoint(tjs_int left, tjs_int top,
-                                   const struct tTVPFont *font) = 0;
+                                   const struct tTVPFont *font,
+                                   iTJSDispatch2 *attention_owner) = 0;
     virtual void ZoomRectangle(tjs_int &left, tjs_int &top, tjs_int &right,
                                tjs_int &bottom) = 0;
     virtual void BringToFront() = 0;
@@ -436,7 +439,7 @@ public:
     // TODO
     void SetMouseCursor(tjs_int handle) {}
     void SetHintText(iTJSDispatch2 *sender, const ttstr &text) {}
-    void DisableAttentionPoint() {}
+    virtual void DisableAttentionPoint() {}
     static void GetVideoOffset(tjs_int &ofsx, tjs_int &ofsy) {
         ofsx = 0;
         ofsy = 0;

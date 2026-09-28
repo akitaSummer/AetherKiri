@@ -7,6 +7,8 @@ typedef krkr::PixelFormat CCPixelFormat;
 #include "tvpgl.h"
 #include <assert.h>
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include "ThreadIntf.h"
 #include "argb.h"
 extern "C" {
@@ -24,7 +26,7 @@ extern "C" {
 #include "Platform.h"
 #include "ConfigManager/IndividualConfigManager.h"
 
-// Inline XXH32 implementation to avoid symbol conflicts with ANGLE's
+// Inline XXH32 implementation to avoid symbol conflicts with graphics backends'
 // built-in xxhash. Only XXH32() is used in this file.
 namespace {
 static inline uint32_t XXH32_round(uint32_t acc, uint32_t input) {
@@ -346,7 +348,9 @@ void iTVPTexture2D::RecycleProcess() {
         delete tex;
     }
     _toDeleteTextures.clear();
+#if defined(KRKR_ENABLE_GPU_BRIDGE)
     glFlush();
+#endif
 }
 static tTVPAtExit TVPReleaseTexture2D(TVP_ATEXIT_PRI_RELEASE + 500,
                                       iTVPTexture2D::RecycleProcess);
@@ -397,6 +401,8 @@ public:
         return 0;
     }
     const void *GetScanLineForRead(tjs_uint l) override {
+        if(l >= static_cast<tjs_uint>(Height) || !BmpData)
+            return nullptr;
         return BmpData + Pitch * l;
     }
     tjs_int GetPitch() const override { return Pitch; }
@@ -497,7 +503,11 @@ public:
     }
 
     const void *GetScanLineForRead(tjs_uint l) override {
+        if(l >= static_cast<tjs_uint>(Height))
+            return nullptr;
         GetPixelData();
+        if(!BmpData)
+            return nullptr;
         return BmpData + l * Pitch;
     }
 
@@ -585,6 +595,11 @@ public:
     }
 
     const void *GetScanLineForRead(tjs_uint l) override {
+        if(l >= static_cast<tjs_uint>(Height) || _scanline.empty())
+            return nullptr;
+        const tjs_uint index = l / 2;
+        if(index >= _scanline.size())
+            return nullptr;
         return _scanline[l / 2];
     }
 
@@ -697,8 +712,8 @@ public:
         if(n >= CompressedBlock.size())
             n = CompressedBlock.size() - 1;
         Block &blk = CompressedBlock[n];
-        n = LZ4_decompress_fast(blk.Data, (char *)buf, blk.Height * Pitch);
-        assert(n == blk.Length);
+        n = LZ4_decompress_safe(blk.Data, (char *)buf, blk.Length, blk.Height * Pitch);
+        assert(n == (size_t)(blk.Height * Pitch));
         return blk.Height;
     }
 
@@ -822,8 +837,8 @@ public:
         tjs_uint clrBlkSize = blkSize / 4;
         tjs_uint8 *tranbuf =
             (tjs_uint8 *)TVPAllocBitmapBits(blkSize, w, BlockSize);
-        n = LZ4_decompress_fast(blk.Data, (char *)tranbuf, blkSize);
-        assert(n == blk.Length);
+        n = LZ4_decompress_safe(blk.Data, (char *)tranbuf, blk.Length, blkSize);
+        assert(n == blkSize);
         tjs_uint8 *current = buf, *prevline = buf, *outbufp[4];
         outbufp[2] = tranbuf;
         outbufp[1] = outbufp[2] + clrBlkSize;
@@ -1220,7 +1235,9 @@ public:
         tjs_int h = rect.bottom - rect.top;
         tjs_int w = rect.right - rect.left;
 
-        tjs_int taskNum = GetAdaptiveThreadNum(w * h, THREAD_FACTOR);
+        tjs_int taskNum = THREAD_FACTOR == 52
+            ? 1
+            : GetAdaptiveThreadNum(w * h, THREAD_FACTOR);
         TVPExecThreadTask(taskNum, [=](int i) {
             tjs_int y0, y1;
             y0 = h * i / taskNum;
@@ -1310,7 +1327,9 @@ public:
         tjs_int h = rect.bottom - rect.top;
         tjs_int w = rect.right - rect.left;
 
-        tjs_int taskNum = GetAdaptiveThreadNum(w * h, THREAD_FACTOR);
+        tjs_int taskNum = THREAD_FACTOR == 52
+            ? 1
+            : GetAdaptiveThreadNum(w * h, THREAD_FACTOR);
         TVPExecThreadTask(taskNum, [&](int i) {
             tjs_int y0, y1;
             y0 = h * i / taskNum;
@@ -1532,21 +1551,29 @@ public:
     void PartialCopy(iTVPTexture2D *dst, tjs_int dx, tjs_int dy,
                      iTVPTexture2D *src, tjs_int sx, tjs_int sy, tjs_int w,
                      tjs_int h, bool backwardCopy) {
-        // 32bpp
-        w *= sizeof(tjs_uint32);
+        assert(dst->GetFormat() == src->GetFormat());
+        const tjs_int pixelSize =
+            dst->GetFormat() == TVPTextureFormat::Gray
+            ? sizeof(tjs_uint8)
+            : sizeof(tjs_uint32);
+        const tjs_int byteWidth = w * pixelSize;
         if(backwardCopy) {
             for(tjs_int y = h - 1; y >= 0; --y) {
-                memmove(((tjs_uint32 *)dst->GetScanLineForWrite(dy + y)) + dx,
-                        ((const tjs_uint32 *)src->GetScanLineForRead(sy + y)) +
-                            sx,
-                        w);
+                memmove(
+                    static_cast<tjs_uint8 *>(
+                        dst->GetScanLineForWrite(dy + y)) + dx * pixelSize,
+                    static_cast<const tjs_uint8 *>(
+                        src->GetScanLineForRead(sy + y)) + sx * pixelSize,
+                    byteWidth);
             }
         } else {
             for(tjs_int y = 0; y < h; ++y) {
-                memmove(((tjs_uint32 *)dst->GetScanLineForWrite(dy + y)) + dx,
-                        ((const tjs_uint32 *)src->GetScanLineForRead(sy + y)) +
-                            sx,
-                        w);
+                memmove(
+                    static_cast<tjs_uint8 *>(
+                        dst->GetScanLineForWrite(dy + y)) + dx * pixelSize,
+                    static_cast<const tjs_uint8 *>(
+                        src->GetScanLineForRead(sy + y)) + sx * pixelSize,
+                    byteWidth);
             }
         }
         // 		tjs_int spitch = p->spitch, dpitch = p->dpitch;
@@ -1598,6 +1625,51 @@ public:
 
         tjs_int sx = rcsrc.left, dx = rctar.left, sy = rcsrc.top,
                 dy = rctar.top;
+        if(!_tar || !_src || w <= 0 || h <= 0) return;
+
+        const tjs_int dst_w = static_cast<tjs_int>(_tar->GetWidth());
+        const tjs_int dst_h = static_cast<tjs_int>(_tar->GetHeight());
+        const tjs_int src_w = static_cast<tjs_int>(_src->GetWidth());
+        const tjs_int src_h = static_cast<tjs_int>(_src->GetHeight());
+
+        if(dx < 0) {
+            sx -= dx;
+            w += dx;
+            dx = 0;
+        }
+        if(dy < 0) {
+            sy -= dy;
+            h += dy;
+            dy = 0;
+        }
+        if(sx < 0) {
+            dx -= sx;
+            w += sx;
+            sx = 0;
+        }
+        if(sy < 0) {
+            dy -= sy;
+            h += sy;
+            sy = 0;
+        }
+        const tjs_int dst_clip_w = dst_w - dx;
+        const tjs_int dst_clip_h = dst_h - dy;
+        const tjs_int src_clip_w = src_w - sx;
+        const tjs_int src_clip_h = src_h - sy;
+        if(w > dst_clip_w) w = dst_clip_w;
+        if(h > dst_clip_h) h = dst_clip_h;
+        if(w > src_clip_w) w = src_clip_w;
+        if(h > src_clip_h) h = src_clip_h;
+        if(w <= 0 || h <= 0) return;
+
+        // Alpha-on-alpha composition touches the shared texture row accessors
+        // (which may perform a GPU readback/dirty transition).  Keep this
+        // family serialized; splitting it into OpenMP tasks adds scheduling
+        // overhead and does not reduce the measured long-tail frame time.
+        if(THREAD_FACTOR == 52) {
+            this->PartialFill(_tar, _src, sx, sy, dx, dy, w, h);
+            return;
+        }
 
         tjs_int taskNum = GetAdaptiveThreadNum(w * h, THREAD_FACTOR);
         TVPExecThreadTask(
@@ -1624,8 +1696,15 @@ class tTVPRenderMethod_Blt
                      tjs_int sy, tjs_int dx, tjs_int dy, tjs_int w,
                      tjs_int h) override {
         for(tjs_int y = 0; y < h; ++y) {
-            Func(((tjs_uint32 *)dst->GetScanLineForWrite(dy + y)) + dx,
-                 ((const tjs_uint32 *)src->GetScanLineForRead(sy + y)) + sx, w);
+            auto *dst_line = static_cast<tjs_uint32 *>(dst->GetScanLineForWrite(dy + y));
+            const auto *src_line =
+                static_cast<const tjs_uint32 *>(src->GetScanLineForRead(sy + y));
+            if(!dst_line || !src_line) continue;
+
+            tjs_int row_w = w;
+            if(row_w <= 0) continue;
+
+            Func(dst_line + dx, src_line + sx, row_w);
         }
         // 		tjs_uint8 *dst = p->dest, *src = p->src;
         // 		tjs_int width = p->w;
@@ -1847,20 +1926,42 @@ public:
                      tjs_int h) override {
         if(opa == 255) {
             for(tjs_int y = 0; y < h; ++y) {
-                tjs_uint32 *dst =
-                    ((tjs_uint32 *)_dst->GetScanLineForWrite(dy + y)) + dx;
-                Func(dst,
-                     ((const tjs_uint32 *)src->GetScanLineForRead(sy + y)) + sx,
-                     w);
+                auto *dst_line = static_cast<tjs_uint32 *>(_dst->GetScanLineForWrite(dy + y));
+                const auto *src_line =
+                    static_cast<const tjs_uint32 *>(src->GetScanLineForRead(sy + y));
+                if(!dst_line || !src_line) continue;
+
+                tjs_int row_w = w;
+                if(row_w <= 0) continue;
+
+                tjs_uint32 *dst = dst_line + dx;
+                const tjs_uint32 *src_pixels_ptr = src_line + sx;
+                if(Func == TVPAlphaBlend_a) {
+                    for(tjs_int x = 0; x < row_w; ++x)
+                        dst[x] = TVPAddAlphaBlend_a_d(dst[x], src_pixels_ptr[x]);
+                } else {
+                    Func(dst, src_pixels_ptr, row_w);
+                }
             }
         } else {
             for(tjs_int y = 0; y < h; ++y) {
-                tjs_uint32 *dst =
-                    ((tjs_uint32 *)_dst->GetScanLineForWrite(dy + y)) + dx;
-                FuncWithOpa(
-                    dst,
-                    ((const tjs_uint32 *)src->GetScanLineForRead(sy + y)) + sx,
-                    w, opa);
+                auto *dst_line = static_cast<tjs_uint32 *>(_dst->GetScanLineForWrite(dy + y));
+                const auto *src_line =
+                    static_cast<const tjs_uint32 *>(src->GetScanLineForRead(sy + y));
+                if(!dst_line || !src_line) continue;
+
+                tjs_int row_w = w;
+                if(row_w <= 0) continue;
+
+                tjs_uint32 *dst = dst_line + dx;
+                const tjs_uint32 *src_pixels_ptr = src_line + sx;
+                if(FuncWithOpa == TVPAlphaBlend_ao) {
+                    for(tjs_int x = 0; x < row_w; ++x)
+                        dst[x] =
+                            TVPAddAlphaBlend_a_d_o(dst[x], src_pixels_ptr[x], opa);
+                } else {
+                    FuncWithOpa(dst, src_pixels_ptr, row_w, opa);
+                }
             }
         }
     }
@@ -2366,8 +2467,14 @@ public:
         int spitch = src->GetPitch();
         const uint8_t *sdata = (const uint8_t *)src->GetPixelData() +
             (rcsrc.top * spitch + rcsrc.left * 4);
-        uint8_t *ddata =
-            (uint8_t *)tar->GetScanLineForWrite(rcdst.top) + rcdst.left * 4;
+        const bool overwrites_full_destination =
+            rcdst.left <= 0 && rcdst.top <= 0 &&
+            rcdst.right >= static_cast<tjs_int>(tar->GetWidth()) &&
+            rcdst.bottom >= static_cast<tjs_int>(tar->GetHeight());
+        uint8_t *ddata = static_cast<uint8_t *>(
+            (overwrites_full_destination
+                 ? tar->GetScanLineForWriteUninitialized(rcdst.top)
+                 : tar->GetScanLineForWrite(rcdst.top))) + rcdst.left * 4;
         int dpitch = tar->GetPitch();
 
         cv::Mat src_img(sh, sw, CV_8UC4, (void *)sdata, spitch);
@@ -2661,9 +2768,125 @@ static int cvFlags[4] = {
     cv::INTER_CUBIC, // stCubic
 };
 
-static double tTVPPointD_distQ(const tTVPPointD &p0, const tTVPPointD &p1) {
-    double dx = p0.x - p1.x, dy = p0.y - p1.y;
-    return dx * dx + dy * dy;
+static tTVPBBStretchType TVPNormalizeStretchTypeForSampling(
+    tTVPBBStretchType type) {
+    if (type == stNearest) {
+        const char *value = std::getenv("AETHERKIRI_FORCE_NEAREST_STRETCH");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+            return stLinear;
+        }
+    }
+    if (type == stFastLinear || type == stSemiFastLinear) {
+        return stLinear;
+    }
+    if (type < stNearest) {
+        return stLinear;
+    }
+    if (type > stCubic) {
+        return stCubic;
+    }
+    return type;
+}
+
+static int TVPCvResizeInterpolation(tTVPBBStretchType type, int sw, int sh,
+                                    int dw, int dh) {
+    if (type == stNearest) {
+        return cv::INTER_NEAREST;
+    }
+    if (dw < sw || dh < sh) {
+        return cv::INTER_AREA;
+    }
+    if (type == stCubic) {
+        return cv::INTER_CUBIC;
+    }
+    return cv::INTER_LINEAR;
+}
+
+static const std::array<uint8_t, 256 * 256> &TVPUnpremultiplyTable() {
+    static const auto table = [] {
+        std::array<uint8_t, 256 * 256> values{};
+        for(unsigned int a = 1; a < 256; ++a) {
+            for(unsigned int color = 0; color < 256; ++color) {
+                values[(a << 8) | color] = static_cast<uint8_t>(std::min(
+                    255u, (color * 255u + a / 2u) / a));
+            }
+        }
+        return values;
+    }();
+    return table;
+}
+
+static const std::array<uint8_t, 256 * 256> &TVPPremultiplyTable() {
+    static const auto table = [] {
+        std::array<uint8_t, 256 * 256> values{};
+        for(unsigned int a = 0; a < 256; ++a) {
+            for(unsigned int color = 0; color < 256; ++color) {
+                values[(a << 8) | color] = static_cast<uint8_t>(
+                    (color * a + 127u) / 255u);
+            }
+        }
+        return values;
+    }();
+    return table;
+}
+
+static void TVPResizeRgbaForLayerSampling(const cv::Mat &src_img,
+                                          cv::Mat &dst_img,
+                                          const cv::Size &dsize,
+                                          int interpolation) {
+    if (interpolation != cv::INTER_AREA || src_img.type() != CV_8UC4) {
+        cv::resize(src_img, dst_img, dsize, 0, 0, interpolation);
+        return;
+    }
+
+    // Keep the premultiplied working image in 8-bit RGBA.  The previous
+    // float32 staging image used ~16 bytes/pixel and paid three float
+    // multiplies for every source texel before OpenCV could resize it.  The
+    // source and destination are both 8-bit RGBA, so integer premultiplication
+    // preserves the same alpha-edge semantics while allowing OpenCV's fast
+    // 8-bit INTER_AREA path to do the reduction.
+    // Resize is invoked synchronously by the software compositor.  Reuse the
+    // two large staging buffers on the calling thread so a sequence of motion
+    // frames does not repeatedly allocate/free multi-megapixel Mats.  TLS
+    // keeps this safe if a platform drives more than one render thread.
+    static thread_local cv::Mat premul;
+    static thread_local cv::Mat resized;
+    const auto &premultiply = TVPPremultiplyTable();
+    premul.create(src_img.rows, src_img.cols, CV_8UC4);
+    for (int y = 0; y < src_img.rows; ++y) {
+        const uint8_t *src = src_img.ptr<uint8_t>(y);
+        uint8_t *dst = premul.ptr<uint8_t>(y);
+        for (int x = 0; x < src_img.cols; ++x) {
+            const unsigned int a = src[x * 4 + 3];
+            const size_t base = static_cast<size_t>(a) << 8;
+            dst[x * 4 + 0] = premultiply[base | src[x * 4 + 0]];
+            dst[x * 4 + 1] = premultiply[base | src[x * 4 + 1]];
+            dst[x * 4 + 2] = premultiply[base | src[x * 4 + 2]];
+            dst[x * 4 + 3] = static_cast<uint8_t>(a);
+        }
+    }
+
+    resized.create(dsize.height, dsize.width, CV_8UC4);
+    cv::resize(premul, resized, dsize, 0, 0, interpolation);
+    const auto &unpremultiply = TVPUnpremultiplyTable();
+    for (int y = 0; y < resized.rows; ++y) {
+        const uint8_t *src = resized.ptr<uint8_t>(y);
+        uint8_t *dst = dst_img.ptr<uint8_t>(y);
+        for (int x = 0; x < resized.cols; ++x) {
+            const unsigned int a = src[x * 4 + 3];
+            if(a == 0) {
+                dst[x * 4 + 0] = 0;
+                dst[x * 4 + 1] = 0;
+                dst[x * 4 + 2] = 0;
+            } else {
+                const size_t base = static_cast<size_t>(a) << 8;
+                dst[x * 4 + 0] = unpremultiply[base | src[x * 4 + 0]];
+                dst[x * 4 + 1] = unpremultiply[base | src[x * 4 + 1]];
+                dst[x * 4 + 2] = unpremultiply[base | src[x * 4 + 2]];
+            }
+            dst[x * 4 + 3] = static_cast<uint8_t>(a);
+        }
+    }
 }
 
 static bool isDoubleEqual(double a, double b) {
@@ -2674,11 +2897,14 @@ static bool isDoubleEqual(double a, double b) {
 }
 
 static bool checkQuadSquared(const tTVPPointD *p) {
-    double d01 = tTVPPointD_distQ(p[0], p[1]);
-    double d23 = tTVPPointD_distQ(p[2], p[3]);
-    double d12 = tTVPPointD_distQ(p[1], p[2]);
-    double d03 = tTVPPointD_distQ(p[0], p[3]);
-    return isDoubleEqual(d01, d23) && isDoubleEqual(d12, d03);
+    // OperateTriangles receives two triangles laid out as
+    //   LT, RT, LB, RT, LB, RB.
+    // p[3] is therefore a duplicate of p[1], not the fourth corner.  The old
+    // distance test used p[3] and misclassified ordinary affine copies as
+    // perspective quads.  Test the actual RB point and the parallelogram
+    // relation directly so affineCopy can use warpAffine.
+    return isDoubleEqual(p[5].x, p[1].x - p[0].x + p[2].x) &&
+        isDoubleEqual(p[5].y, p[1].y - p[0].y + p[2].y);
 }
 
 static iTVPTexture2D *(*_createStaticTexture2D)(tTVPBitmap *bmp,
@@ -3066,12 +3292,8 @@ public:
     void SetParameterInt(int id, int Value) override {
         switch(id) {
             case eParameters::StretchType:
-                StretchType = (tTVPBBStretchType)Value;
-                if(StretchType > sizeof(cvFlags) / sizeof(cvFlags[0])) {
-                    StretchType = (tTVPBBStretchType)(sizeof(cvFlags) /
-                                                          sizeof(cvFlags[0]) -
-                                                      1);
-                }
+                StretchType = TVPNormalizeStretchTypeForSampling(
+                    (tTVPBBStretchType)Value);
                 break;
             default:
                 break;
@@ -3112,6 +3334,105 @@ public:
                 return;
             }
 
+            // AffineSourceBMPBase uses a tiny opaque neutral-color bitmap as
+            // a mask for some environment transitions.  Scaling that bitmap
+            // to the full 2560x1440 surface used to allocate a temporary
+            // image and then walk every destination pixel through
+            // AlphaBlend_d, even though the result is simply a solid copy.
+            // Restrict this shortcut to the actual AlphaBlend_d method with
+            // opacity 255; other blend modes and opacity values retain the
+            // exact legacy path.
+            bool canFillUniformOpaque =
+                method != nullptr && method->GetName() == "AlphaBlend_d" &&
+                static_cast<tTVPRenderMethod_BltAndOpa<
+                    52, TVPAlphaBlend_d, TVPAlphaBlend_do> *>(method)->opa ==
+                    255;
+            if(canFillUniformOpaque) {
+                const int sourceLeft = std::max(0, rcsrc.left);
+                const int sourceTop = std::max(0, rcsrc.top);
+                const int sourceRight =
+                    std::min<int>(src->GetWidth(), rcsrc.right);
+                const int sourceBottom =
+                    std::min<int>(src->GetHeight(), rcsrc.bottom);
+                const int sourceWidth = sourceRight - sourceLeft;
+                const int sourceHeight = sourceBottom - sourceTop;
+                const auto *sourcePixels = static_cast<const tjs_uint8 *>(
+                    src->GetPixelData());
+                const int sourcePitch = src->GetPitch();
+                if(sourcePixels != nullptr && sourcePitch > 0 &&
+                   sourceWidth > 0 && sourceHeight > 0) {
+                    tjs_uint32 uniformPixel = 0;
+                    bool uniform = true;
+                    bool first = true;
+                    for(int y = sourceTop; y < sourceBottom && uniform; ++y) {
+                        const auto *row = sourcePixels + y * sourcePitch;
+                        for(int x = sourceLeft; x < sourceRight; ++x) {
+                            tjs_uint32 pixel = 0;
+                            std::memcpy(&pixel, row + x * 4, sizeof(pixel));
+                            if(first) {
+                                uniformPixel = pixel;
+                                first = false;
+                            } else if(pixel != uniformPixel) {
+                                uniform = false;
+                                break;
+                            }
+                        }
+                    }
+                    if(uniform && !first) {
+                        if((uniformPixel >> 24) == 0) {
+                            return;
+                        }
+                        if((uniformPixel >> 24) == 255) {
+                            const int targetWidth = rctar.get_width();
+                            for(int y = rctar.top; y < rctar.bottom; ++y) {
+                                auto *row = static_cast<tjs_uint32 *>(
+                                    tar->GetScanLineForWrite(y));
+                                if(row != nullptr) {
+                                    TVPFillARGB(row + rctar.left, targetWidth,
+                                                uniformPixel);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // A plain Copy stretch does not need an intermediate OpenCV
+            // image.  Feed the axis-aligned rectangle directly to the same
+            // fixed-point sampler used by the affine renderer.  This avoids
+            // a multi-megapixel resize allocation plus a second full-frame
+            // copy during the frequent environment-layer updates.
+            if(method != nullptr && method->GetName() == "Copy") {
+                TAffuncFunc affineloop = GetStretchFunction(
+                    static_cast<tTVPRenderMethod_Software *>(method));
+                const tTVPPointD firstTriangle[3] = {
+                    {static_cast<double>(rctar.left),
+                     static_cast<double>(rctar.top)},
+                    {static_cast<double>(rctar.right),
+                     static_cast<double>(rctar.top)},
+                    {static_cast<double>(rctar.left),
+                     static_cast<double>(rctar.bottom)},
+                };
+                const tTVPPointD secondTriangle[3] = {
+                    {static_cast<double>(rctar.right),
+                     static_cast<double>(rctar.top)},
+                    {static_cast<double>(rctar.left),
+                     static_cast<double>(rctar.bottom)},
+                    {static_cast<double>(rctar.right),
+                     static_cast<double>(rctar.bottom)},
+                };
+                // InternalAffineBlt rasterizes one triangle at a time.  A
+                // rectangle therefore needs both its LT/RT/LB and
+                // RT/LB/RB halves; drawing only one leaves a diagonal
+                // untouched wedge in scaled backgrounds and SD CGs.
+                InternalAffineBlt(rctar, rcsrc, rcsrc, src, tar,
+                                  firstTriangle, true, affineloop);
+                InternalAffineBlt(rctar, rcsrc, rcsrc, src, tar,
+                                  secondTriangle, false, affineloop);
+                return;
+            }
+
             const uint8_t *sdata;
             int spitch = src->GetPitch();
             sdata = (const uint8_t *)src->GetPixelData() +
@@ -3143,7 +3464,9 @@ public:
             cv::Size dsize(dw, dh);
             cv::Mat src_img(sh, sw, CV_8UC4, (void *)sdata, spitch);
             cv::Mat dst_img(dh, dw, CV_8UC4, (void *)ddata, dpitch);
-            cv::resize(src_img, dst_img, dsize, 0, 0, cvFlags[StretchType]);
+            TVPResizeRgbaForLayerSampling(
+                src_img, dst_img, dsize,
+                TVPCvResizeInterpolation(StretchType, sw, sh, dw, dh));
 #endif
             tTVPRect rc(0, 0, dw, dh);
             ((tTVPRenderMethod_Software *)method)
@@ -3644,6 +3967,45 @@ public:
                 OperateRect(method, target, rcdest, src, refrect);
                 return;
             }
+
+            // Native Artemis submits ordinary translated/rotated E-mote
+            // parts as two affine triangles to the GPU. Sending every such
+            // quad through OpenCV allocates a temporary image and runs a full
+            // remap kernel; a character made of a hundred small parts then
+            // spends most of the frame in remap scheduling. The software
+            // renderer already has the equivalent clipped triangle scanner.
+            // Use it for genuine affine parallelograms and keep OpenCV only
+            // for perspective quads that cannot be represented by one affine
+            // transform.
+            if(isSrcRect && checkQuadSquared(dstpt)) {
+                TAffuncFunc affineloop = GetStretchFunction(
+                    static_cast<tTVPRenderMethod_Software *>(method));
+                tjs_int taskNum = std::min<tjs_int>(TVPGetThreadNum(), 2);
+                TVPExecThreadTask(taskNum, [&](int n) {
+                    const int begin = 2 * n / taskNum;
+                    const int end = 2 * (n + 1) / taskNum;
+                    for(int i = begin; i < end; ++i) {
+                        const bool nrot = i & 1;
+                        const tTVPPointD *pt = srcpt + 3 * i;
+                        tTVPRect rc;
+                        if(nrot) { // rt, lb, rb
+                            rc.top = pt[0].y;
+                            rc.right = pt[0].x;
+                            rc.left = pt[1].x;
+                            rc.bottom = pt[1].y;
+                        } else { // lt, rt, lb
+                            rc.top = pt[1].y;
+                            rc.right = pt[1].x;
+                            rc.left = pt[2].x;
+                            rc.bottom = pt[2].y;
+                        }
+                        InternalAffineBlt(rcclip, rc, rc, src, dst,
+                                          dstpt + 3 * i, !nrot, affineloop);
+                    }
+                });
+                return;
+            }
+
             const uint8_t *sdata;
             int spitch = src->GetPitch();
             sdata = (const uint8_t *)src->GetPixelData();
@@ -3662,39 +4024,16 @@ public:
                 cv::Point2f(dstpt[2].x - rcclip.left, dstpt[2].y - rcclip.top),
             };
 
-            cv::Mat src_img;
-            if(isSrcRect) {
-                tTVPRect rcsrc(0x7FFFFFFF, 0x7FFFFFFF, -1, -1);
-                for(int i = 0; i < 4; ++i) {
-                    const cv::Point2f &pt = pts_src[i];
-                    tjs_int x = pt.x;
-                    if(x < rcsrc.left)
-                        rcsrc.left = x;
-                    if(++x > rcsrc.right)
-                        rcsrc.right = x;
-                    tjs_int y = pt.y;
-                    if(y < rcsrc.top)
-                        rcsrc.top = y;
-                    if(++y > rcsrc.bottom)
-                        rcsrc.bottom = y;
-                }
-                sdata += rcsrc.top * spitch + rcsrc.left * 4;
-                for(int i = 0; i < 4; ++i) {
-                    cv::Point2f &pt = pts_src[i];
-                    pt.x -= rcsrc.left;
-                    pt.y -= rcsrc.top;
-                }
-                tjs_int sw = src->GetWidth(), sh = src->GetHeight();
-                if(rcsrc.get_width() > sw)
-                    rcsrc.set_width(sw);
-                if(rcsrc.get_height() > sh)
-                    rcsrc.set_height(sh);
-                src_img = cv::Mat(rcsrc.get_height(), rcsrc.get_width(),
-                                  CV_8UC4, (void *)sdata, spitch);
-            } else {
-                src_img = cv::Mat(src->GetHeight(), src->GetWidth(), CV_8UC4,
-                                  (void *)sdata, spitch);
-            }
+            // Keep the Mat backed by the complete texture.  The previous ROI
+            // optimization enlarged right/bottom by two pixels but clamped
+            // only its width/height, without accounting for a non-zero
+            // left/top.  A cropped source touching the texture edge could
+            // consequently expose rows past the allocation to OpenCV's NEON
+            // remap kernel and crash during an interrupted title animation.
+            // A full-image Mat is only a header here; it does not copy pixels
+            // or make warpAffine/warpPerspective process additional output.
+            cv::Mat src_img(src->GetHeight(), src->GetWidth(), CV_8UC4,
+                            (void *)sdata, spitch);
 
             cv::Mat dst_img;
             cv::Size dst_size(rcclip.get_width(), rcclip.get_height());
@@ -4406,7 +4745,7 @@ public:
             if(dv01y == 0.0) {
                 sxstep = (tjs_int)((refrect.right - refrect.left) / dv01x);
                 systep = 0;
-            } else if(dv01y == 0.0) {
+            } else if(dv02y == 0.0) {
                 sxstep = 0;
                 systep = (tjs_int)((refrect.bottom - refrect.top) / dv02x);
             } else {
@@ -4936,12 +5275,16 @@ iTVPRenderManager *TVPGetRenderManager() {
         // Prefer command-line option set via engine_set_option
         tTJSVariant val;
         ttstr str;
-        if(TVPGetCommandLine(TJS_W("renderer"), &val)) {
+        // The renderer can be selected through an early engine_set_option.
+        // Do not initialize the legacy application/data path merely to choose
+        // an off-screen renderer for an externally hosted runtime such as
+        // Artemis.
+        if(TVPGetCommandLineNoInit(TJS_W("renderer"), &val)) {
             str = val;
         }
         if(str.IsEmpty()) {
             str = IndividualConfigManager::GetInstance()
-                      ->GetValue<std::string>("renderer", "opengl");
+                      ->GetValue<std::string>("renderer", "godot_native");
         }
         _RenderManager = TVPGetRenderManager(str);
         _RenderManagerInitialized = true;
@@ -4951,8 +5294,7 @@ iTVPRenderManager *TVPGetRenderManager() {
 
 bool TVPIsSoftwareRenderManager() {
     if(!_RenderManagerInitialized) return true; // assume software if not yet initialized
-    static bool ret = TVPGetRenderManager()->IsSoftware();
-    return ret;
+    return TVPGetRenderManager()->IsSoftware();
 }
 
 iTVPRenderManager *TVPGetSoftwareRenderManager() { // for province image process

@@ -4,32 +4,141 @@ extern "C" {
 #include "libswscale/swscale.h"
 }
 
-#include <spdlog/spdlog.h>
 #include "KRMoviePlayer.h"
 #include "VideoCodec.h"
 #include "CodecUtils.h"
 #include "AudioDevice.h"
 #include "WaveMixer.h"
+#include "Application.h"
 #include "WindowImpl.h"
 #include "VideoOvlImpl.h"
+#include "LayerIntf.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
 
 extern std::thread::id TVPMainThreadID;
 
+#if defined(__GNUC__)
+extern "C" bool TVPHostSubmitVideoOverlayFrame(
+    const void *rgba, uint32_t width, uint32_t height, uint32_t stride_bytes,
+    int32_t left, int32_t top, int32_t right,
+    int32_t bottom) __attribute__((weak));
+extern "C" void TVPHostClearVideoOverlayFrame() __attribute__((weak));
+#else
+extern "C" bool TVPHostSubmitVideoOverlayFrame(
+    const void *rgba, uint32_t width, uint32_t height, uint32_t stride_bytes,
+    int32_t left, int32_t top, int32_t right, int32_t bottom);
+extern "C" void TVPHostClearVideoOverlayFrame();
+#endif
+
 NS_KRMOVIE_BEGIN
 
-TVPMoviePlayer::TVPMoviePlayer() { m_pPlayer = new BasePlayer(this); }
+static inline uint8_t ClampByte(int value) {
+    if(value < 0)
+        return 0;
+    if(value > 255)
+        return 255;
+    return static_cast<uint8_t>(value);
+}
+
+static void ConvertYuv420ToRgba(const DVDVideoPicture &pic, uint8_t *dst,
+                                int dstWidth, int dstHeight,
+                                int dstStride) {
+    const int copyWidth = std::min<int>(dstWidth, pic.iWidth);
+    const int copyHeight = std::min<int>(dstHeight, pic.iHeight);
+    for(int y = 0; y < copyHeight; ++y) {
+        const uint8_t *yRow = pic.data[0] + y * pic.iLineSize[0];
+        const uint8_t *uRow = pic.data[1] + (y / 2) * pic.iLineSize[1];
+        const uint8_t *vRow = pic.data[2] + (y / 2) * pic.iLineSize[2];
+        uint8_t *out = dst + static_cast<size_t>(y) * dstStride;
+        for(int x = 0; x < copyWidth; ++x) {
+            int c = static_cast<int>(yRow[x]) - 16;
+            int d = static_cast<int>(uRow[x / 2]) - 128;
+            int e = static_cast<int>(vRow[x / 2]) - 128;
+            if(c < 0)
+                c = 0;
+            out[x * 4 + 0] = ClampByte((298 * c + 409 * e + 128) >> 8);
+            out[x * 4 + 1] =
+                ClampByte((298 * c - 100 * d - 208 * e + 128) >> 8);
+            out[x * 4 + 2] = ClampByte((298 * c + 516 * d + 128) >> 8);
+            out[x * 4 + 3] = 0xff;
+        }
+    }
+}
+
+static double VideoSubmitMaxFps() {
+    const char *value = std::getenv("AETHERKIRI_GODOT_VIDEO_SUBMIT_FPS");
+    if(value == nullptr || value[0] == '\0')
+        return 45.0;
+    char *end = nullptr;
+    double parsed = std::strtod(value, &end);
+    if(end == value)
+        return 45.0;
+    return parsed;
+}
+
+static bool VideoTraceEnabled() {
+    const char *value = std::getenv("AETHERKIRI_VIDEO_TRACE");
+    return value != nullptr && value[0] != '\0';
+}
+
+static bool SubmitHostVideoOverlayFrame(const void *rgba, uint32_t width,
+                                        uint32_t height,
+                                        uint32_t stride_bytes,
+                                        const tTVPRect &dest) {
+#if defined(__GNUC__)
+    if(!TVPHostSubmitVideoOverlayFrame)
+        return false;
+#endif
+    return TVPHostSubmitVideoOverlayFrame(
+        rgba, width, height, stride_bytes, dest.left, dest.top, dest.right,
+        dest.bottom);
+}
+
+static void ClearHostVideoOverlayFrame() {
+#if defined(__GNUC__)
+    if(!TVPHostClearVideoOverlayFrame)
+        return;
+#endif
+    TVPHostClearVideoOverlayFrame();
+}
+
+TVPMoviePlayer::TVPMoviePlayer() {
+    m_pPlayer = new BasePlayer(this);
+}
 
 TVPMoviePlayer::~TVPMoviePlayer() {
-    delete m_pPlayer;
+    ShutdownPlayer();
     if(img_convert_ctx)
         sws_freeContext(img_convert_ctx), img_convert_ctx = nullptr;
 }
 
+void TVPMoviePlayer::ShutdownPlayer() {
+    if(m_pPlayer) {
+        m_pPlayer->SetCallback({});
+        delete m_pPlayer;
+        m_pPlayer = nullptr;
+    }
+}
+
 void TVPMoviePlayer::Release() {
-    if(RefCount == 1)
-        delete this;
-    else
+    if(RefCount == 0)
+        return;
+    if(RefCount > 1) {
         RefCount--;
+        return;
+    }
+
+    RefCount = 0;
+    if(std::this_thread::get_id() == TVPMainThreadID || !Application) {
+        delete this;
+        return;
+    }
+
+    Application->PostUserMessage([this]() { delete this; }, this);
 }
 
 void TVPMoviePlayer::SetPosition(uint64_t tick) { m_pPlayer->SeekTime(tick); }
@@ -164,6 +273,7 @@ void TVPMoviePlayer::Flush() {
     }
     m_curpts = 0.0;
     m_usedPicture = 0;
+    m_lastQueuedPicturePts = -1.0;
 }
 
 void TVPMoviePlayer::FrameMove() { m_pPlayer->FrameMove(); }
@@ -174,36 +284,64 @@ void TVPMoviePlayer::SetLoopSegement(int beginFrame, int endFrame) {
 
 int TVPMoviePlayer::AddVideoPicture(DVDVideoPicture &pic, int index) {
     // from other thread
-    if(pic.format != RENDER_FMT_YUV420P)
+    if(pic.format != RENDER_FMT_YUV420P) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer AddVideoPicture skip format={} pts={}",
+                         (int)pic.format, pic.pts);
         return -2;
-    if(pic.pts == DVD_NOPTS_VALUE)
+    }
+    if(pic.pts == DVD_NOPTS_VALUE) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer AddVideoPicture skip no_pts size={}x{}",
+                         pic.iWidth, pic.iHeight);
         return 0;
+    }
+
+    const double pts = pic.pts / DVD_TIME_BASE;
+    const double maxSubmitFps = VideoSubmitMaxFps();
+    if(maxSubmitFps > 0.0 && m_lastQueuedPicturePts >= 0.0 &&
+       pts - m_lastQueuedPicturePts < (1.0 / maxSubmitFps)) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer AddVideoPicture throttle pts={} last={} used={}",
+                         pts, m_lastQueuedPicturePts, m_usedPicture);
+        return MAX_BUFFER_COUNT - m_usedPicture;
+    }
 
     if(m_usedPicture >= MAX_BUFFER_COUNT) {
         std::unique_lock<std::mutex> lk(m_mtxPicture);
         m_condPicture.wait(lk);
     }
-    if(m_usedPicture >= MAX_BUFFER_COUNT)
+    if(m_usedPicture >= MAX_BUFFER_COUNT) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer AddVideoPicture full pts={} used={}", pts,
+                         m_usedPicture);
         return -1;
+    }
 
-    int width = pic.iWidth, height = pic.iHeight;
-    // YUV data passthrough
-    int yuvwidth[3] = { width, width / 2, width / 2 };
-    int yuvheight[3] = { height, height / 2, height / 2 };
-    uint8_t *yuvdata[3] = { nullptr };
-    for(int i = 0; i < sizeof(yuvdata) / sizeof(yuvdata[0]); ++i) {
-        int size = yuvwidth[i] * yuvheight[i];
-        yuvdata[i] = (uint8_t *)TJSAlignedAlloc(size, 4);
-        if(yuvwidth[i] == pic.iLineSize[i]) {
-            memcpy(yuvdata[i], pic.data[i], size);
-        } else {
-            uint8_t *d = yuvdata[i], *s = pic.data[i];
-            for(int y = 0; y < yuvheight[i]; ++y) {
-                memcpy(d, s, yuvwidth[i]);
-                d += yuvwidth[i];
-                s += pic.iLineSize[i];
-            }
-        }
+    int srcWidth = pic.iWidth;
+    int srcHeight = pic.iHeight;
+    int width = pic.iDisplayWidth > 0 ? pic.iDisplayWidth : pic.iWidth;
+    int height = pic.iDisplayHeight > 0 ? pic.iDisplayHeight : pic.iHeight;
+    if(srcWidth <= 0 || srcHeight <= 0 || width <= 0 || height <= 0 ||
+       !pic.data[0] || !pic.data[1] || !pic.data[2])
+        return -1;
+    uint8_t *data = (uint8_t *)TJSAlignedAlloc(width * height * 4, 4);
+    if(!data)
+        return -1;
+    uint8_t *dstData[4] = {data, nullptr, nullptr, nullptr};
+    int dstLineSize[4] = {width * 4, 0, 0, 0};
+
+    img_convert_ctx = sws_getCachedContext(
+        img_convert_ctx, srcWidth, srcHeight, AV_PIX_FMT_YUV420P, width, height,
+        AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    int processed = 0;
+    if(img_convert_ctx) {
+        processed = sws_scale(img_convert_ctx, pic.data, pic.iLineSize, 0,
+                              srcHeight, dstData, dstLineSize);
+    }
+    if(processed <= 0) {
+        std::memset(data, 0, static_cast<size_t>(width) * height * 4);
+        ConvertYuv420ToRgba(pic, data, width, height, dstLineSize[0]);
     }
 
     {
@@ -213,11 +351,14 @@ int TVPMoviePlayer::AddVideoPicture(DVDVideoPicture &pic, int index) {
         picbuf.Clear();
         picbuf.width = width;
         picbuf.height = height;
-        for(int i = 0; i < sizeof(yuvdata) / sizeof(yuvdata[0]); ++i) {
-            picbuf.yuv[i] = yuvdata[i];
-        }
-        picbuf.pts = pic.pts / DVD_TIME_BASE;
+        picbuf.rgba = data;
+        picbuf.pts = pts;
         ++m_usedPicture;
+        m_lastQueuedPicturePts = pts;
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer AddVideoPicture queued pts={} size={}x{} used={} visible={}",
+                         pts, width, height, m_usedPicture,
+                         Visible ? "yes" : "no");
         return MAX_BUFFER_COUNT - m_usedPicture;
     }
 
@@ -226,23 +367,36 @@ int TVPMoviePlayer::AddVideoPicture(DVDVideoPicture &pic, int index) {
     // this, std::placeholders::_1), 0, sckey);
 }
 
-VideoPresentOverlay::~VideoPresentOverlay() { ClearNode(); }
+VideoPresentOverlay::~VideoPresentOverlay() {
+    TVPRemoveContinuousEventHook(this);
+    ClearHostVideoOverlayFrame();
+    ClearNode();
+}
 
 void VideoPresentOverlay::ClearNode() {
-    // Overlay lifecycle is managed by Flutter.
+    // Overlay lifecycle is managed by Application host.
     m_pRootNode = nullptr;
     m_pSprite = nullptr;
+    if(m_frameBitmap) {
+        delete m_frameBitmap;
+        m_frameBitmap = nullptr;
+    }
 }
 
 // Replace VideoPresentOverlay::PresentPicture with stub
 void VideoPresentOverlay::PresentPicture(float dt) {
     BitmapPicture pic;
+    m_curpts = m_pPlayer->GetClock() / DVD_TIME_BASE;
     {
         std::unique_lock<std::mutex> lk(m_mtxPicture);
-        if(m_usedPicture <= 0)
+        if(m_usedPicture <= 0) {
+            if(VideoTraceEnabled())
+                spdlog::info("MoviePlayer PresentPicture skip empty visible={}",
+                             Visible ? "yes" : "no");
             return;
+        }
         do {
-            m_picture[m_curPicture].swap(pic);
+            pic.MoveFrom(m_picture[m_curPicture]);
             --m_usedPicture;
             if(++m_curPicture >= MAX_BUFFER_COUNT)
                 m_curPicture = 0;
@@ -252,33 +406,141 @@ void VideoPresentOverlay::PresentPicture(float dt) {
     }
     FrameMove();
     if(!pic.rgba) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer PresentPicture skip no_rgba pts={}",
+                         pic.pts);
         return;
     }
-    // Video frames are decoded but display overlay is not rendered.
-    // This will be re-implemented via Flutter texture sharing.
+    if(!Visible) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer PresentPicture skip invisible pts={} size={}x{}",
+                         pic.pts, pic.width, pic.height);
+        ClearHostVideoOverlayFrame();
+        return;
+    }
+
+    tTVPRect dest = GetBounds();
+    if(dest.get_width() <= 0 || dest.get_height() <= 0) {
+        dest = tTVPRect(0, 0, pic.width, pic.height);
+    }
+    if(SubmitHostVideoOverlayFrame(pic.rgba, static_cast<uint32_t>(pic.width),
+                                   static_cast<uint32_t>(pic.height),
+                                   static_cast<uint32_t>(pic.width * 4),
+                                   dest)) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer PresentPicture submitted_host pts={} src={}x{} dest={}x{}+{}+{} curpts={}",
+                         pic.pts, pic.width, pic.height, dest.get_width(),
+                         dest.get_height(), dest.left, dest.top, m_curpts);
+        return;
+    }
+
+    tTJSNI_Window *window = nullptr;
+    if(auto *overlay = dynamic_cast<MoviePlayerOverlay *>(this)) {
+        window = overlay->GetOwnerWindow();
+    }
+    if(!window || !window->GetDrawDevice()) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer PresentPicture skip no_window window={}",
+                         window ? "yes" : "no");
+        return;
+    }
+    tTJSNI_BaseLayer *primary = window->GetDrawDevice()->GetPrimaryLayer();
+    if(!primary) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer PresentPicture skip no_primary primary=no");
+        return;
+    }
+
+    tTVPBaseTexture *target = primary->GetMainImage();
+    if(!target) {
+        try {
+            primary->SetHasImage(true);
+            target = primary->GetMainImage();
+        } catch(...) {
+            if(VideoTraceEnabled())
+                spdlog::info("MoviePlayer PresentPicture skip no_primary_image primary=yes");
+            return;
+        }
+    }
+    if(!target) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer PresentPicture skip no_primary_image primary=yes");
+        return;
+    }
+
+    if(!m_frameBitmap || m_frameBitmap->GetWidth() != pic.width ||
+       m_frameBitmap->GetHeight() != pic.height) {
+        if(m_frameBitmap)
+            delete m_frameBitmap;
+        m_frameBitmap = new tTVPBaseTexture(pic.width, pic.height, 32);
+    }
+    m_frameBitmap->Update(pic.rgba, pic.width * 4, 0, 0, pic.width,
+                          pic.height);
+
+    if(dest.get_width() <= 0 || dest.get_height() <= 0) {
+        dest = tTVPRect(0, 0, target->GetWidth(), target->GetHeight());
+    }
+    const tjs_uint required_width =
+        static_cast<tjs_uint>(std::max<tjs_int>(target->GetWidth(), dest.right));
+    const tjs_uint required_height =
+        static_cast<tjs_uint>(std::max<tjs_int>(target->GetHeight(), dest.bottom));
+    if(required_width != target->GetWidth() ||
+       required_height != target->GetHeight()) {
+        primary->SetImageSize(required_width, required_height);
+        target = primary->GetMainImage();
+        if(!target) {
+            if(VideoTraceEnabled())
+                spdlog::info("MoviePlayer PresentPicture skip resized_primary_image");
+            return;
+        }
+    }
+    tTVPRect clip(0, 0, target->GetWidth(), target->GetHeight());
+    tTVPRect src(0, 0, pic.width, pic.height);
+    target->StretchBlt(clip, dest, m_frameBitmap, src, bmCopy, 255, false,
+                       stLinear);
+    primary->Update(dest);
+    if(VideoTraceEnabled())
+        spdlog::info("MoviePlayer PresentPicture drew pts={} src={}x{} dest={}x{}+{}+{} curpts={}",
+                     pic.pts, pic.width, pic.height, dest.get_width(),
+                     dest.get_height(), dest.left, dest.top, m_curpts);
+}
+
+void VideoPresentOverlay::OnContinuousCallback(tjs_uint64 tick) {
+    if(!m_usedPicture)
+        return;
+    double curpts = m_pPlayer->GetClock() / DVD_TIME_BASE;
+    {
+        std::lock_guard<std::mutex> lk(m_mtxPicture);
+        BitmapPicture &picbuf = m_picture[m_curPicture];
+        if(picbuf.pts > curpts)
+            return;
+    }
+    PresentPicture(0.0f);
 }
 
 void KRMovie::VideoPresentOverlay::Play() {
     TVPMoviePlayer::Play();
+    TVPAddContinuousEventHook(this);
 }
 
 void KRMovie::VideoPresentOverlay::Stop() {
+    TVPRemoveContinuousEventHook(this);
+    ClearHostVideoOverlayFrame();
     TVPMoviePlayer::Stop();
 }
 
 MoviePlayerOverlay::~MoviePlayerOverlay() {
-    assert(std::this_thread::get_id() == TVPMainThreadID);
-    delete m_pPlayer;
-    m_pPlayer = nullptr;
+    ClearHostVideoOverlayFrame();
+    m_pCallbackWin = nullptr;
+    m_pOwnerWindow = nullptr;
+    if(m_pPlayer)
+        m_pPlayer->SetCallback({});
 }
 
 // Replace MoviePlayerOverlay::SetWindow with stub
 void MoviePlayerOverlay::SetWindow(tTJSNI_Window *window) {
     ClearNode();
     m_pOwnerWindow = window;
-    // Video overlay will be connected via Flutter rendering path.
-    spdlog::warn("MoviePlayerOverlay::SetWindow: video overlay display is "
-                 "currently disabled (scene tree removed)");
 }
 
 void MoviePlayerOverlay::BuildGraph(tTJSNI_VideoOverlay *callbackwin,
@@ -298,10 +560,28 @@ const tTVPRect &MoviePlayerOverlay::GetBounds() {
 
 void KRMovie::MoviePlayerOverlay::SetVisible(bool b) {
     VideoPresentOverlay::SetVisible(b);
+    if(!b)
+        ClearHostVideoOverlayFrame();
 }
 
 void MoviePlayerOverlay::OnPlayEvent(KRMovieEvent msg, void *p) {
-    if(msg == KRMovieEvent::Ended) {
+    if(msg == KRMovieEvent::Update) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer OnPlayEvent update visible={}",
+                         Visible ? "yes" : "no");
+        if(std::this_thread::get_id() == TVPMainThreadID)
+            PresentPicture(0.0f);
+        if(m_pCallbackWin) {
+            int frame;
+            GetFrame(&frame);
+            NativeEvent ev(WM_GRAPHNOTIFY);
+            ev.WParam = EC_UPDATE;
+            ev.LParam = frame;
+            m_pCallbackWin->PostEvent(ev);
+        }
+    } else if(msg == KRMovieEvent::Ended) {
+        if(VideoTraceEnabled())
+            spdlog::info("MoviePlayer OnPlayEvent ended");
         NativeEvent ev(WM_GRAPHNOTIFY);
         ev.WParam = EC_COMPLETE;
         ev.LParam = 0;
@@ -309,16 +589,33 @@ void MoviePlayerOverlay::OnPlayEvent(KRMovieEvent msg, void *p) {
     }
 }
 
-void VideoPresentOverlay::BitmapPicture::swap(BitmapPicture &r) {
-    std::swap(data, r.data);
-    std::swap(width, r.width);
-    std::swap(height, r.height);
+void TVPMoviePlayer::BitmapPicture::MoveFrom(BitmapPicture &source) {
+    if(this == &source)
+        return;
+    Clear();
+    fmt = source.fmt;
+    width = source.width;
+    height = source.height;
+    pts = source.pts;
+    for(int i = 0; i < sizeof(data) / sizeof(data[0]); ++i) {
+        data[i] = source.data[i];
+        source.data[i] = nullptr;
+    }
+    source.fmt = RENDER_FMT_NONE;
+    source.width = 0;
+    source.height = 0;
+    source.pts = 0.0;
 }
 
 void TVPMoviePlayer::BitmapPicture::Clear() {
-    for(int i = 0; i < sizeof(data) / sizeof(data[0]); ++i)
+    for(int i = 0; i < sizeof(data) / sizeof(data[0]); ++i) {
         if(data[i])
             TJSAlignedDealloc(data[i]), data[i] = nullptr;
+    }
+    fmt = RENDER_FMT_NONE;
+    width = 0;
+    height = 0;
+    pts = 0.0;
 }
 
 void VideoPresentOverlay2::SetRootNode(OverlayNode *node) {

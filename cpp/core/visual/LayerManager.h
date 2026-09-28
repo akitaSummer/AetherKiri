@@ -14,6 +14,7 @@
 #include "LayerIntf.h"
 #include "drawable.h"
 #include <algorithm>
+#include <string>
 #include <vector>
 
 /*[*/
@@ -244,7 +245,7 @@ class tTVPDestTexture : public tTVPBaseTexture {
     bool HoldAlpha = true;
 
 public:
-    tTVPDestTexture(tjs_uint w, tjs_uint h) : tTVPBaseTexture(w, h) {}
+    tTVPDestTexture(tjs_uint w, tjs_uint h);
 
     //     bool Blt(tjs_int x, tjs_int y, const iTVPBaseBitmap *ref,
     // 		tTVPRect refrect, tTVPBBBltMethod method, tjs_int opa);
@@ -271,6 +272,12 @@ class tTVPLayerManager : public iTVPLayerManager, public tTVPDrawable {
                                     //!< for this layer manager
 
     tTJSNI_BaseLayer *CaptureOwner;
+    // Capture may be released by a page transition during onMouseDown. Keep
+    // the original gesture target alive until mouse-up so its release cannot
+    // activate a control on the newly revealed page.
+    bool LeftPointerGestureActive = false;
+    tTJSVariant LeftPointerDownOwner;
+    bool IsLeftPointerGestureTarget(tTJSNI_BaseLayer *layer) const;
     tTJSNI_BaseLayer *LastMouseMoveSent;
     std::vector<tTVPTouchCaptureLayer>
         TouchCapture; //!< 同時タッチ数は多くても10点程度なのでvectorで持つ(ほぼ1or2点)
@@ -297,9 +304,19 @@ class tTVPLayerManager : public iTVPLayerManager, public tTVPDrawable {
     tjs_int LastMouseMoveY;
 
     bool ReleaseCaptureCalled;
+    tjs_uint64 PendingSaveLoadEnterTick = 0;
+    tjs_uint64 PendingSaveLoadEnterReleaseTick = 0;
+    tjs_int PendingConfirmX = 0;
+    tjs_int PendingConfirmY = 0;
+    bool PendingConfirmRequiresSameSelection = false;
+    std::string PendingConfirmLayerName;
+    bool SuppressCurrentTitleMenuPointerGesture = false;
 
     bool InNotifyingHintOrCursorChange;
     bool HoldAlpha = true;
+    tTVPBaseTexture *EnsureDrawBufferSize(tjs_int w, tjs_int h,
+                                          bool clear_on_resize);
+    tTVPBaseTexture *EnsureDrawBufferMatchesPrimary(bool clear_on_resize);
 
 public:
     tTVPLayerManager(class iTVPLayerTreeOwner *owner);
@@ -323,6 +340,10 @@ public:
         DesiredLayerType = type;
     }
     void SetHoldAlpha(bool b);
+    // D2D multi-manager composition uses transparent pixels outside the
+    // manager's actual content.  Clear an already allocated target when the
+    // draw device switches this manager to alpha-preserving output.
+    void ClearDrawBufferForAlpha();
 
 public: // methods from tTVPDrawable
     tTVPBaseTexture *GetDrawTargetBitmap(const tTVPRect &rect,
@@ -333,7 +354,9 @@ public: // methods from tTVPDrawable
     void DrawCompleted(const tTVPRect &destrect, tTVPBaseTexture *bmp,
                        const tTVPRect &cliprect, tTVPLayerType type,
                        tjs_int opacity) override;
-    tTVPBaseTexture *GetDrawBuffer() override { return DrawBuffer; }
+    tTVPBaseTexture *GetDrawBuffer() override {
+        return EnsureDrawBufferMatchesPrimary(false);
+    }
     tTVPBaseTexture *GetOrCreateDrawBuffer();
 
 public:
@@ -458,6 +481,16 @@ public:
     tTJSNI_BaseLayer *GetMostFrontChildAt(tjs_int x, tjs_int y,
                                           tTJSNI_BaseLayer *except = nullptr,
                                           bool get_disabled = false);
+    tTJSNI_BaseLayer *GetClickableLayerAt(tjs_int x, tjs_int y);
+    tTJSNI_BaseLayer *GetConfirmableSelectionLayerAt(tjs_int x, tjs_int y);
+    bool IsPendingConfirmStillOnSameSelection();
+    tTJSNI_BaseLayer *GetPendingConfirmSelectionLayer();
+    bool IsSaveLoadMessageCommandBand(tTJSNI_BaseLayer *layer, tjs_int x,
+                                      tjs_int y);
+    bool ShouldSynthesizeEnterForSaveLoadButton(
+        tTJSNI_BaseLayer *layer, tjs_int x, tjs_int y);
+    bool IsTitleMenuInputState(tTJSNI_BaseLayer *layer);
+    bool IsTitleMenuControlPoint(tjs_int x, tjs_int y);
 
     void PrimaryClick(tjs_int x, tjs_int y);
     void PrimaryDoubleClick(tjs_int x, tjs_int y);
@@ -467,7 +500,8 @@ public:
     void PrimaryMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb,
                         tjs_uint32 flags);
 
-    void PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags);
+    void PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags,
+                          bool force = false);
     void ForceMouseLeave();
     void ForceMouseRecheck();
     void MouseOutOfWindow();

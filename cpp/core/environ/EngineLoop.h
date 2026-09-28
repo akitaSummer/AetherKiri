@@ -39,7 +39,7 @@ struct EngineInputEvent {
     double   x = 0;             ///< Pointer X in logical pixels
     double   y = 0;             ///< Pointer Y in logical pixels
     double   delta_x = 0;       ///< Scroll delta X
-    double   delta_y = 0;       ///< Scroll delta Y
+    double   delta_y = 0;       ///< Scroll delta Y: positive=up, negative=down
     int32_t  pointer_id = 0;    ///< Pointer / touch ID
     int32_t  button = 0;        ///< Mouse button: 0=left, 1=right, 2=middle
     int32_t  key_code = 0;      ///< Virtual key code (Windows VK_*)
@@ -76,7 +76,7 @@ public:
 
     /**
      * Start the engine from the given game path (standalone mode).
-     * In host mode (Flutter), engine_open_game calls Application::StartApplication
+     * In host mode (Application host), engine_open_game calls Application::StartApplication
      * directly, so this may not be used.
      */
     bool StartupFrom(const std::string& path);
@@ -93,6 +93,22 @@ public:
      * @param delta  Time elapsed since last tick, in seconds.
      */
     void Tick(float delta);
+
+    /**
+     * Finish input state that must remain visible while Application::Run()
+     * delivers the current frame's queued events.
+     *
+     * Host integrations that drive Application::Run() themselves (such as
+     * engine_api) must call this immediately afterwards.
+     */
+    void CompleteInputFrame();
+
+    /**
+     * Cancel host pointer capture state without posting synthetic input.
+     * Call this when a game session is opened/destroyed or the host loses
+     * focus, so a button held across that boundary cannot poison later moves.
+     */
+    void ResetPointerState();
 
     /** Whether the loop has been started. */
     bool IsStarted() const { return started_; }
@@ -124,6 +140,7 @@ private:
     void HandleKeyDown(const EngineInputEvent& event);
     void HandleKeyUp(const EngineInputEvent& event);
     void HandleTextInput(const EngineInputEvent& event);
+    static bool IsTouchPointerEvent(const EngineInputEvent& event);
 
     /**
      * Convert modifier flags to TVP shift state flags (TVP_SS_*).
@@ -137,4 +154,14 @@ private:
     // LastMouseDownX/Y).  OnClick uses the down position, not up position.
     int32_t last_mouse_down_x_ = 0;
     int32_t last_mouse_down_y_ = 0;
+    int64_t last_click_time_ms_ = 0;
+    int32_t last_click_x_ = 0;
+    int32_t last_click_y_ = 0;
+    bool suppress_next_left_click_ = false;
+    // Bit positions are the mouse VK values (1=left, 2=right, 4=middle).
+    // A mask preserves simultaneous releases until their queued handlers run.
+    uint8_t pending_mouse_release_mask_ = 0;
+    // Mirrors Win32's GetMouseButtonState(): move/wheel events must retain
+    // the pressed-button flags even when a host omits them from its event.
+    uint32_t active_mouse_shift_flags_ = 0;
 };

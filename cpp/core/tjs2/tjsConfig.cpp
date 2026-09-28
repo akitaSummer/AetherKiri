@@ -23,7 +23,6 @@
 #else
 #define isfinite std::isfinite
 #endif
-#define INTMAX_MAX 0x7fffffffffffffff
 
 static int utf8_mbtowc(/*conv_t conv,*/ tjs_char *pwc, const unsigned char *s,
                        int n) {
@@ -62,16 +61,8 @@ static int utf8_wctomb(/*conv_t conv,*/ unsigned char *r, tjs_char wc,
         count = 1;
     else if(wc < 0x800)
         count = 2;
-    else if(wc < 0x10000)
-        count = 3;
-    // 	else if (wc < 0x200000)
-    // 		count = 4;
-    // 	else if (wc < 0x4000000)
-    // 		count = 5;
-    // 	else if (wc <= 0x7fffffff)
-    // 		count = 6;
     else
-        return -1;
+        count = 3;
     if(n < count)
         return -2;
     switch(count) { /* note: code falls through cases! */
@@ -250,11 +241,10 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     void TJS_strcpy_maxlen(tjs_char *d, const tjs_char *s, size_t len) {
-        tjs_char ch;
-        len++;
-        while((ch = *s) != 0 && --len)
-            *(d++) = ch, s++;
-        *d = 0;
+        size_t i = 0;
+        for(; i < len && s[i] != 0; i++)
+            d[i] = s[i];
+        d[i] = 0;
     }
 
     //---------------------------------------------------------------------------

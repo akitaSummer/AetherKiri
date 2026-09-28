@@ -4,6 +4,8 @@
 #include <algorithm>
 #include "AEFactory.h"
 
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 extern "C" {
 #include "libavcodec/avcodec.h"
 }
@@ -101,21 +103,6 @@ int CDVDAudioCodecPassthrough::Decode(uint8_t *pData, int iSize, double dts,
                     m_backlogSize - consumed);
         }
         m_backlogSize -= consumed;
-    }
-
-    // get rid of potential side data
-    if(pData) {
-        AVPacket pkt;
-        av_init_packet(&pkt);
-        pkt.data = pData;
-        pkt.size = iSize;
-        int didSplit = av_packet_split_side_data(&pkt);
-        if(didSplit) {
-            skip = iSize - pkt.size;
-            pData = pkt.data;
-            iSize = pkt.size;
-            av_packet_free_side_data(&pkt);
-        }
     }
 
     if(pData) {
